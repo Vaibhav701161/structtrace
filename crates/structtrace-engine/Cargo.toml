@@ -1,0 +1,29 @@
+[package]
+name = "structtrace-engine"
+description = "Run orchestration, storage, replay, and release gates for StructTrace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+structtrace-adapters = { path = "../structtrace-adapters" }
+structtrace-core = { path = "../structtrace-core" }
+structtrace-report = { path = "../structtrace-report" }
+tempfile.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

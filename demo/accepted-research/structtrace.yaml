@@ -1,0 +1,47 @@
+version: 1
+
+project:
+  name: accepted-contract-sensitivity-evidence
+  description: Compact normalized replay of the accepted paired research counts
+
+dataset:
+  path: generated/dataset.jsonl
+  format: jsonl
+
+schema:
+  path: schema.json
+
+variants:
+  baseline:
+    kind: recorded
+    path: generated/baseline.jsonl
+  candidate:
+    kind: recorded
+    path: generated/candidate.jsonl
+
+evaluators:
+  - id: accepted_outcome
+    kind: json_pointer_exact
+    pointer: /answer
+    expected_pointer: /answer
+
+outcomes:
+  semantic_correct:
+    all_of: [accepted_outcome]
+
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap:
+    samples: 10000
+    confidence: 0.95
+    seed: 17
+
+gate:
+  max_primary_regression_pp: 0.0
+  min_candidate_schema_validity: 1.0
+
+report:
+  title: Accepted Contract Sensitivity Lab evidence
+  include_raw_outputs: true
+  include_prompts: false
+  default_case_filter: discordant

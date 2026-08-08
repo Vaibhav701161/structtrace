@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Support ticket route",
+  "type": "object",
+  "required": ["priority", "assigned_team", "requires_human", "summary"],
+  "properties": {
+    "priority": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "assigned_team": {
+      "type": "string",
+      "enum": ["account", "billing", "data", "infrastructure", "product", "retention", "security", "trust"]
+    },
+    "requires_human": { "type": "boolean" },
+    "summary": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,64 @@
+version: 1
+
+project:
+  name: support-ticket-migration
+  description: A structurally cleaner candidate that introduces semantic routing regressions
+
+storage:
+  root: .structtrace
+  retain_raw_outputs: true
+  retain_provider_responses: true
+
+dataset:
+  path: data/golden.jsonl
+  format: jsonl
+
+schema:
+  path: schemas/ticket.schema.json
+
+variants:
+  baseline:
+    kind: recorded
+    path: outputs/baseline.jsonl
+  candidate:
+    kind: recorded
+    path: outputs/candidate.jsonl
+
+evaluators:
+  - id: exact_priority
+    kind: json_pointer_exact
+    pointer: /priority
+    expected_pointer: /priority
+  - id: exact_team
+    kind: json_pointer_exact
+    pointer: /assigned_team
+    expected_pointer: /assigned_team
+  - id: exact_human_flag
+    kind: json_pointer_exact
+    pointer: /requires_human
+    expected_pointer: /requires_human
+
+outcomes:
+  semantic_correct:
+    all_of:
+      - exact_priority
+      - exact_team
+      - exact_human_flag
+
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap:
+    samples: 10000
+    confidence: 0.95
+    seed: 17
+
+gate:
+  max_primary_regression_pp: 1.0
+  max_valid_but_wrong_increase_pp: 0.5
+  min_candidate_schema_validity: 1.0
+
+report:
+  title: Support ticket migration report
+  include_raw_outputs: true
+  include_prompts: false
+  default_case_filter: discordant

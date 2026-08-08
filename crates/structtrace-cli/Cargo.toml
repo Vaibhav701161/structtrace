@@ -1,0 +1,32 @@
+[package]
+name = "structtrace-cli"
+description = "Command-line interface for StructTrace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "structtrace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+structtrace-adapters = { path = "../structtrace-adapters" }
+structtrace-core = { path = "../structtrace-core" }
+structtrace-engine = { path = "../structtrace-engine" }
+structtrace-report = { path = "../structtrace-report" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+/target/
+/docs/book/
+**/.structtrace/
+**/__pycache__/
+*.py[cod]
+/.idea/
+/.vscode/
+*.swp
+.DS_Store

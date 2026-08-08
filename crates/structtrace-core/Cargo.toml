@@ -1,0 +1,28 @@
+[package]
+name = "structtrace-core"
+description = "Domain types, evaluators, metrics, hashing, and artifact formats for StructTrace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+jsonschema.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

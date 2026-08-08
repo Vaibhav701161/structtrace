@@ -1,0 +1,26 @@
+[
+  {
+    "id": "corrected_qwen",
+    "label": "Corrected Qwen",
+    "both_pass": 15,
+    "baseline_only_pass": 3,
+    "candidate_only_pass": 9,
+    "both_fail": 22
+  },
+  {
+    "id": "canonical_llama",
+    "label": "Canonical Llama",
+    "both_pass": 76,
+    "baseline_only_pass": 16,
+    "candidate_only_pass": 6,
+    "both_fail": 52
+  },
+  {
+    "id": "tool_call_pilot",
+    "label": "Tool-call pilot",
+    "both_pass": 23,
+    "baseline_only_pass": 3,
+    "candidate_only_pass": 1,
+    "both_fail": 3
+  }
+]
