@@ -613,6 +613,11 @@ mod tests {
 
     use super::*;
 
+    // Cold Python startup on Windows CI can exceed one second. These tests
+    // exercise protocol behavior, not startup latency, so keep a generous
+    // platform-independent deadline and test timeout behavior separately.
+    const FIXTURE_TIMEOUT_MS: u64 = 10_000;
+
     const HELPER: &str = r#"import argparse
 import json
 import sys
@@ -696,7 +701,7 @@ for line in sys.stdin:
         let run = run_command(
             &spec,
             ProcessMode::Persistent,
-            1_000,
+            FIXTURE_TIMEOUT_MS,
             &cases(),
             directory.path(),
             &CommandLimits::default(),
@@ -716,7 +721,7 @@ for line in sys.stdin:
         let run = run_command(
             &spec,
             ProcessMode::PerCase,
-            1_000,
+            FIXTURE_TIMEOUT_MS,
             &cases(),
             directory.path(),
             &CommandLimits::default(),
@@ -733,7 +738,7 @@ for line in sys.stdin:
             let run = run_command(
                 &spec,
                 ProcessMode::Persistent,
-                1_000,
+                FIXTURE_TIMEOUT_MS,
                 &cases(),
                 directory.path(),
                 &CommandLimits::default(),
@@ -755,7 +760,7 @@ for line in sys.stdin:
         let run = run_command(
             &spec,
             ProcessMode::Persistent,
-            1_000,
+            FIXTURE_TIMEOUT_MS,
             &cases(),
             directory.path(),
             &CommandLimits::default(),
@@ -791,7 +796,7 @@ for line in sys.stdin:
         let run = run_command(
             &spec,
             ProcessMode::Persistent,
-            1_000,
+            FIXTURE_TIMEOUT_MS,
             &cases(),
             directory.path(),
             &CommandLimits::default(),
@@ -807,7 +812,7 @@ for line in sys.stdin:
         let run = run_command(
             &spec,
             ProcessMode::PerCase,
-            1_000,
+            FIXTURE_TIMEOUT_MS,
             &cases()[..1],
             directory.path(),
             &CommandLimits::default(),
@@ -824,7 +829,7 @@ for line in sys.stdin:
             let run = run_command(
                 &spec,
                 mode,
-                1_000,
+                FIXTURE_TIMEOUT_MS,
                 &cases()[..1],
                 directory.path(),
                 &CommandLimits {
@@ -847,7 +852,7 @@ for line in sys.stdin:
             let run = run_command(
                 &spec,
                 mode,
-                1_000,
+                FIXTURE_TIMEOUT_MS,
                 &cases()[..1],
                 directory.path(),
                 &CommandLimits::default(),

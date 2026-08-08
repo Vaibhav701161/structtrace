@@ -285,9 +285,10 @@ fn error(evaluator_id: &str, message: impl Into<String>) -> EvaluatorResult {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-
     use super::*;
+
+    #[cfg(unix)]
+    use tempfile::tempdir;
 
     #[test]
     fn malformed_response_fails_closed() {
