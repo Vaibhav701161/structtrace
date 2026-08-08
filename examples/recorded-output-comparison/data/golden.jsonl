@@ -1,0 +1,2 @@
+{"id":"case-001","input":{"text":"Approve the verified request."},"expected":{"label":"accepted"}}
+{"id":"case-002","input":{"text":"Reject the unverifiable request."},"expected":{"label":"rejected"}}

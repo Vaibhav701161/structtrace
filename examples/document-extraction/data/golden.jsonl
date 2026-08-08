@@ -1,0 +1,3 @@
+{"id":"invoice-001","input":{"text":"Invoice A-14 total USD 120.50 due 2026-09-01"},"expected":{"invoice_id":"A-14","total":"120.50","currency":"USD"}}
+{"id":"invoice-002","input":{"text":"Invoice B-09 total USD 80.00 due 2026-09-04"},"expected":{"invoice_id":"B-09","total":"80.00","currency":"USD"}}
+{"id":"invoice-003","input":{"text":"Invoice C-22 total EUR 45.25 due 2026-09-10"},"expected":{"invoice_id":"C-22","total":"45.25","currency":"EUR"}}

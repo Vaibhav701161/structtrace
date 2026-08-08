@@ -1,0 +1,2 @@
+{"case_id":"case-001","status":"ok","raw_output":"{\"label\":\"accepted\",\"reason\":\"verified\"}"}
+{"case_id":"case-002","status":"ok","raw_output":"{\"label\":\"accepted\",\"reason\":\"plausible but wrong\"}"}

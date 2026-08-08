@@ -1,0 +1,2 @@
+{"id":"case-001","input":{"text":"Classify as accepted."},"expected":{"label":"accepted"}}
+{"id":"case-002","input":{"text":"Classify as rejected."},"expected":{"label":"rejected"}}

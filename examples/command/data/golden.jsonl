@@ -1,0 +1,2 @@
+{"id":"case-001","input":{"text":"A clear positive example."},"expected":{"label":"accepted"}}
+{"id":"case-002","input":{"text":"A clear negative example."},"expected":{"label":"rejected"}}

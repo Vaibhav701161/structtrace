@@ -1,0 +1,15 @@
+version: 1
+project: {name: recorded-output-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline: {kind: recorded, path: outputs/baseline.jsonl}
+  candidate: {kind: recorded, path: outputs/candidate.jsonl}
+evaluators:
+  - {id: label, kind: enum_accuracy, pointer: /label, expected_pointer: /label}
+outcomes:
+  semantic_correct: {all_of: [label]}
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
+gate: {max_primary_regression_pp: 0, max_valid_but_wrong_increase_pp: 0}

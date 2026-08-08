@@ -1,0 +1,21 @@
+version: 1
+project: {name: command-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline:
+    kind: command
+    command: {program: python3, args: [variants/adapter.py, --variant, baseline]}
+    process_mode: persistent
+  candidate:
+    kind: command
+    command: {program: python3, args: [variants/adapter.py, --variant, candidate]}
+    process_mode: persistent
+evaluators:
+  - {id: label, kind: json_pointer_exact, pointer: /label, expected_pointer: /label}
+outcomes:
+  semantic_correct: {all_of: [label]}
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
+gate: {max_primary_regression_pp: 0, min_candidate_schema_validity: 1.0}

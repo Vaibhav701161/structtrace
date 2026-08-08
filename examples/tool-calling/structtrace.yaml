@@ -1,0 +1,25 @@
+version: 1
+project: {name: tool-calling-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline: {kind: recorded, path: outputs/baseline.jsonl}
+  candidate: {kind: recorded, path: outputs/candidate.jsonl}
+evaluators:
+  - {id: tool, kind: tool_selection, pointer: /name, expected_pointer: /name}
+  - id: arguments
+    kind: tool_arguments
+    pointers:
+      - {pointer: /arguments/sku, expected_pointer: /arguments/sku}
+      - {pointer: /arguments/quantity_delta, expected_pointer: /arguments/quantity_delta}
+  - id: receipt
+    kind: json_pointers_exact
+    pointers:
+      - {pointer: /receipt/executed, expected_pointer: /receipt/executed}
+      - {pointer: /receipt/after, expected_pointer: /receipt/after}
+outcomes:
+  executable_correct: {all_of: [tool, arguments, receipt]}
+analysis:
+  primary_outcome: executable_correct
+  bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
+gate: {max_primary_regression_pp: 0, max_valid_but_wrong_increase_pp: 0}

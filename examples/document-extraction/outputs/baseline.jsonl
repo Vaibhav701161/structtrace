@@ -1,0 +1,3 @@
+{"case_id":"invoice-001","status":"ok","raw_output":"{\"invoice_id\":\"A-14\",\"total\":\"120.50\",\"currency\":\"USD\"}"}
+{"case_id":"invoice-002","status":"ok","raw_output":"{\"invoice_id\":\"B-09\",\"total\":\"80.00\"}"}
+{"case_id":"invoice-003","status":"ok","raw_output":"{\"invoice_id\":\"C-22\",\"total\":\"45.25\",\"currency\":\"EUR\"}"}

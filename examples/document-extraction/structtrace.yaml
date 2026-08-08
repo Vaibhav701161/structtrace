@@ -1,0 +1,18 @@
+version: 1
+project: {name: document-extraction-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline: {kind: recorded, path: outputs/baseline.jsonl}
+  candidate: {kind: recorded, path: outputs/candidate.jsonl}
+evaluators:
+  - {id: invoice_id, kind: json_pointer_exact, pointer: /invoice_id, expected_pointer: /invoice_id}
+  - {id: total, kind: numeric_tolerance, pointer: /total, expected_pointer: /total, absolute: "0.01", exact_integer: false}
+  - {id: currency, kind: enum_accuracy, pointer: /currency, expected_pointer: /currency}
+  - {id: completeness, kind: required_fields, pointers: [/invoice_id, /total, /currency]}
+outcomes:
+  extraction_correct: {all_of: [invoice_id, total, currency, completeness]}
+analysis:
+  primary_outcome: extraction_correct
+  bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
+gate: {max_primary_regression_pp: 0, min_candidate_schema_validity: 1.0}

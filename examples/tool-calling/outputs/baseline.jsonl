@@ -1,0 +1,2 @@
+{"case_id":"inventory-001","status":"ok","raw_output":"{\"name\":\"adjust_inventory\",\"arguments\":{\"sku\":\"ABC-14\",\"quantity_delta\":\"-12\"},\"receipt\":{\"executed\":true,\"after\":18}}"}
+{"case_id":"inventory-002","status":"ok","raw_output":"{\"name\":\"adjust_inventory\",\"arguments\":{\"sku\":\"ZX-02\",\"quantity_delta\":\"5\"},\"receipt\":{\"executed\":true,\"after\":13}}"}

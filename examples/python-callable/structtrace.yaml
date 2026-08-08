@@ -1,0 +1,15 @@
+version: 1
+project: {name: python-callable-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline: {kind: python, interpreter: python3, callable: "variants.app:baseline"}
+  candidate: {kind: python, interpreter: python3, callable: "variants.app:candidate"}
+evaluators:
+  - {id: label, kind: json_pointer_exact, pointer: /label, expected_pointer: /label}
+outcomes:
+  semantic_correct: {all_of: [label]}
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
+gate: {max_primary_regression_pp: 0, min_candidate_schema_validity: 1.0}

@@ -1,0 +1,28 @@
+version: 1
+project: {name: openai-compatible-example}
+dataset: {path: data/golden.jsonl, format: jsonl}
+schema: {path: schemas/output.schema.json}
+variants:
+  baseline:
+    kind: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: LOCAL_LLM_API_KEY
+    model: baseline-model
+    request: {system: "Return only the required object.", user_template: "{{ input.text }}", temperature: 0, max_output_tokens: 100}
+    structured_output: {mode: json_schema, schema: schemas/output.schema.json}
+    retries: 0
+  candidate:
+    kind: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: LOCAL_LLM_API_KEY
+    model: candidate-model
+    request: {system: "Return only the required object.", user_template: "{{ input.text }}", temperature: 0, max_output_tokens: 100}
+    structured_output: {mode: json_schema, schema: schemas/output.schema.json}
+    retries: 0
+evaluators:
+  - {id: label, kind: enum_accuracy, pointer: /label, expected_pointer: /label}
+outcomes:
+  semantic_correct: {all_of: [label]}
+analysis:
+  primary_outcome: semantic_correct
+gate: {max_primary_regression_pp: 0}
