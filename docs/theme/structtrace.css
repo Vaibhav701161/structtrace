@@ -1,0 +1,10 @@
+:root {
+  --content-max-width: 920px;
+  --sidebar-width: 300px;
+  --links: #155eef;
+}
+
+code { font-variant-ligatures: none; }
+.content main { line-height: 1.62; }
+table { width: 100%; }
+.warning, .note { border-radius: 6px; }

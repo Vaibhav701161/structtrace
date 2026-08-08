@@ -1,0 +1,261 @@
+# StructTrace
+
+> Your schema passed. Did the answer?
+
+[![CI](https://github.com/Vaibhav701161/structtrace/actions/workflows/ci.yml/badge.svg)](https://github.com/Vaibhav701161/structtrace/actions/workflows/ci.yml)
+[![Rust 1.87+](https://img.shields.io/badge/Rust-1.87%2B-000000?logo=rust)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-155eef.svg)](LICENSE)
+[![No telemetry](https://img.shields.io/badge/telemetry-none-087a55.svg)](SECURITY.md)
+
+StructTrace is a local-first regression harness for structured LLM outputs. It evaluates the same golden cases against a baseline and candidate, separates JSON and schema validity from semantic or executable correctness, preserves every failure in the denominator, and produces an offline report plus a CI release decision.
+
+```text
+matched cases        baseline + candidate       one evidence bundle
+─────────────        ────────────────────       ───────────────────
+input + expected  -> strict output capture  -> parse and schema facts
+                  -> deterministic scoring  -> paired transitions
+                  -> operational metrics    -> report, gate, replay
+```
+
+## See the failure that schema metrics miss
+
+The bundled support-ticket migration is intentionally realistic: the candidate becomes more structurally reliable while routing more tickets incorrectly.
+
+| Metric | Baseline | Candidate | What changed |
+|---|---:|---:|---|
+| Strict JSON | 11/12 | 12/12 | candidate improved |
+| Schema valid | 11/12 | 12/12 | candidate improved |
+| Semantically correct | 10/12 | 8/12 | candidate regressed |
+| Valid but wrong | 1/12 | 4/12 | hidden risk increased |
+
+That run fails its release gate. The invalid baseline row, all semantic regressions, and every discordant case remain inspectable.
+
+```bash
+cargo run -p structtrace-cli -- demo support-ticket
+cargo run -p structtrace-cli -- demo research
+```
+
+Neither demo needs Python, an API key, a model download, a network connection, or a GPU.
+
+## What the report gives you
+
+- strict whole-output JSON parsing, with surrounding prose treated as failure;
+- external JSON Schema validation with remote retrieval disabled;
+- deterministic semantic and tool-call evaluators;
+- valid-but-wrong counts as a first-class result;
+- the complete paired 2x2 transition matrix;
+- candidate-minus-baseline percentage-point effect;
+- exact McNemar test and seeded paired bootstrap interval;
+- field-level regression and improvement hotspots;
+- mean, median, and p95 latency, retries, token use, and user-priced cost;
+- a filterable case explorer with JSON-aware diffs;
+- independent release-gate rules with stable exit codes;
+- SQLite storage, BLAKE3-bound portable artifacts, and full replay.
+
+The report is one self-contained HTML file. It contains no CDN assets, analytics, telemetry, or remote runtime dependency.
+
+## Install
+
+StructTrace uses stable Rust 1.87 or newer.
+
+```bash
+git clone https://github.com/Vaibhav701161/structtrace.git
+cd structtrace
+cargo install --path crates/structtrace-cli --locked
+structtrace --help
+structtrace doctor
+```
+
+## Five-minute workflow
+
+```bash
+structtrace init my-structured-output-check
+cd my-structured-output-check
+
+# Inspect the generated dataset, schema, outputs, evaluators, and thresholds.
+structtrace run
+structtrace report latest --open
+structtrace gate latest
+structtrace replay latest
+```
+
+Choose the integration closest to your application:
+
+```bash
+structtrace init my-check --template recorded
+structtrace init my-check --template command
+structtrace init my-check --template python
+structtrace init my-check --template openai-compatible
+```
+
+Initialization refuses to overwrite existing StructTrace files.
+
+## Execution sources
+
+| Adapter | Use it when | Execution behavior |
+|---|---|---|
+| Recorded JSONL | outputs already exist | no process, Python, or provider required |
+| Command | application is in any language | versioned JSONL over stdin/stdout; no shell |
+| Python callable | application exposes a Python function | bundled bridge; exceptions retained as failures |
+| OpenAI-compatible | comparing models or request settings | explicit endpoint, bounded concurrency, opt-in retries |
+
+All adapters produce the same `VariantOutput` envelope and enter the same storage, evaluation, report, gate, and replay path. Adapter errors, timeouts, malformed responses, and missing outputs never shrink the denominator.
+
+## Evaluators and outcomes
+
+Built-in deterministic evaluators cover:
+
+- exact JSON equality;
+- one or multiple JSON Pointer comparisons;
+- enum/classification accuracy;
+- arbitrary-length exact integers and exact-decimal numeric tolerance;
+- required fields;
+- tool selection;
+- selected tool arguments;
+- versioned custom command and Python evaluators for deterministic execution receipts.
+
+Evaluators are composed into named `all_of` or `any_of` outcomes. The user must choose one primary semantic or executable outcome; StructTrace refuses to infer correctness from schema validity.
+
+```yaml
+evaluators:
+  - id: exact_priority
+    kind: json_pointer_exact
+    pointer: /priority
+    expected_pointer: /priority
+  - id: exact_team
+    kind: json_pointer_exact
+    pointer: /assigned_team
+    expected_pointer: /assigned_team
+
+outcomes:
+  routing_correct:
+    all_of: [exact_priority, exact_team]
+
+analysis:
+  primary_outcome: routing_correct
+```
+
+The machine-readable configuration schema is at [schemas/structtrace.schema.json](schemas/structtrace.schema.json).
+
+## Release gates
+
+Rules are evaluated independently. A schema improvement cannot hide a semantic regression, and a correctness improvement is still shown when an operational threshold fails.
+
+```yaml
+gate:
+  max_primary_regression_pp: 1.0
+  max_valid_but_wrong_increase_pp: 0.5
+  min_candidate_schema_validity: 1.0
+  max_error_rate: 0.0
+  max_timeout_rate: 0.0
+  latency:
+    max_p95_increase_percent: 25
+  cost:
+    max_average_increase_percent: 20
+```
+
+```bash
+structtrace gate latest                 # human output
+structtrace gate latest --format json   # automation
+structtrace gate latest --format github # Actions annotations
+```
+
+A completed quality regression returns exit code `10`; malformed input, execution failure, artifact corruption, and protocol failure use distinct codes.
+
+## Durable and replayable by design
+
+Each run lives under `.structtrace/runs/<ULID>/` and contains:
+
+```text
+manifest.json              BLAKE3 provenance and lifecycle
+run.sqlite3                versioned durable store
+inputs/                    retained config, dataset, schema, outputs
+cases.jsonl                complete paired case records
+discordances.jsonl         regression and valid-but-wrong slice
+summary.json / summary.md  machine and human summaries
+logs/                      separated adapter diagnostics
+report/index.html          offline report
+```
+
+`structtrace replay` verifies manifest-bound hashes and recomputes parsing, schema validation, evaluators, outcomes, valid-but-wrong classification, transitions, McNemar, bootstrap intervals, and every gate rule. Resume is allowed only when all bound experimental inputs still match.
+
+## Privacy boundary
+
+StructTrace sends no telemetry and performs no automatic uploads. Provider credentials are read only from named environment variables; secret values are never written into resolved configuration or manifests.
+
+```yaml
+storage:
+  retain_raw_outputs: false
+  redaction:
+    json_pointers:
+      - /input/customer_email
+      - /input/phone
+```
+
+Raw retention is enforced before portable output artifacts are written. Report redaction also removes matching echoes from parsed output and evaluator evidence. The report server binds to a random loopback-only address.
+
+Output, subprocess diagnostics, and report embedding are bounded independently. Defaults are conservative and every setting has a compiled hard ceiling:
+
+```yaml
+limits:
+  max_output_bytes_per_case: 4194304
+  max_stderr_bytes_per_process: 1048576
+  max_report_raw_bytes_per_case: 262144
+```
+
+Oversized command, Python, or provider output fails closed and remains in the denominator. Report truncation changes only the HTML view, never the scored artifact.
+
+## Research foundation, without universal claims
+
+The offline research demo reproduces three accepted paired matrices from the Contract Sensitivity Lab evidence chain:
+
+| Study | Baseline | Candidate | Candidate-only | Baseline-only |
+|---|---:|---:|---:|---:|
+| Corrected Qwen | 18/49 | 24/49 | 9 | 3 |
+| Canonical Llama | 92/150 | 82/150 | 6 | 16 |
+| Executable tool pilot | 26/30 | 24/30 | 1 | 3 |
+
+The point is not that one representation universally wins. The same class of contract-preserving change produced different effects across evaluated systems. StructTrace exists so teams measure the effect on their own model, prompt, schema, backend, and workload.
+
+## Architecture
+
+```text
+structtrace-cli
+      │
+      ├── structtrace-engine ── SQLite, lifecycle, resume, replay
+      │          │
+      │          ├── structtrace-adapters ── recorded / command / Python / OpenAI
+      │          ├── structtrace-core ────── config, schema, evaluators, statistics
+      │          └── structtrace-report ──── self-contained HTML and loopback serving
+      │
+      └── stable exit codes and human / JSON / GitHub output
+```
+
+Important semantic and product decisions are recorded in [DECISIONS.md](DECISIONS.md).
+
+## Development
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo build --workspace --release
+```
+
+The test suite uses deterministic fixtures and local mock servers. It requires no external API key, model provider, GPU, or network service.
+
+## Documentation
+
+The documentation book covers configuration, integrations, metrics, reports, CI, privacy, replay, and troubleshooting. Start at [docs/src/introduction.md](docs/src/introduction.md) while the static site is being built.
+
+External usability evidence is deliberately tracked separately from automated correctness. The [release-candidate validation protocol](docs/src/release-candidate-validation.md) defines the tasks, privacy boundary, retained evidence, and acceptance gate; it currently makes no claim that outside validation has occurred.
+
+## Product boundaries
+
+StructTrace does not automatically rewrite schemas, optimize prompts, choose a winning representation, or guarantee model quality. It does not require an LLM judge for its central workflow. It is a measurement and release-evidence system: it makes structural, semantic, executable, and operational changes visible before deployment.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development contract and [SECURITY.md](SECURITY.md) for the local security boundary and responsible disclosure process.
+
+StructTrace is licensed under the [MIT License](LICENSE).

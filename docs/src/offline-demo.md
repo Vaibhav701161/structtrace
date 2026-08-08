@@ -1,0 +1,14 @@
+# Running the offline demo
+
+The demos are compiled into the StructTrace binary and make no network requests.
+
+```bash
+structtrace demo support-ticket --open
+structtrace demo research --open
+```
+
+The support-ticket demo contains twelve matched routing cases. The candidate improves strict JSON and schema validity from 11/12 to 12/12 while semantic correctness falls from 10/12 to 8/12. Its valid-but-wrong count grows from one to four, so the release gate fails.
+
+The research demo reproduces three accepted paired matrices from the Contract Sensitivity Lab record. The corrected Qwen estimate is positive, while the canonical Llama and practical tool-call estimates are negative. This is evidence that contract-sensitive effects must be measured on the actual workload, not a claim that one representation always wins.
+
+The generated report remains under `.structtrace/runs/<run-id>/report/index.html` after the loopback server is closed.
