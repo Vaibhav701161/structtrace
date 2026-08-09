@@ -1,6 +1,6 @@
 //! BLAKE3 hashing and deterministic JSON serialization.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, io::Read, path::Path};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -17,6 +17,36 @@ pub fn hash_file(path: &Path) -> Result<String> {
     std::fs::read(path)
         .map(|bytes| hash_bytes(&bytes))
         .map_err(read_error(path))
+}
+
+/// Read a regular file without allocating beyond a caller-declared byte ceiling.
+pub fn read_bounded(path: &Path, maximum: usize, label: &str) -> Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).map_err(read_error(path))?;
+    if metadata.file_type().is_symlink() {
+        return Err(CoreError::Artifact(format!(
+            "{label} {} must not be a symbolic link",
+            path.display()
+        )));
+    }
+    if metadata.len() > maximum as u64 {
+        return Err(CoreError::Artifact(format!(
+            "{label} {} is {} bytes; limit is {maximum}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(read_error(path))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error(path))?;
+    if bytes.len() > maximum {
+        return Err(CoreError::Artifact(format!(
+            "{label} {} grew beyond the {maximum}-byte limit while being read",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Serialize a value with recursively sorted object keys.

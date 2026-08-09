@@ -8,10 +8,11 @@ structtrace demo support-ticket --open
 structtrace demo research --open
 ```
 
-The default invoice demo is a deterministic 120-case release scenario. It compares matched invoice extraction
-outputs, surfaces exact field-level improvements and regressions, and produces a `FAILED` headline
-when a configured quality rule is violated. Its 120 matched cases satisfy the configured minimum
-evidence threshold.
+The invoice demo uses twelve genuinely different fixture invoices. Both variants pass 9/12, with
+three baseline-only and three candidate-only transitions. It demonstrates nested field diagnosis,
+valid-but-wrong cases, and gate behavior, but its headline is `INSUFFICIENT EVIDENCE`. It is a
+workflow demonstration, not a release scenario. StructTrace never repeats these rows to satisfy a
+minimum evidence threshold.
 
 The support-ticket demo contains twelve matched routing cases. The candidate improves strict JSON
 and schema validity from 11/12 to 12/12 while semantic correctness falls from 10/12 to 8/12. Its

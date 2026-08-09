@@ -18,7 +18,7 @@ newer:
 ```bash
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
-structtrace doctor
+structtrace doctor --strict
 ```
 
 Create and run an offline recorded-output project:

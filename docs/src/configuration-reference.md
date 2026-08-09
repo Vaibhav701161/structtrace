@@ -26,6 +26,12 @@ Resource limits are configurable within hard safety ceilings:
 
 ```yaml
 limits:
+  max_config_bytes: 1048576
+  max_dataset_bytes: 268435456
+  max_recorded_output_bytes: 536870912
+  max_schema_bytes: 16777216
+  max_cases: 1000000
+  max_jsonl_line_bytes: 16777216
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144
@@ -34,6 +40,11 @@ limits:
 ```
 
 The output limit applies to command, Python, and OpenAI-compatible adapter content. Standard error beyond its retained limit is drained but not stored. The report limit truncates only the shareable HTML view; scored artifacts remain unchanged according to the storage-retention policy. Zero values and values above the compiled hard ceilings fail configuration validation before execution.
+
+Dataset field pointers are required to be disjoint across `input`, `expected`,
+`model_visible_metadata`, and evaluation-only `metadata`. Equal, parent/child, and root overlaps
+are rejected before ingestion so configuration cannot accidentally route a golden answer into a
+variant request.
 
 Latency and cost gate blocks accept `min_coverage` in `[0, 1]`, defaulting to `1.0`. Their
 comparisons are computed only from case IDs with observations for both variants.

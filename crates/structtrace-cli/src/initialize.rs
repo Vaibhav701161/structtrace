@@ -55,6 +55,14 @@ pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<
     ] {
         std::fs::create_dir_all(destination.join(directory))?;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            destination.join(".structtrace"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+    }
     let project_name = destination
         .file_name()
         .and_then(|value| value.to_str())
@@ -217,6 +225,12 @@ storage:
   retain_provider_responses: false
 
 limits:
+  max_config_bytes: 1048576
+  max_dataset_bytes: 268435456
+  max_recorded_output_bytes: 536870912
+  max_schema_bytes: 16777216
+  max_cases: 1000000
+  max_jsonl_line_bytes: 16777216
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144
@@ -251,6 +265,8 @@ analysis:
 gate:
   # The generated two-case fixture is a demonstration, not release evidence.
   min_cases: 100
+  min_unique_cases: 100
+  max_duplicate_case_rate: 0.01
   min_primary_scored_rate: 0.99
   max_primary_evaluator_error_rate: 0.01
   max_primary_not_applicable_rate: 0.0
@@ -264,7 +280,7 @@ gate:
 
 fn readme(project_name: &str, template: InitTemplate) -> String {
     format!(
-        "# {project_name}\n\nStructTrace paired regression project using the `{}` integration.\n\n```bash\nstructtrace doctor\nstructtrace run\nstructtrace report latest --open\nstructtrace gate latest\n```\n",
+        "# {project_name}\n\nStructTrace paired regression project using the `{}` integration.\n\n```bash\nstructtrace doctor --strict\nstructtrace run\nstructtrace report latest --open\nstructtrace gate latest\n```\n",
         match template {
             InitTemplate::Recorded => "recorded-output",
             InitTemplate::Python => "Python-callable",

@@ -43,6 +43,7 @@ struct ExecutionCheckpoint {
     dataset_hash: String,
     schema_hash: String,
     execution_definition_hash: String,
+    implementation_fingerprint: String,
     completed_outputs: BTreeMap<String, String>,
     original_input_hashes: BTreeMap<String, String>,
     source_labels: BTreeMap<String, String>,
@@ -75,14 +76,24 @@ async fn run_configured_inner(
         .canonicalize()
         .with_context(|| format!("project root {} does not exist", project_root.display()))?;
     let config_path = resolve(&project_root, config_path);
-    let config_source_bytes = std::fs::read(&config_path)
-        .with_context(|| format!("could not read configuration {}", config_path.display()))?;
+    let config_source_bytes = structtrace_core::hashing::read_bounded(
+        &config_path,
+        structtrace_core::config::HARD_MAX_CONFIG_BYTES,
+        "configuration",
+    )?;
     let config = Config::from_bytes(&config_path, &config_source_bytes)?;
+    anyhow::ensure!(
+        config_source_bytes.len() <= config.limits.max_config_bytes,
+        "configuration exceeds limits.max_config_bytes"
+    );
     let dataset_path = resolve(&project_root, &config.dataset.path);
-    let dataset = Dataset::read(&dataset_path, &config.dataset.fields)?;
+    let dataset = Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits)?;
     let schema_path = resolve(&project_root, &config.schema.path);
-    let schema_bytes = std::fs::read(&schema_path)
-        .with_context(|| format!("could not read schema {}", schema_path.display()))?;
+    let schema_bytes = structtrace_core::hashing::read_bounded(
+        &schema_path,
+        config.limits.max_schema_bytes,
+        "schema",
+    )?;
     let schema_value: Value = serde_json::from_slice(&schema_bytes)
         .with_context(|| format!("schema {} is not valid JSON", schema_path.display()))?;
     compile_schema(&schema_value)?;
@@ -97,6 +108,7 @@ async fn run_configured_inner(
         "gate": config.gate,
         "limits": config.limits,
     }))?;
+    let implementation_fingerprint = implementation_fingerprint(&project_root, &config)?;
     let expected = ExecutionCheckpoint {
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
         run_id: resume_run_id.clone().unwrap_or_default(),
@@ -105,6 +117,7 @@ async fn run_configured_inner(
         dataset_hash: dataset.source_hash.clone(),
         schema_hash: hash_bytes(&schema_bytes),
         execution_definition_hash: definition_hash,
+        implementation_fingerprint: implementation_fingerprint.clone(),
         completed_outputs: BTreeMap::new(),
         original_input_hashes: BTreeMap::new(),
         source_labels: BTreeMap::new(),
@@ -203,12 +216,193 @@ async fn run_configured_inner(
         baseline,
         candidate,
         Some(run_id),
+        Some(implementation_fingerprint),
     )?;
     let checkpoint_path = completed.run_dir.join("execution-checkpoint.json");
     if checkpoint_path.is_file() {
         std::fs::remove_file(checkpoint_path)?;
     }
     Ok(completed)
+}
+
+fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::Result<String> {
+    let mut sources = BTreeMap::<String, String>::new();
+    collect_project_python_sources(project_root, project_root, &mut sources)?;
+    for lockfile in [
+        "Cargo.lock",
+        "uv.lock",
+        "poetry.lock",
+        "requirements.txt",
+        "requirements.lock",
+        "Pipfile.lock",
+    ] {
+        let path = project_root.join(lockfile);
+        if path.is_file() {
+            sources.insert(lockfile.to_owned(), hash_file(&path)?);
+        }
+    }
+    for (variant_id, variant) in &config.variants {
+        match variant {
+            VariantConfig::Command { command, .. } => {
+                let path = resolve(project_root, Path::new(&command.program));
+                if path.is_file() {
+                    sources.insert(format!("variant:{variant_id}:program"), hash_file(&path)?);
+                }
+            }
+            VariantConfig::Python { callable, .. } => {
+                if let Some((module, _)) = callable.split_once(':') {
+                    let path = project_root.join(format!("{}.py", module.replace('.', "/")));
+                    if path.is_file() {
+                        sources.insert(format!("variant:{variant_id}:python"), hash_file(&path)?);
+                    }
+                }
+            }
+            VariantConfig::Recorded { .. } | VariantConfig::OpenaiCompatible(_) => {}
+        }
+    }
+    for evaluator in &config.evaluators {
+        match &evaluator.kind {
+            structtrace_core::config::EvaluatorKind::Command { command, .. } => {
+                let path = resolve(project_root, Path::new(&command.program));
+                if path.is_file() {
+                    sources.insert(
+                        format!("evaluator:{}:program", evaluator.id),
+                        hash_file(&path)?,
+                    );
+                }
+            }
+            structtrace_core::config::EvaluatorKind::Python { callable, .. } => {
+                if let Some((module, _)) = callable.split_once(':') {
+                    let path = project_root.join(format!("{}.py", module.replace('.', "/")));
+                    if path.is_file() {
+                        sources.insert(
+                            format!("evaluator:{}:python", evaluator.id),
+                            hash_file(&path)?,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let git_commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let git_dirty_hash = std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| hash_bytes(&output.stdout));
+    let git_status_hash = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| hash_bytes(&output.stdout));
+    let interpreters = config
+        .variants
+        .values()
+        .filter_map(|variant| match variant {
+            VariantConfig::Python { interpreter, .. } => Some(interpreter),
+            _ => None,
+        })
+        .chain(
+            config
+                .evaluators
+                .iter()
+                .filter_map(|evaluator| match &evaluator.kind {
+                    structtrace_core::config::EvaluatorKind::Python { interpreter, .. } => {
+                        Some(interpreter)
+                    }
+                    _ => None,
+                }),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|interpreter| {
+            let version = std::process::Command::new(interpreter)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|output| {
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            (interpreter.clone(), version)
+        })
+        .collect::<BTreeMap<_, _>>();
+    hash_canonical_json(&serde_json::json!({
+        "sources": sources,
+        "git_commit": git_commit,
+        "git_dirty_hash": git_dirty_hash,
+        "git_status_hash": git_status_hash,
+        "interpreters": interpreters,
+        "binary": env!("CARGO_PKG_VERSION"),
+    }))
+    .map_err(Into::into)
+}
+
+fn collect_project_python_sources(
+    root: &Path,
+    directory: &Path,
+    output: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::ensure!(
+                path.extension().and_then(|value| value.to_str()) != Some("py"),
+                "Python implementation source must not be a symlink: {}",
+                path.display()
+            );
+            continue;
+        }
+        if file_type.is_dir() {
+            if matches!(
+                name.to_str(),
+                Some(
+                    ".git"
+                        | ".structtrace"
+                        | ".venv"
+                        | ".tox"
+                        | "target"
+                        | "node_modules"
+                        | "dist"
+                        | "build"
+                        | "__pycache__"
+                )
+            ) {
+                continue;
+            }
+            collect_project_python_sources(root, &path, output)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("py") {
+            let metadata = entry.metadata()?;
+            anyhow::ensure!(
+                metadata.len() <= 16 * 1024 * 1024,
+                "Python source is too large to fingerprint: {}",
+                path.display()
+            );
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            output.insert(format!("python-tree:{relative}"), hash_file(&path)?);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,6 +664,11 @@ fn verify_resume_compatibility(
             expected.execution_definition_hash.clone(),
             actual.execution_definition_hash.clone(),
         ),
+        (
+            "implementation fingerprint",
+            expected.implementation_fingerprint.clone(),
+            actual.implementation_fingerprint.clone(),
+        ),
     ];
     let changed = checks
         .into_iter()
@@ -548,6 +747,7 @@ mod tests {
             dataset_hash: "dataset".to_owned(),
             schema_hash: "schema".to_owned(),
             execution_definition_hash: "definition".to_owned(),
+            implementation_fingerprint: "implementation".to_owned(),
             completed_outputs: BTreeMap::new(),
             original_input_hashes: BTreeMap::new(),
             source_labels: BTreeMap::new(),
@@ -561,6 +761,15 @@ mod tests {
         actual.dataset_hash = "changed".to_owned();
         let error = verify_resume_compatibility(&expected, &actual).unwrap_err();
         assert!(error.to_string().contains("dataset hash"));
+    }
+
+    #[test]
+    fn resume_refuses_changed_implementation_fingerprint() {
+        let expected = checkpoint();
+        let mut actual = expected.clone();
+        actual.implementation_fingerprint = "changed-code".to_owned();
+        let error = verify_resume_compatibility(&expected, &actual).unwrap_err();
+        assert!(error.to_string().contains("implementation fingerprint"));
     }
 
     #[tokio::test]

@@ -12,7 +12,11 @@
 | `required_fields` | configured output pointers exist and are non-null |
 | `tool_selection` | tool name matches expected |
 | `tool_arguments` | selected argument pointers match expected |
-| `keyed_array` | order-independent array matching with explicit missing, extra, and changed keys |
+| `keyed_array` | order-independent identity matching plus optional per-item exact, normalized-string, exact-integer, decimal-tolerance, and canonical-date comparisons |
 | `financial_invariants` | line amount, subtotal, and total arithmetic using exact decimals |
 
 Numeric evaluation does not round through binary floating point. Arbitrary-length integer text is normalized exactly, and decimal tolerances use exact decimal arithmetic. Missing expected values or malformed numeric references produce explicit evaluator errors.
+
+For invoice line items, `fields` makes item diagnosis practical instead of comparing the whole
+object byte-for-byte. Every failed field is attributed to its concrete array index and pointer;
+missing, extra, changed-identity, and changed-value cases remain distinguishable.

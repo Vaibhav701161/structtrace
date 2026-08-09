@@ -52,7 +52,14 @@ impl RunStore {
         std::fs::create_dir_all(run_dir.join("logs"))?;
         std::fs::create_dir_all(run_dir.join("report"))?;
         std::fs::create_dir_all(run_dir.join("exports"))?;
+        harden_directory_permissions(root)?;
+        harden_directory_permissions(&root.join("runs"))?;
+        harden_directory_permissions(&run_dir)?;
+        harden_directory_permissions(&run_dir.join("logs"))?;
+        harden_directory_permissions(&run_dir.join("report"))?;
+        harden_directory_permissions(&run_dir.join("exports"))?;
         let connection = Connection::open(run_dir.join("run.sqlite3"))?;
+        harden_file_permissions(&run_dir.join("run.sqlite3"))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", true)?;
         migrate(&connection)?;
@@ -242,6 +249,30 @@ impl RunStore {
     }
 }
 
+#[cfg(unix)]
+fn harden_directory_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_directory_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_file_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_file_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn optional_json(value: Option<&serde_json::Value>) -> anyhow::Result<Option<String>> {
     value
         .map(serde_json::to_string)
@@ -391,6 +422,30 @@ mod tests {
         store.set_status("01ABC", RunStatus::Validating).unwrap();
         assert_eq!(store.status("01ABC").unwrap(), RunStatus::Validating);
         store.checkpoint().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_run_storage() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let store = RunStore::create(directory.path(), "01PRIVATE").unwrap();
+        assert_eq!(
+            std::fs::metadata(store.run_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(store.run_dir().join("run.sqlite3"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

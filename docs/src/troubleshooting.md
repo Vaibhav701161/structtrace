@@ -1,6 +1,8 @@
 # Troubleshooting
 
-Run `structtrace doctor` first. It never contacts a provider.
+Run `structtrace doctor --strict` first. It never contacts a provider. Strict mode validates bounded
+sources, pointer isolation, semantic duplicates, exact golden-value echoes, Python callable imports,
+and Unix storage permissions in addition to the ordinary environment checks.
 
 **Configuration refused:** unknown fields, missing baseline/candidate variants, duplicate evaluator IDs, undefined outcome references, and unsupported versions fail closed. Validate against `schemas/structtrace.schema.json` for editor feedback.
 

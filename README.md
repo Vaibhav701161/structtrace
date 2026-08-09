@@ -48,9 +48,10 @@ structtrace demo invoice --open
 structtrace init invoice-extractor --preset extraction
 ```
 
-The bundled 120-case release scenario records 90/120 baseline passes and 75/120 candidate passes,
-with 30 baseline-only and 15 candidate-only transitions. Its release gate is `FAILED`, not merely
-underpowered. The generated 12-case extraction project remains an inspectable onboarding fixture.
+The bundled demo is deliberately an honest 12-case workflow demonstration: both variants pass
+9/12, with three regressions and three improvements. Its gate is `INSUFFICIENT EVIDENCE` because a
+small fixture must not be presented as release evidence. StructTrace fingerprints semantic cases,
+reports duplicates, resamples one unit per fingerprint, and requires an explicit unique-case gate.
 Its exact hotspot acceptance test requires:
 
 | Pointer | Regressions | Improvements | Candidate failures |
@@ -58,6 +59,7 @@ Its exact hotspot acceptance test requires:
 | `/total` | 2 | 0 | 2 |
 | `/tax` | 1 | 0 | 1 |
 | `/line_items` | 1 | 0 | 1 |
+| `/subtotal` | 1 | 0 | 1 |
 | `/vendor_name` | 0 | 1 | 0 |
 | `/currency` | 0 | 2 | 0 |
 
@@ -67,9 +69,9 @@ Its exact hotspot acceptance test requires:
 - external JSON Schema validation with remote retrieval disabled;
 - deterministic extraction, classification, and tool-argument evaluators;
 - valid-but-wrong counts as a first-class result;
-- the complete paired 2x2 transition matrix;
-- candidate-minus-baseline percentage-point effect;
-- exact McNemar test and seeded paired bootstrap interval;
+- a complete-denominator deployment-success view and separate jointly scored semantic view;
+- an independent paired 2x2 matrix over canonical semantic fingerprints;
+- duplicate-aware exact McNemar testing and seeded paired bootstrap interval;
 - field-level regression and improvement hotspots;
 - mean, median, and p95 latency, retries, token use, and user-priced cost;
 - a filterable case explorer with JSON-aware diffs;
@@ -94,7 +96,7 @@ git clone https://github.com/Vaibhav701161/structtrace.git
 cd structtrace
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
-structtrace doctor
+structtrace doctor --strict
 ```
 
 The release workflow and checksum-verifying installers are release-candidate assets. They become
@@ -146,7 +148,8 @@ Built-in deterministic evaluators cover:
 - enum/classification accuracy;
 - Unicode-normalized strings and calendar-aware canonical dates;
 - arbitrary-length exact integers and exact-decimal numeric tolerance;
-- keyed array matching with missing/extra item evidence and financial invariants;
+- keyed array identity matching with nested normalized, integer, decimal, and date field evidence;
+- exact-decimal invoice financial invariants with path-specific diagnostics;
 - required fields;
 - tool selection;
 - selected tool arguments;
@@ -188,6 +191,8 @@ Rules are evaluated independently. A schema improvement cannot hide a semantic r
 ```yaml
 gate:
   min_cases: 100
+  min_unique_cases: 100
+  max_duplicate_case_rate: 0.01
   min_primary_scored_rate: 0.99
   max_primary_evaluator_error_rate: 0.01
   max_primary_not_applicable_rate: 0.0
@@ -244,7 +249,8 @@ intervals, and every gate rule. It does not rerun a model or reproduce provider 
 Side-effecting external evaluator programs are not re-executed: their definition-, request-, and
 response-bound receipts are verified instead. Local
 hashes establish integrity and consistency, not cryptographic authorship. Resume is allowed only
-when all bound experimental inputs still match.
+when all bound experimental inputs still match, including local entry-source files, dependency
+lockfiles, the Git commit, and the dirty-tree fingerprint.
 
 ## Privacy boundary
 
@@ -271,6 +277,12 @@ Output, subprocess diagnostics, and report embedding are bounded independently. 
 
 ```yaml
 limits:
+  max_config_bytes: 1048576
+  max_dataset_bytes: 268435456
+  max_recorded_output_bytes: 536870912
+  max_schema_bytes: 16777216
+  max_cases: 1000000
+  max_jsonl_line_bytes: 16777216
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144

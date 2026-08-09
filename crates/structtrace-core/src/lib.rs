@@ -18,7 +18,7 @@ pub mod statistics;
 pub use error::{CoreError, Result};
 
 /// Current on-disk artifact format.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 4;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 5;
 
 /// Current command and evaluator JSONL protocol.
 pub const PROTOCOL_VERSION: u32 = 1;

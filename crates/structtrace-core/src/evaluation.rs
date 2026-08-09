@@ -8,7 +8,7 @@ use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    config::{EvaluatorConfig, EvaluatorKind, OutcomeConfig, PointerPair},
+    config::{EvaluatorConfig, EvaluatorKind, KeyedArrayField, OutcomeConfig, PointerPair},
     dataset::Case,
     output::{OutputStatus, VariantOutput},
 };
@@ -406,7 +406,16 @@ fn evaluate_builtin(
             pointer,
             expected_pointer,
             keys,
-        } => evaluate_keyed_array(id, output, expected, pointer, expected_pointer, keys),
+            fields,
+        } => evaluate_keyed_array(
+            id,
+            output,
+            expected,
+            pointer,
+            expected_pointer,
+            keys,
+            fields,
+        ),
         EvaluatorKind::FinancialInvariants {
             line_items_pointer,
             subtotal_pointer,
@@ -826,6 +835,7 @@ fn evaluate_keyed_array(
     pointer: &str,
     expected_pointer: &str,
     keys: &[String],
+    field_configs: &[KeyedArrayField],
 ) -> EvaluatorResult {
     let Some(expected) = expected else {
         return field_error(
@@ -853,8 +863,8 @@ fn evaluate_keyed_array(
             Value::Null,
         );
     };
-    let actual_map = keyed_items(actual_items, keys);
-    let expected_map = keyed_items(expected_items, keys);
+    let actual_map = keyed_items(actual_items, keys, field_configs);
+    let expected_map = keyed_items(expected_items, keys, field_configs);
     let (Ok(actual_map), Ok(expected_map)) = (actual_map, expected_map) else {
         return field_result(
             id,
@@ -877,45 +887,202 @@ fn evaluate_keyed_array(
         .filter(|key| !expected_map.contains_key(*key))
         .cloned()
         .collect::<Vec<_>>();
-    let changed = expected_map
-        .iter()
-        .filter(|(key, value)| actual_map.get(*key).is_some_and(|actual| actual != *value))
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
+    let mut changed = Vec::new();
+    let mut field_facts = Vec::new();
+    if !missing.is_empty() || !extra.is_empty() {
+        field_facts.push(FieldEvaluationFact {
+            pointer: pointer.to_owned(),
+            expected_pointer: Some(expected_pointer.to_owned()),
+            status: EvaluationStatus::Failed,
+            expected: reference.cloned(),
+            actual: actual.cloned(),
+            message: format!(
+                "Keyed array has {} missing and {} extra identity-matched item(s).",
+                missing.len(),
+                extra.len()
+            ),
+        });
+    }
+    let mut had_error = false;
+    for (key, (expected_index, expected_item)) in &expected_map {
+        let Some((actual_index, actual_item)) = actual_map.get(key) else {
+            continue;
+        };
+        if field_configs.is_empty() {
+            if actual_item != expected_item {
+                changed.push(key.clone());
+            }
+            continue;
+        }
+        let mut item_changed = false;
+        for field in field_configs {
+            let actual_value = actual_item.pointer(&field.pointer);
+            let expected_value = expected_item.pointer(&field.pointer);
+            let (field_status, message) = compare_keyed_field(field, actual_value, expected_value);
+            item_changed |= field_status != EvaluationStatus::Passed;
+            had_error |= field_status == EvaluationStatus::Error;
+            field_facts.push(FieldEvaluationFact {
+                pointer: format!("{pointer}/{actual_index}{}", field.pointer),
+                expected_pointer: Some(format!(
+                    "{expected_pointer}/{expected_index}{}",
+                    field.pointer
+                )),
+                status: field_status,
+                expected: expected_value.cloned(),
+                actual: actual_value.cloned(),
+                message: message.to_owned(),
+            });
+        }
+        if item_changed {
+            changed.push(key.clone());
+        }
+    }
     let status = if missing.is_empty() && extra.is_empty() && changed.is_empty() {
-        EvaluationStatus::Passed
+        if had_error {
+            EvaluationStatus::Error
+        } else {
+            EvaluationStatus::Passed
+        }
+    } else if had_error {
+        EvaluationStatus::Error
     } else {
         EvaluationStatus::Failed
     };
-    field_result(
-        id,
-        status,
-        pointer,
-        expected_pointer,
-        actual,
-        reference,
-        if status == EvaluationStatus::Passed {
-            "Keyed array items matched independent of order."
-        } else {
-            "Keyed array had missing, extra, or changed items."
-        },
-        serde_json::json!({"missing": missing, "extra": extra, "changed": changed}),
-    )
+    let message = if status == EvaluationStatus::Passed {
+        "Keyed array items matched independent of order."
+    } else if status == EvaluationStatus::Error {
+        "Keyed-array field comparison could not be evaluated reliably."
+    } else {
+        "Keyed array had missing, extra, or changed items."
+    };
+    let details = serde_json::json!({"missing": missing, "extra": extra, "changed": changed});
+    let result = match status {
+        EvaluationStatus::Passed => EvaluatorResult::passed(id, message, details),
+        EvaluationStatus::Failed => EvaluatorResult::failed(id, message, details),
+        EvaluationStatus::Error => EvaluatorResult::error(id, message),
+        EvaluationStatus::NotApplicable => unreachable!(),
+    };
+    result.with_fields(field_facts)
 }
 
-fn keyed_items<'a>(items: &'a [Value], keys: &[String]) -> Result<BTreeMap<String, &'a Value>, ()> {
+fn compare_keyed_field(
+    field: &KeyedArrayField,
+    actual: Option<&Value>,
+    expected: Option<&Value>,
+) -> (EvaluationStatus, &'static str) {
+    let Some(expected) = expected else {
+        return (
+            EvaluationStatus::Error,
+            "Expected item field did not resolve.",
+        );
+    };
+    let Some(actual) = actual else {
+        return (
+            EvaluationStatus::Failed,
+            "Output item field did not resolve.",
+        );
+    };
+    let passed = match field.evaluator.as_str() {
+        "exact" => actual == expected,
+        "normalized_string" => {
+            actual
+                .as_str()
+                .zip(expected.as_str())
+                .is_some_and(|(actual, expected)| {
+                    normalize_text(actual, field.case_insensitive)
+                        == normalize_text(expected, field.case_insensitive)
+                })
+        }
+        "exact_integer" => {
+            number_text(actual)
+                .zip(number_text(expected))
+                .is_some_and(|(actual, expected)| {
+                    canonical_integer(actual) == canonical_integer(expected)
+                        && canonical_integer(actual).is_some()
+                })
+        }
+        "decimal_tolerance" => decimal_value(Some(actual))
+            .zip(decimal_value(Some(expected)))
+            .zip(
+                field
+                    .absolute
+                    .as_deref()
+                    .and_then(|value| Decimal::from_str(value).ok()),
+            )
+            .is_some_and(|((actual, expected), tolerance)| (actual - expected).abs() <= tolerance),
+        "canonical_date" => {
+            actual
+                .as_str()
+                .zip(expected.as_str())
+                .is_some_and(|(actual, expected)| {
+                    canonical_date(actual, &field.formats)
+                        == canonical_date(expected, &field.formats)
+                        && canonical_date(actual, &field.formats).is_some()
+                })
+        }
+        _ => {
+            return (
+                EvaluationStatus::Error,
+                "Keyed-array field evaluator is unsupported.",
+            );
+        }
+    };
+    if passed {
+        (
+            EvaluationStatus::Passed,
+            "Matched using the configured item-field comparator.",
+        )
+    } else {
+        (
+            EvaluationStatus::Failed,
+            "Did not match using the configured item-field comparator.",
+        )
+    }
+}
+
+fn keyed_items<'a>(
+    items: &'a [Value],
+    keys: &[String],
+    fields: &[KeyedArrayField],
+) -> Result<BTreeMap<String, (usize, &'a Value)>, ()> {
     let mut indexed = BTreeMap::new();
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let identity = keys
             .iter()
-            .map(|key| item.pointer(key).ok_or(()))
+            .map(|key| {
+                let value = item.pointer(key).ok_or(())?;
+                Ok(normalized_key_value(
+                    value,
+                    fields.iter().find(|field| field.pointer == *key),
+                ))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let identity = serde_json::to_string(&identity).map_err(|_| ())?;
-        if indexed.insert(identity, item).is_some() {
+        if indexed.insert(identity, (index, item)).is_some() {
             return Err(());
         }
     }
     Ok(indexed)
+}
+
+fn normalized_key_value(value: &Value, field: Option<&KeyedArrayField>) -> Value {
+    let Some(field) = field else {
+        return value.clone();
+    };
+    match field.evaluator.as_str() {
+        "normalized_string" => value.as_str().map_or_else(
+            || value.clone(),
+            |text| Value::String(normalize_text(text, field.case_insensitive)),
+        ),
+        "exact_integer" => number_text(value)
+            .and_then(canonical_integer)
+            .map_or_else(|| value.clone(), Value::String),
+        "canonical_date" => value
+            .as_str()
+            .and_then(|text| canonical_date(text, &field.formats))
+            .map_or_else(|| value.clone(), Value::String),
+        _ => value.clone(),
+    }
 }
 
 fn evaluate_financial_invariants(
@@ -977,9 +1144,20 @@ fn evaluate_financial_invariants(
     let subtotal = decimal_value(output.pointer(subtotal_pointer));
     let tax = decimal_value(output.pointer(tax_pointer));
     let total = decimal_value(output.pointer(total_pointer));
+    if tax.is_none() {
+        had_error = true;
+        fields.push(FieldEvaluationFact {
+            pointer: tax_pointer.to_owned(),
+            expected_pointer: None,
+            status: EvaluationStatus::Error,
+            expected: None,
+            actual: output.pointer(tax_pointer).cloned(),
+            message: "Required financial value was missing or nonnumeric.".to_owned(),
+        });
+    }
     for (pointer, actual, expected_value, message) in [
         (
-            line_items_pointer,
+            subtotal_pointer,
             subtotal,
             Some(item_sum),
             "Subtotal must equal the sum of line amounts.",
@@ -1435,6 +1613,7 @@ mod tests {
             "/items",
             "/items",
             &keys,
+            &[],
         );
         assert_eq!(reordered.status, EvaluationStatus::Passed);
         let missing = evaluate_keyed_array(
@@ -1444,9 +1623,137 @@ mod tests {
             "/items",
             "/items",
             &keys,
+            &[],
         );
         assert_eq!(missing.status, EvaluationStatus::Failed);
         assert_eq!(missing.details["missing"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keyed_arrays_apply_field_specific_invoice_semantics() {
+        let keys = vec!["/description".to_owned()];
+        let fields = vec![
+            KeyedArrayField {
+                pointer: "/description".to_owned(),
+                evaluator: "normalized_string".to_owned(),
+                absolute: None,
+                case_insensitive: true,
+                formats: vec!["iso".to_owned()],
+            },
+            KeyedArrayField {
+                pointer: "/quantity".to_owned(),
+                evaluator: "exact_integer".to_owned(),
+                absolute: None,
+                case_insensitive: true,
+                formats: vec!["iso".to_owned()],
+            },
+            KeyedArrayField {
+                pointer: "/amount".to_owned(),
+                evaluator: "decimal_tolerance".to_owned(),
+                absolute: Some("0.01".to_owned()),
+                case_insensitive: true,
+                formats: vec!["iso".to_owned()],
+            },
+        ];
+        let result = evaluate_keyed_array(
+            "items",
+            &json!({"items": [{"description": " Widget ", "quantity": "01", "amount": "10.0"}]}),
+            Some(&json!({"items": [{"description": "widget", "quantity": 1, "amount": "10.00"}]})),
+            "/items",
+            "/items",
+            &keys,
+            &fields,
+        );
+        assert_eq!(result.status, EvaluationStatus::Passed);
+        assert_eq!(result.fields.len(), 3);
+        assert!(
+            result
+                .fields
+                .iter()
+                .all(|field| field.status == EvaluationStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn financial_invariants_attribute_failures_to_exact_paths() {
+        let base = json!({
+            "line_items": [{"quantity": "2", "unit_price": "5.00", "amount": "10.00"}],
+            "subtotal": "10.00", "tax": "1.00", "total": "11.00"
+        });
+        let evaluate = |value: &Value| {
+            evaluate_financial_invariants(
+                "financial",
+                value,
+                "/line_items",
+                "/subtotal",
+                "/tax",
+                "/total",
+                "0.01",
+            )
+        };
+
+        let mut wrong_amount = base.clone();
+        wrong_amount["line_items"][0]["amount"] = json!("9.00");
+        let result = evaluate(&wrong_amount);
+        let fact = result
+            .fields
+            .iter()
+            .find(|fact| fact.pointer == "/line_items/0/amount")
+            .unwrap();
+        assert_eq!(fact.status, EvaluationStatus::Failed);
+        assert_eq!(fact.expected, Some(json!("10")));
+        assert_eq!(fact.actual, Some(json!("9.00")));
+        assert_eq!(
+            fact.message,
+            "Line amount must equal quantity multiplied by unit price."
+        );
+
+        let mut wrong_subtotal = base.clone();
+        wrong_subtotal["subtotal"] = json!("12.00");
+        let result = evaluate(&wrong_subtotal);
+        let fact = result
+            .fields
+            .iter()
+            .find(|fact| fact.pointer == "/subtotal")
+            .unwrap();
+        assert_eq!(fact.status, EvaluationStatus::Failed);
+        assert_eq!(fact.expected, Some(json!("10")));
+        assert_eq!(fact.actual, Some(json!("12")));
+        assert_eq!(fact.message, "Subtotal must equal the sum of line amounts.");
+
+        let mut wrong_total = base.clone();
+        wrong_total["total"] = json!("12.00");
+        let result = evaluate(&wrong_total);
+        let fact = result
+            .fields
+            .iter()
+            .find(|fact| fact.pointer == "/total")
+            .unwrap();
+        assert_eq!(fact.status, EvaluationStatus::Failed);
+        assert_eq!(fact.expected, Some(json!("11")));
+        assert_eq!(fact.actual, Some(json!("12")));
+
+        let mut missing_tax = base.clone();
+        missing_tax.as_object_mut().unwrap().remove("tax");
+        let result = evaluate(&missing_tax);
+        let fact = result
+            .fields
+            .iter()
+            .find(|fact| fact.pointer == "/tax")
+            .unwrap();
+        assert_eq!(fact.status, EvaluationStatus::Error);
+        assert_eq!(fact.actual, None);
+
+        let mut nonnumeric_subtotal = base;
+        nonnumeric_subtotal["subtotal"] = json!("not-a-number");
+        let result = evaluate(&nonnumeric_subtotal);
+        let fact = result
+            .fields
+            .iter()
+            .find(|fact| fact.pointer == "/subtotal")
+            .unwrap();
+        assert_eq!(fact.status, EvaluationStatus::Error);
+        assert_eq!(fact.actual, Some(json!("not-a-number")));
     }
 
     proptest! {

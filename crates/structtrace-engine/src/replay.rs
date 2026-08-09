@@ -440,7 +440,32 @@ fn safe_artifact_path(run_dir: &Path, relative: &str) -> anyhow::Result<std::pat
         "manifest contains unsafe artifact path `{}`",
         relative.display()
     );
-    Ok(run_dir.join(relative))
+    let canonical_root = run_dir
+        .canonicalize()
+        .with_context(|| format!("could not canonicalize run directory {}", run_dir.display()))?;
+    let mut current = canonical_root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!()
+        };
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("artifact {} is missing", current.display()))?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "manifest artifact path contains a symbolic link: {}",
+            current.display()
+        );
+    }
+    let canonical = current
+        .canonicalize()
+        .with_context(|| format!("could not canonicalize artifact {}", current.display()))?;
+    anyhow::ensure!(
+        canonical.starts_with(&canonical_root),
+        "manifest artifact escaped the run directory: {}",
+        canonical.display()
+    );
+    Ok(canonical)
 }
 
 fn transition_name(baseline: bool, candidate: bool) -> &'static str {
@@ -482,6 +507,18 @@ mod tests {
     fn rejects_path_traversal_from_a_manifest() {
         assert!(safe_artifact_path(Path::new("run"), "../secret").is_err());
         assert!(safe_artifact_path(Path::new("run"), "/secret").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_manifest_artifacts() {
+        use std::os::unix::fs::symlink;
+        let run = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "sensitive").unwrap();
+        symlink(outside.path().join("secret"), run.path().join("artifact")).unwrap();
+        let error = safe_artifact_path(run.path(), "artifact").unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
     }
 
     #[test]

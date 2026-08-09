@@ -42,6 +42,13 @@ struct ReportView {
     default_filter: String,
     difference: String,
     interval: String,
+    total_rows: usize,
+    unique_cases: usize,
+    duplicate_groups: usize,
+    largest_duplicate_group: usize,
+    semantic_jointly_scored: usize,
+    semantic_excluded: usize,
+    semantic_difference: String,
     baseline_primary: MetricView,
     candidate_primary: MetricView,
     structural_rows: Vec<ComparisonRow>,
@@ -410,8 +417,24 @@ fn verify_bound_artifact(
         .artifacts
         .get(relative)
         .with_context(|| format!("manifest does not bind `{relative}`"))?;
-    let path = run_dir.join(relative_path);
+    let canonical_root = run_dir.canonicalize()?;
+    let mut path = canonical_root.clone();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(component) = component else {
+            unreachable!()
+        };
+        path.push(component);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "bound artifact contains a symlink: {relative}"
+        );
+    }
     anyhow::ensure!(path.is_file(), "bound artifact is missing: {relative}");
+    anyhow::ensure!(
+        path.canonicalize()?.starts_with(canonical_root),
+        "bound artifact escaped run directory: {relative}"
+    );
     let observed = hash_file(&path)?;
     anyhow::ensure!(
         &observed == expected,
@@ -629,6 +652,16 @@ fn build_view(
             "[{:.2}, {:.2}] pp",
             summary.bootstrap.lower_pp, summary.bootstrap.upper_pp
         ),
+        total_rows: summary.evidence.total_rows,
+        unique_cases: summary.evidence.unique_semantic_cases,
+        duplicate_groups: summary.evidence.exact_duplicate_groups,
+        largest_duplicate_group: summary.evidence.largest_duplicate_group,
+        semantic_jointly_scored: summary.jointly_scored_semantic.jointly_scored_cases,
+        semantic_excluded: summary.jointly_scored_semantic.excluded_pairs,
+        semantic_difference: format!(
+            "{:+.2} pp",
+            summary.jointly_scored_semantic.paired.difference_pp
+        ),
         baseline_primary: metric(summary.baseline.primary_pass, summary.baseline.total),
         candidate_primary: metric(summary.candidate.primary_pass, summary.candidate.total),
         structural_rows,
@@ -690,7 +723,15 @@ fn build_view(
             ),
             (
                 "Total paired cases".to_owned(),
-                summary.paired.total.to_string(),
+                summary.evidence.total_rows.to_string(),
+            ),
+            (
+                "Unique semantic cases".to_owned(),
+                summary.evidence.unique_semantic_cases.to_string(),
+            ),
+            (
+                "Exact duplicate groups".to_owned(),
+                summary.evidence.exact_duplicate_groups.to_string(),
             ),
             (
                 "Primary scored cases".to_owned(),
@@ -706,8 +747,14 @@ fn build_view(
                 "Jointly scored cases".to_owned(),
                 format!(
                     "{} / {}",
-                    summary.primary_jointly_scored, summary.paired.total
+                    summary.primary_jointly_scored, summary.evidence.total_rows
                 ),
+            ),
+            (
+                "Semantic exclusion reasons".to_owned(),
+                compact_json(&serde_json::to_value(
+                    &summary.jointly_scored_semantic.exclusion_reasons,
+                )?),
             ),
             (
                 "Discordant cases".to_owned(),
@@ -730,6 +777,15 @@ fn build_view(
             (
                 "Execution schedule".to_owned(),
                 manifest.execution_schedule.clone(),
+            ),
+            (
+                "Implementation fingerprint".to_owned(),
+                manifest
+                    .implementation_fingerprint
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "recorded outputs; source artifacts are hash-bound".to_owned()
+                    }),
             ),
             (
                 "Variant definitions".to_owned(),
@@ -1251,9 +1307,17 @@ const TEMPLATE: &str = r##"<!doctype html>
   <section class="metrics" aria-label="Executive summary">
     <div class="metric"><span>Baseline primary outcome</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
     <div class="metric"><span>Candidate primary outcome</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
-    <div class="metric"><span>Paired difference</span><strong>{{ difference }}</strong>candidate minus baseline</div>
-    <div class="metric"><span>Paired bootstrap interval</span><strong>{{ interval }}</strong>seeded matched resampling</div>
+    <div class="metric"><span>Independent paired difference</span><strong>{{ difference }}</strong>candidate minus baseline</div>
+    <div class="metric"><span>Independent bootstrap interval</span><strong>{{ interval }}</strong>one unit per semantic fingerprint</div>
   </section>
+
+  <h2>Evidence independence</h2>
+  <p class="muted">Exact semantic duplicates remain visible descriptively but cannot multiply the inferential denominator or satisfy the unique-evidence gate.</p>
+  <table><thead><tr><th>Total rows</th><th>Unique semantic cases</th><th>Duplicate groups</th><th>Largest group</th></tr></thead><tbody><tr><td class="num">{{ total_rows }}</td><td class="num">{{ unique_cases }}</td><td class="num">{{ duplicate_groups }}</td><td class="num">{{ largest_duplicate_group }}</td></tr></tbody></table>
+
+  <h2>Deployment success versus semantic effect</h2>
+  <p class="muted">The release gate uses complete-denominator deployment success. The semantic-only estimate includes only independent pairs where both primary outcomes explicitly resolved to true or false; operational failures are not relabeled as semantic errors.</p>
+  <table><thead><tr><th>Estimate</th><th>Included pairs</th><th>Excluded operational/error pairs</th><th>Candidate minus baseline</th></tr></thead><tbody><tr><td>Jointly scored semantic effect</td><td class="num">{{ semantic_jointly_scored }}</td><td class="num">{{ semantic_excluded }}</td><td class="num">{{ semantic_difference }}</td></tr></tbody></table>
 
   {% if research_studies %}<section><h2>Accepted research matrices</h2><p class="muted">The same class of contract-preserving change had different effects across evaluated systems. These are compact normalized outcomes, not universal model rankings.</p><table><thead><tr><th>Study</th><th>Baseline correct</th><th>Candidate correct</th><th>Candidate-only</th><th>Baseline-only</th></tr></thead><tbody>{% for study in research_studies %}<tr><td>{{ study.label }}</td><td class="num">{{ study.baseline.count }}/{{ study.baseline.total }}</td><td class="num">{{ study.candidate.count }}/{{ study.candidate.total }}</td><td class="num">{{ study.candidate_only }}</td><td class="num">{{ study.baseline_only }}</td></tr>{% endfor %}</tbody></table></section>{% endif %}
 
@@ -1261,7 +1325,7 @@ const TEMPLATE: &str = r##"<!doctype html>
   <p class="muted">Validity and correctness are deliberately separate. A schema-valid output can still fail the configured semantic or executable outcome.</p>
   <table><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody>{% for row in structural_rows %}<tr><td>{{ row.label }}</td><td class="num">{{ row.baseline.count }}/{{ row.baseline.total }} · {{ row.baseline.percent }}</td><td class="num">{{ row.candidate.count }}/{{ row.candidate.total }} · {{ row.candidate.percent }}</td></tr>{% endfor %}</tbody></table>
 
-  <h2>Paired transition matrix</h2>
+  <h2>Independent deployment-success transition matrix</h2>
   <div class="matrix" aria-label="Paired transition matrix"><div class="cell"><span>Both pass</span><strong>{{ transition.both_pass }}</strong></div><div class="cell loss"><span>Baseline-only pass</span><strong>{{ transition.baseline_only }}</strong></div><div class="cell win"><span>Candidate-only pass</span><strong>{{ transition.candidate_only }}</strong></div><div class="cell"><span>Both fail</span><strong>{{ transition.both_fail }}</strong></div></div>
 
   <h2>Release gate</h2><div class="panel">{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
@@ -1420,6 +1484,29 @@ mod tests {
             baseline: variant.clone(),
             candidate: variant,
             primary_jointly_scored: total,
+            evidence: structtrace_core::artifact::EvidenceSummary {
+                total_rows: total,
+                unique_semantic_cases: total,
+                exact_duplicate_groups: 0,
+                largest_duplicate_group: usize::from(total > 0),
+                duplicate_case_rate: 0.0,
+                effective_gate_denominator: total,
+            },
+            independent_paired: paired.clone(),
+            independent_bootstrap: BootstrapInterval {
+                lower_pp: 0.0,
+                upper_pp: 0.0,
+                confidence: 0.95,
+                samples: 100,
+                seed: 17,
+            },
+            jointly_scored_semantic: structtrace_core::artifact::SemanticEffectSummary {
+                jointly_scored_cases: total,
+                excluded_pairs: 0,
+                exclusion_reasons: BTreeMap::new(),
+                paired: paired.clone(),
+                bootstrap: None,
+            },
             matched_operational: Default::default(),
             paired,
             bootstrap: BootstrapInterval {

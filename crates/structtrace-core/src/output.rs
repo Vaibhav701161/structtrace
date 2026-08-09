@@ -5,7 +5,12 @@ use std::{collections::HashMap, path::Path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{CoreError, Result, dataset::Dataset, error::read_error, hashing::hash_bytes};
+use crate::{
+    CoreError, Result,
+    config::LimitsConfig,
+    dataset::Dataset,
+    hashing::{hash_bytes, read_bounded},
+};
 
 /// Success or retained failure.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,12 +123,19 @@ pub struct RecordedOutputs {
     pub rows: Vec<VariantOutput>,
     /// Hash of exact JSONL source bytes.
     pub source_hash: String,
+    /// Exact bounded source bytes used for parsing and retention.
+    pub source_bytes: Vec<u8>,
 }
 
 impl RecordedOutputs {
     /// Read a JSONL envelope and match it to the complete dataset denominator.
     pub fn read(path: &Path, dataset: &Dataset) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(read_error(path))?;
+        Self::read_bounded(path, dataset, &LimitsConfig::default())
+    }
+
+    /// Read recorded outputs under configured artifact and JSONL-line ceilings.
+    pub fn read_bounded(path: &Path, dataset: &Dataset, limits: &LimitsConfig) -> Result<Self> {
+        let bytes = read_bounded(path, limits.max_recorded_output_bytes, "recorded output")?;
         let text = std::str::from_utf8(&bytes).map_err(|error| CoreError::RecordedOutput {
             line: 1,
             message: format!("output file is not valid UTF-8: {error}"),
@@ -136,6 +148,16 @@ impl RecordedOutputs {
         let mut by_id = HashMap::new();
         for (index, line) in text.lines().enumerate() {
             let line_number = index + 1;
+            if line.len() > limits.max_jsonl_line_bytes {
+                return Err(CoreError::RecordedOutput {
+                    line: line_number,
+                    message: format!(
+                        "JSONL line is {} bytes; limit is {}",
+                        line.len(),
+                        limits.max_jsonl_line_bytes
+                    ),
+                });
+            }
             if line.trim().is_empty() {
                 return Err(CoreError::RecordedOutput {
                     line: line_number,
@@ -185,6 +207,7 @@ impl RecordedOutputs {
         Ok(Self {
             rows,
             source_hash: hash_bytes(&bytes),
+            source_bytes: bytes,
         })
     }
 }

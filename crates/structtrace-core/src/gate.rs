@@ -9,6 +9,10 @@ use crate::{config::GateConfig, statistics::PairedMetrics};
 pub struct GateInputs<'a> {
     /// Complete matched case count.
     pub total_cases: usize,
+    /// Distinct canonical semantic evidence units.
+    pub unique_cases: usize,
+    /// Fraction of rows beyond the first member of each semantic group.
+    pub duplicate_case_rate: f64,
     /// Minimum explicit pass-or-fail scoring rate across both variants.
     pub primary_scored_rate: f64,
     /// Maximum primary evaluator-error rate across both variants.
@@ -120,6 +124,8 @@ pub struct GateDecision {
 /// Evaluate all configured rules without allowing one metric to hide another.
 pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecision {
     let gate_configured = config.min_cases.is_some()
+        || config.min_unique_cases.is_some()
+        || config.max_duplicate_case_rate.is_some()
         || config.min_primary_scored_rate.is_some()
         || config.max_primary_evaluator_error_rate.is_some()
         || config.max_primary_not_applicable_rate.is_some()
@@ -143,6 +149,18 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
             config.min_cases.map(|value| value as f64),
             inputs.total_cases as f64,
             "paired case count",
+        ),
+        required_minimum_rule(
+            "min_unique_cases",
+            config.min_unique_cases.map(|value| value as f64),
+            inputs.unique_cases as f64,
+            "unique semantic case count",
+        ),
+        required_maximum_rule(
+            "max_duplicate_case_rate",
+            config.max_duplicate_case_rate,
+            inputs.duplicate_case_rate,
+            "exact semantic duplicate rate",
         ),
         required_minimum_rule(
             "min_primary_scored_rate",
@@ -407,6 +425,8 @@ mod tests {
     fn release_config() -> GateConfig {
         GateConfig {
             min_cases: Some(2),
+            min_unique_cases: Some(2),
+            max_duplicate_case_rate: Some(0.0),
             min_primary_scored_rate: Some(1.0),
             max_primary_evaluator_error_rate: Some(0.0),
             max_primary_not_applicable_rate: Some(0.0),
@@ -419,6 +439,8 @@ mod tests {
     fn inputs<'a>(primary: &'a PairedMetrics) -> GateInputs<'a> {
         GateInputs {
             total_cases: primary.total,
+            unique_cases: primary.total,
+            duplicate_case_rate: 0.0,
             primary_scored_rate: 1.0,
             primary_evaluator_error_rate: 0.0,
             primary_not_applicable_rate: 0.0,
@@ -451,7 +473,15 @@ mod tests {
         let primary = paired_metrics(&[(true, false), (true, true)]);
         let decision = evaluate_gate(&release_config(), &inputs(&primary));
         assert_eq!(decision.status, GateStatus::Failed);
-        assert_eq!(decision.rules[5].status, GateRuleStatus::Failed);
+        assert_eq!(
+            decision
+                .rules
+                .iter()
+                .find(|rule| rule.rule == "max_primary_regression_pp")
+                .unwrap()
+                .status,
+            GateRuleStatus::Failed
+        );
     }
 
     #[test]

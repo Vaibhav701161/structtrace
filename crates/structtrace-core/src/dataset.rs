@@ -5,7 +5,11 @@ use std::{collections::HashSet, path::Path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{CoreError, Result, config::DatasetFields, error::read_error, hashing::hash_bytes};
+use crate::{
+    CoreError, Result,
+    config::{DatasetFields, LimitsConfig},
+    hashing::{hash_bytes, read_bounded},
+};
 
 /// One immutable matched case retained inside the evaluation boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,13 +71,38 @@ pub struct Dataset {
 impl Dataset {
     /// Read, validate, and preserve a JSONL dataset.
     pub fn read(path: &Path, fields: &DatasetFields) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(read_error(path))?;
-        Self::from_bytes(&bytes, fields)
+        Self::read_bounded(path, fields, &LimitsConfig::default())
+    }
+
+    /// Read a dataset under configured total, line, and case-count ceilings.
+    pub fn read_bounded(
+        path: &Path,
+        fields: &DatasetFields,
+        limits: &LimitsConfig,
+    ) -> Result<Self> {
+        let bytes = read_bounded(path, limits.max_dataset_bytes, "dataset")?;
+        Self::from_bytes_bounded(
+            &bytes,
+            fields,
+            limits.max_jsonl_line_bytes,
+            limits.max_cases,
+        )
     }
 
     /// Parse already-captured bytes so execution and finalization use one
     /// immutable dataset snapshot.
     pub fn from_bytes(bytes: &[u8], fields: &DatasetFields) -> Result<Self> {
+        let limits = LimitsConfig::default();
+        Self::from_bytes_bounded(bytes, fields, limits.max_jsonl_line_bytes, limits.max_cases)
+    }
+
+    /// Parse immutable dataset bytes under line and case-count ceilings.
+    pub fn from_bytes_bounded(
+        bytes: &[u8],
+        fields: &DatasetFields,
+        max_line_bytes: usize,
+        max_cases: usize,
+    ) -> Result<Self> {
         let text = std::str::from_utf8(bytes).map_err(|error| CoreError::Dataset {
             line: 1,
             message: format!("dataset is not valid UTF-8: {error}"),
@@ -82,6 +111,21 @@ impl Dataset {
         let mut ids = HashSet::new();
         for (index, line) in text.lines().enumerate() {
             let line_number = index + 1;
+            if line.len() > max_line_bytes {
+                return Err(CoreError::Dataset {
+                    line: line_number,
+                    message: format!(
+                        "JSONL line is {} bytes; limit is {max_line_bytes}",
+                        line.len()
+                    ),
+                });
+            }
+            if cases.len() >= max_cases {
+                return Err(CoreError::Dataset {
+                    line: line_number,
+                    message: format!("dataset exceeds the configured {max_cases}-case limit"),
+                });
+            }
             if line.trim().is_empty() {
                 return Err(CoreError::Dataset {
                     line: line_number,
@@ -197,5 +241,16 @@ mod tests {
         );
         assert!(encoded.pointer("/expected").is_none());
         assert!(!encoded.to_string().contains("billing"));
+    }
+
+    #[test]
+    fn bounded_ingestion_rejects_long_lines_and_excess_cases() {
+        let bytes = b"{\"id\":\"a\",\"input\":{}}\n{\"id\":\"b\",\"input\":{}}\n";
+        let long =
+            Dataset::from_bytes_bounded(bytes, &DatasetFields::default(), 8, 10).unwrap_err();
+        assert!(long.to_string().contains("JSONL line"));
+        let many =
+            Dataset::from_bytes_bounded(bytes, &DatasetFields::default(), 1024, 1).unwrap_err();
+        assert!(many.to_string().contains("case limit"));
     }
 }

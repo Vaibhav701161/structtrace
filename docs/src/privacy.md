@@ -3,6 +3,11 @@
 StructTrace has no telemetry and no automatic upload path. The offline report server binds only to
 a random `127.0.0.1` port.
 
+On Unix, the storage root and run directories are hardened to `0700`; SQLite and finalized artifact
+files are hardened to `0600`. `structtrace doctor --strict` checks existing storage permissions.
+Replay and report verification reject symlinked manifest artifacts and require canonical targets to
+remain beneath the run directory. Windows deployments must apply an equivalent user-only ACL.
+
 Credentials are read from configured environment variables. Manifests retain the variable name and presence, never the value. Authorization headers and secret values are not logged.
 
 Disable portable raw-output retention and configure shareable-report redaction:

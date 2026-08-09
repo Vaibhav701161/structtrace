@@ -161,7 +161,11 @@ enum Commands {
         schema: PathBuf,
     },
     /// Validate the local environment without making network requests.
-    Doctor,
+    Doctor {
+        /// Fail on insecure storage, duplicate evidence, and leakage-risk values.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -264,7 +268,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                         println!();
                         println!("Project: {}", created.display());
                         println!("Next:    cd {}", created.display());
-                        println!("         structtrace doctor");
+                        println!("         structtrace doctor --strict");
                         println!("         structtrace run");
                     }
                 }
@@ -476,7 +480,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             })
         }
         Commands::Inspect { schema } => inspect_schema(cli, schema),
-        Commands::Doctor => doctor(cli),
+        Commands::Doctor { strict } => doctor(cli, *strict),
     }
 }
 
@@ -779,7 +783,7 @@ const fn gate_exit_code(status: GateStatus) -> u8 {
     }
 }
 
-fn doctor(cli: &Cli) -> anyhow::Result<u8> {
+fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
     let root = cli
         .project_root
         .canonicalize()
@@ -797,12 +801,52 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
             Ok(config) => {
                 checks.push(serde_json::json!({"check": "configuration", "passed": true, "detail": config_path}));
                 let dataset_path = resolve(&root, &config.dataset.path);
-                match Dataset::read(&dataset_path, &config.dataset.fields) {
-                    Ok(dataset) => checks.push(serde_json::json!({
-                        "check": "dataset",
-                        "passed": true,
-                        "detail": {"path": dataset_path, "cases": dataset.cases.len(), "blake3": dataset.source_hash}
-                    })),
+                match Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits) {
+                    Ok(dataset) => {
+                        checks.push(serde_json::json!({
+                            "check": "dataset",
+                            "passed": true,
+                            "detail": {"path": dataset_path, "cases": dataset.cases.len(), "blake3": dataset.source_hash}
+                        }));
+                        let mut fingerprints = std::collections::BTreeMap::<String, usize>::new();
+                        let mut visible_gold_matches = 0usize;
+                        for case in &dataset.cases {
+                            let semantic = serde_json::json!({
+                                "input": case.input,
+                                "expected": case.expected,
+                                "model_visible_metadata": case.model_visible_metadata,
+                                "evaluation_metadata": case.metadata,
+                            });
+                            let fingerprint =
+                                structtrace_core::hashing::hash_canonical_json(&semantic)?;
+                            *fingerprints.entry(fingerprint).or_default() += 1;
+                            if case.expected.as_ref().is_some_and(|expected| {
+                                json_contains(&case.input, expected)
+                                    || case
+                                        .model_visible_metadata
+                                        .as_ref()
+                                        .is_some_and(|metadata| json_contains(metadata, expected))
+                            }) {
+                                visible_gold_matches += 1;
+                            }
+                        }
+                        let duplicate_rows = dataset.cases.len().saturating_sub(fingerprints.len());
+                        let duplicate_passed = duplicate_rows == 0;
+                        passed &= !strict || duplicate_passed;
+                        checks.push(serde_json::json!({
+                            "check": "independent_evidence",
+                            "passed": duplicate_passed,
+                            "required": strict,
+                            "detail": {"total_rows": dataset.cases.len(), "unique_semantic_cases": fingerprints.len(), "duplicate_rows": duplicate_rows}
+                        }));
+                        let leakage_passed = visible_gold_matches == 0;
+                        checks.push(serde_json::json!({
+                            "check": "golden_value_isolation",
+                            "passed": leakage_passed,
+                            "required": false,
+                            "detail": {"model_visible_exact_gold_matches": visible_gold_matches}
+                        }));
+                    }
                     Err(error) => {
                         passed = false;
                         checks.push(serde_json::json!({"check": "dataset", "passed": false, "detail": error.to_string()}));
@@ -836,6 +880,20 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
                         checks.push(serde_json::json!({"check": "storage", "passed": false, "detail": format!("{error:#}")}));
                     }
                 }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&storage_root) {
+                        let secure = metadata.permissions().mode() & 0o077 == 0;
+                        passed &= !strict || secure;
+                        checks.push(serde_json::json!({
+                            "check": "storage_permissions",
+                            "passed": secure,
+                            "required": strict,
+                            "detail": format!("mode {:o}; expected no group/other permissions", metadata.permissions().mode() & 0o777)
+                        }));
+                    }
+                }
                 for (name, variant) in &config.variants {
                     match variant {
                         VariantConfig::Recorded { path } => {
@@ -849,10 +907,20 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
                             passed &= exists;
                             checks.push(serde_json::json!({"check": format!("variant.{name}.executable"), "passed": exists, "detail": command.program}));
                         }
-                        VariantConfig::Python { interpreter, .. } => {
+                        VariantConfig::Python {
+                            interpreter,
+                            callable,
+                            ..
+                        } => {
                             let exists = executable_exists(&root, interpreter);
                             passed &= exists;
                             checks.push(serde_json::json!({"check": format!("variant.{name}.python"), "passed": exists, "detail": interpreter}));
+                            if strict && exists {
+                                let importable =
+                                    python_callable_imports(&root, interpreter, callable);
+                                passed &= importable;
+                                checks.push(serde_json::json!({"check": format!("variant.{name}.callable"), "passed": importable, "detail": callable}));
+                            }
                         }
                         VariantConfig::OpenaiCompatible(adapter) => {
                             let present = adapter
@@ -879,19 +947,32 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
                     }
                 }
                 for evaluator in &config.evaluators {
-                    let (program, kind) = match &evaluator.kind {
+                    let (program, kind, callable) = match &evaluator.kind {
                         structtrace_core::config::EvaluatorKind::Command { command, .. } => {
-                            (Some(command.program.as_str()), "executable")
+                            (Some(command.program.as_str()), "executable", None)
                         }
-                        structtrace_core::config::EvaluatorKind::Python { interpreter, .. } => {
-                            (Some(interpreter.as_str()), "python")
-                        }
-                        _ => (None, "builtin"),
+                        structtrace_core::config::EvaluatorKind::Python {
+                            interpreter,
+                            callable,
+                            ..
+                        } => (
+                            Some(interpreter.as_str()),
+                            "python",
+                            Some(callable.as_str()),
+                        ),
+                        _ => (None, "builtin", None),
                     };
                     if let Some(program) = program {
                         let exists = executable_exists(&root, program);
                         passed &= exists;
                         checks.push(serde_json::json!({"check": format!("evaluator.{}.{}", evaluator.id, kind), "passed": exists, "detail": program}));
+                        if strict && exists {
+                            if let Some(callable) = callable {
+                                let importable = python_callable_imports(&root, program, callable);
+                                passed &= importable;
+                                checks.push(serde_json::json!({"check": format!("evaluator.{}.callable", evaluator.id), "passed": importable, "detail": callable}));
+                            }
+                        }
                     }
                 }
                 checks.push(serde_json::json!({
@@ -953,7 +1034,7 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
                     let state = if check["passed"].as_bool() == Some(true) {
                         "PASS"
                     } else if check["required"].as_bool() == Some(false) {
-                        "INFO"
+                        "WARNING"
                     } else {
                         "FAIL"
                     };
@@ -972,9 +1053,40 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
     })
 }
 
+fn python_callable_imports(root: &Path, interpreter: &str, callable: &str) -> bool {
+    std::process::Command::new(interpreter)
+        .args([
+            "-c",
+            "import importlib,sys; m,n=sys.argv[1].split(':',1); assert callable(getattr(importlib.import_module(m),n))",
+            callable,
+        ])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn json_contains(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
+    haystack == needle
+        || match haystack {
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| json_contains(value, needle))
+            }
+            serde_json::Value::Object(values) => {
+                values.values().any(|value| json_contains(value, needle))
+            }
+            _ => false,
+        }
+}
+
 fn writable_directory(path: &Path) -> anyhow::Result<()> {
+    let existed = path.exists();
     std::fs::create_dir_all(path)
         .with_context(|| format!("could not create storage directory {}", path.display()))?;
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
     let marker = path.join(format!(
         ".doctor-write-check-{}-{}",
         std::process::id(),
@@ -1084,7 +1196,17 @@ fn verify_manifest_artifact(run_dir: &Path, relative: &str) -> anyhow::Result<()
         .artifacts
         .get(relative)
         .with_context(|| format!("manifest does not bind required artifact `{relative}`"))?;
-    let actual = hash_file(&run_dir.join(relative))?;
+    let path = run_dir.join(relative);
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+        "artifact `{relative}` must not be a symbolic link"
+    );
+    let canonical_root = run_dir.canonicalize()?;
+    anyhow::ensure!(
+        path.canonicalize()?.starts_with(canonical_root),
+        "artifact `{relative}` escaped the run directory"
+    );
+    let actual = hash_file(&path)?;
     anyhow::ensure!(
         &actual == expected,
         "artifact `{relative}` failed manifest hash verification: expected {expected}, observed {actual}"

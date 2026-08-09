@@ -18,7 +18,16 @@ evaluators:
   - {id: subtotal, kind: numeric_tolerance, pointer: /subtotal, expected_pointer: /subtotal, absolute: "0.01", exact_integer: false}
   - {id: tax, kind: numeric_tolerance, pointer: /tax, expected_pointer: /tax, absolute: "0.01", exact_integer: false}
   - {id: total, kind: numeric_tolerance, pointer: /total, expected_pointer: /total, absolute: "0.01", exact_integer: false}
-  - {id: line_items, kind: keyed_array, pointer: /line_items, expected_pointer: /line_items, keys: [/description]}
+  - id: line_items
+    kind: keyed_array
+    pointer: /line_items
+    expected_pointer: /line_items
+    keys: [/description]
+    fields:
+      - {pointer: /description, evaluator: normalized_string, case_insensitive: true}
+      - {pointer: /quantity, evaluator: exact_integer}
+      - {pointer: /unit_price, evaluator: decimal_tolerance, absolute: "0.01"}
+      - {pointer: /amount, evaluator: decimal_tolerance, absolute: "0.01"}
   - {id: financial_consistency, kind: financial_invariants, line_items_pointer: /line_items, subtotal_pointer: /subtotal, tax_pointer: /tax, total_pointer: /total, absolute: "0.01"}
   - {id: completeness, kind: required_fields, pointers: [/invoice_number, /vendor_name, /invoice_date, /currency, /subtotal, /tax, /total, /line_items]}
 outcomes:
@@ -26,4 +35,4 @@ outcomes:
 analysis:
   primary_outcome: extraction_correct
   bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
-gate: {min_cases: 100, min_primary_scored_rate: 0.99, max_primary_evaluator_error_rate: 0.01, max_primary_not_applicable_rate: 0, max_primary_unscored_rate: 0, max_primary_regression_pp: 0, min_candidate_schema_validity: 1.0}
+gate: {min_cases: 100, min_unique_cases: 100, max_duplicate_case_rate: 0.01, min_primary_scored_rate: 0.99, max_primary_evaluator_error_rate: 0.01, max_primary_not_applicable_rate: 0, max_primary_unscored_rate: 0, max_primary_regression_pp: 0, min_candidate_schema_validity: 1.0}

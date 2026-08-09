@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result, error::read_error};
+use crate::{CoreError, Result, hashing::read_bounded};
 
 /// Complete `structtrace.yaml` configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,11 +60,35 @@ pub const HARD_MAX_CONCURRENCY: usize = 256;
 pub const HARD_MAX_RETRIES: u32 = 20;
 /// Hard ceiling for provider-requested generated tokens.
 pub const HARD_MAX_OUTPUT_TOKENS: u32 = 1_000_000;
+/// Hard ceiling for source configuration bytes.
+pub const HARD_MAX_CONFIG_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling for dataset bytes.
+pub const HARD_MAX_DATASET_BYTES: usize = 1024 * 1024 * 1024;
+/// Hard ceiling for one recorded-output artifact.
+pub const HARD_MAX_RECORDED_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Hard ceiling for an external JSON Schema.
+pub const HARD_MAX_SCHEMA_BYTES: usize = 64 * 1024 * 1024;
+/// Hard ceiling for matched case count.
+pub const HARD_MAX_CASES: usize = 10_000_000;
+/// Hard ceiling for one JSONL record.
+pub const HARD_MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Configurable resource limits with conservative defaults and enforced hard ceilings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
+    /// Maximum bytes accepted for the source configuration.
+    pub max_config_bytes: usize,
+    /// Maximum bytes accepted for the dataset source.
+    pub max_dataset_bytes: usize,
+    /// Maximum bytes accepted for either recorded-output source.
+    pub max_recorded_output_bytes: usize,
+    /// Maximum bytes accepted for the external JSON Schema.
+    pub max_schema_bytes: usize,
+    /// Maximum number of cases accepted from a dataset.
+    pub max_cases: usize,
+    /// Maximum bytes accepted for one JSONL line.
+    pub max_jsonl_line_bytes: usize,
     /// Maximum model or adapter output bytes retained for one case.
     pub max_output_bytes_per_case: usize,
     /// Maximum standard-error bytes retained from one process.
@@ -80,6 +104,12 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
+            max_config_bytes: 1024 * 1024,
+            max_dataset_bytes: 256 * 1024 * 1024,
+            max_recorded_output_bytes: 512 * 1024 * 1024,
+            max_schema_bytes: 16 * 1024 * 1024,
+            max_cases: 1_000_000,
+            max_jsonl_line_bytes: 16 * 1024 * 1024,
             max_output_bytes_per_case: 4 * 1024 * 1024,
             max_stderr_bytes_per_process: 1024 * 1024,
             max_report_raw_bytes_per_case: 256 * 1024,
@@ -440,6 +470,9 @@ pub enum EvaluatorKind {
         expected_pointer: String,
         /// Relative JSON Pointers that form each item's identity.
         keys: Vec<String>,
+        /// Optional field-specific comparators applied after identity matching.
+        #[serde(default)]
+        fields: Vec<KeyedArrayField>,
     },
     /// Invoice arithmetic consistency independent of golden-answer matching.
     FinancialInvariants {
@@ -484,6 +517,25 @@ pub enum EvaluatorKind {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+}
+
+/// Comparator for one field inside a matched keyed-array item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyedArrayField {
+    /// Relative JSON Pointer within each item.
+    pub pointer: String,
+    /// `exact`, `normalized_string`, `exact_integer`, `decimal_tolerance`, or `canonical_date`.
+    pub evaluator: String,
+    /// Absolute tolerance for `decimal_tolerance`.
+    #[serde(default)]
+    pub absolute: Option<String>,
+    /// Case folding for `normalized_string`.
+    #[serde(default = "default_true")]
+    pub case_insensitive: bool,
+    /// Accepted formats for `canonical_date`.
+    #[serde(default = "default_date_formats")]
+    pub formats: Vec<String>,
 }
 
 fn default_tool_name_pointer() -> String {
@@ -579,6 +631,10 @@ impl Default for BootstrapConfig {
 pub struct GateConfig {
     /// Minimum paired case count required for a release decision.
     pub min_cases: Option<usize>,
+    /// Minimum distinct semantic evidence units required for a release decision.
+    pub min_unique_cases: Option<usize>,
+    /// Maximum fraction of rows belonging to an exact semantic duplicate group.
+    pub max_duplicate_case_rate: Option<f64>,
     /// Minimum fraction explicitly scored pass or fail on both variants.
     pub min_primary_scored_rate: Option<f64>,
     /// Maximum evaluator-error fraction on either variant.
@@ -657,7 +713,7 @@ impl Default for ReportConfig {
 impl Config {
     /// Load YAML or JSON and validate cross-field invariants.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(read_error(path))?;
+        let bytes = read_bounded(path, HARD_MAX_CONFIG_BYTES, "configuration")?;
         Self::from_bytes(path, &bytes)
     }
 
@@ -761,6 +817,32 @@ impl Config {
         }
         for (name, value, maximum) in [
             (
+                "limits.max_config_bytes",
+                config.limits.max_config_bytes,
+                HARD_MAX_CONFIG_BYTES,
+            ),
+            (
+                "limits.max_dataset_bytes",
+                config.limits.max_dataset_bytes,
+                HARD_MAX_DATASET_BYTES,
+            ),
+            (
+                "limits.max_recorded_output_bytes",
+                config.limits.max_recorded_output_bytes,
+                HARD_MAX_RECORDED_OUTPUT_BYTES,
+            ),
+            (
+                "limits.max_schema_bytes",
+                config.limits.max_schema_bytes,
+                HARD_MAX_SCHEMA_BYTES,
+            ),
+            ("limits.max_cases", config.limits.max_cases, HARD_MAX_CASES),
+            (
+                "limits.max_jsonl_line_bytes",
+                config.limits.max_jsonl_line_bytes,
+                HARD_MAX_JSONL_LINE_BYTES,
+            ),
+            (
                 "limits.max_output_bytes_per_case",
                 config.limits.max_output_bytes_per_case,
                 HARD_MAX_OUTPUT_BYTES_PER_CASE,
@@ -807,6 +889,7 @@ impl Config {
         ] {
             validate_json_pointer(name, pointer)?;
         }
+        validate_dataset_field_isolation(&config.dataset.fields)?;
         for (name, variant) in &config.variants {
             validate_variant(&format!("variants.{name}"), variant)?;
         }
@@ -1007,6 +1090,7 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             pointer,
             expected_pointer,
             keys,
+            fields,
         } => {
             validate_json_pointer(&format!("{name}.pointer"), pointer)?;
             validate_json_pointer(&format!("{name}.expected_pointer"), expected_pointer)?;
@@ -1017,6 +1101,39 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             }
             for key in keys {
                 validate_json_pointer(&format!("{name}.keys"), key)?;
+            }
+            for field in fields {
+                validate_json_pointer(&format!("{name}.fields.pointer"), &field.pointer)?;
+                if !matches!(
+                    field.evaluator.as_str(),
+                    "exact"
+                        | "normalized_string"
+                        | "exact_integer"
+                        | "decimal_tolerance"
+                        | "canonical_date"
+                ) {
+                    return Err(CoreError::Configuration(format!(
+                        "{name}.fields evaluator `{}` is unsupported",
+                        field.evaluator
+                    )));
+                }
+                if field.evaluator == "decimal_tolerance" {
+                    let value = field.absolute.as_deref().ok_or_else(|| {
+                        CoreError::Configuration(format!(
+                            "{name}.fields decimal_tolerance requires absolute"
+                        ))
+                    })?;
+                    let tolerance = Decimal::from_str(value).map_err(|_| {
+                        CoreError::Configuration(format!(
+                            "{name}.fields absolute must be a valid decimal"
+                        ))
+                    })?;
+                    if tolerance.is_sign_negative() {
+                        return Err(CoreError::Configuration(format!(
+                            "{name}.fields absolute must be non-negative"
+                        )));
+                    }
+                }
             }
             Ok(())
         }
@@ -1081,18 +1198,28 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
         }
         EvaluatorKind::Command {
             command,
+            process_mode,
             timeout_ms,
-            ..
         } => {
+            if matches!(process_mode, ProcessMode::PerCase) {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.process_mode=per_case is experimental and refused by the stable runtime; use persistent"
+                )));
+            }
             validate_command(&format!("{name}.command"), command)?;
             validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
         }
         EvaluatorKind::Python {
             interpreter,
             callable,
+            process_mode,
             timeout_ms,
-            ..
         } => {
+            if matches!(process_mode, ProcessMode::PerCase) {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.process_mode=per_case is experimental and refused by the stable runtime; use persistent"
+                )));
+            }
             validate_python(&name, interpreter, callable)?;
             validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
         }
@@ -1175,9 +1302,9 @@ fn validate_json_pointer(name: &str, pointer: &str) -> Result<()> {
 }
 
 fn validate_gate(gate: &GateConfig) -> Result<()> {
-    if gate.min_cases == Some(0) {
+    if gate.min_cases == Some(0) || gate.min_unique_cases == Some(0) {
         return Err(CoreError::Configuration(
-            "gate.min_cases must be at least 1".to_owned(),
+            "gate.min_cases and gate.min_unique_cases must be at least 1".to_owned(),
         ));
     }
     for (name, value) in [
@@ -1204,6 +1331,7 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
             gate.max_primary_not_applicable_rate,
         ),
         ("max_primary_unscored_rate", gate.max_primary_unscored_rate),
+        ("max_duplicate_case_rate", gate.max_duplicate_case_rate),
         (
             "min_candidate_schema_validity",
             gate.min_candidate_schema_validity,
@@ -1259,6 +1387,42 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_dataset_field_isolation(fields: &DatasetFields) -> Result<()> {
+    let protected = [
+        ("input", fields.input.as_str()),
+        ("expected", fields.expected.as_str()),
+        (
+            "model_visible_metadata",
+            fields.model_visible_metadata.as_str(),
+        ),
+        ("metadata", fields.metadata.as_str()),
+    ];
+    for left in 0..protected.len() {
+        for right in (left + 1)..protected.len() {
+            let (left_name, left_pointer) = protected[left];
+            let (right_name, right_pointer) = protected[right];
+            if pointers_overlap(left_pointer, right_pointer) {
+                return Err(CoreError::Configuration(format!(
+                    "dataset.fields.{left_name} `{left_pointer}` overlaps dataset.fields.{right_name} `{right_pointer}`; model-visible and evaluation-only fields must be disjoint"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pointers_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left.is_empty()
+        || right.is_empty()
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -1320,6 +1484,92 @@ mod tests {
     #[test]
     fn accepts_minimal_configuration() {
         Config::validate(minimal()).unwrap();
+    }
+
+    #[test]
+    fn expected_pointer_cannot_equal_input_pointer() {
+        let mut config = minimal();
+        config.dataset.fields.input = "/expected".to_owned();
+        assert!(
+            Config::validate(config)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
+    #[test]
+    fn expected_pointer_cannot_equal_model_visible_pointer() {
+        let mut config = minimal();
+        config.dataset.fields.model_visible_metadata = "/expected".to_owned();
+        assert!(
+            Config::validate(config)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
+    #[test]
+    fn root_input_cannot_contain_expected() {
+        let mut config = minimal();
+        config.dataset.fields.input = String::new();
+        assert!(
+            Config::validate(config)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
+    #[test]
+    fn parent_child_pointer_overlap_is_rejected() {
+        let mut config = minimal();
+        config.dataset.fields.input = "/payload".to_owned();
+        config.dataset.fields.expected = "/payload/gold".to_owned();
+        assert!(
+            Config::validate(config)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
+    #[test]
+    fn evaluation_metadata_cannot_be_model_visible() {
+        let mut config = minimal();
+        config.dataset.fields.model_visible_metadata = "/metadata/public".to_owned();
+        config.dataset.fields.metadata = "/metadata".to_owned();
+        assert!(
+            Config::validate(config)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
+    #[test]
+    fn per_case_external_evaluator_is_refused_from_stable_runtime() {
+        let mut config = minimal();
+        config.evaluators = vec![EvaluatorConfig {
+            id: "external".to_owned(),
+            implementation_version: Some("v1".to_owned()),
+            kind: EvaluatorKind::Command {
+                command: CommandSpec {
+                    program: "worker".to_owned(),
+                    args: vec![],
+                },
+                process_mode: ProcessMode::PerCase,
+                timeout_ms: 100,
+            },
+        }];
+        config.outcomes.get_mut("semantic_correct").unwrap().all_of = vec!["external".to_owned()];
+        let error = Config::validate(config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("per_case is experimental and refused")
+        );
     }
 
     #[test]

@@ -36,6 +36,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "max_config_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 1048576},
+        "max_dataset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824, "default": 268435456},
+        "max_recorded_output_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 536870912},
+        "max_schema_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
+        "max_cases": {"type": "integer", "minimum": 1, "maximum": 10000000, "default": 1000000},
+        "max_jsonl_line_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
         "max_output_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 4194304},
         "max_stderr_bytes_per_process": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 1048576},
         "max_report_raw_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 4194304, "default": 262144},
@@ -106,6 +112,8 @@
       "additionalProperties": false,
       "properties": {
         "min_cases": {"type": ["integer", "null"], "minimum": 1},
+        "min_unique_cases": {"type": ["integer", "null"], "minimum": 1},
+        "max_duplicate_case_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "min_primary_scored_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_primary_evaluator_error_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_primary_not_applicable_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
@@ -192,11 +200,23 @@
         {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "numeric_tolerance"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "absolute": {"type": ["string", "null"]}, "relative": {"type": ["string", "null"]}, "exact_integer": {"type": "boolean"}}},
         {"type": "object", "required": ["id", "kind", "pointers"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "required_fields"}, "pointers": {"type": "array", "items": {"type": "string"}, "minItems": 1}}},
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "tool_selection"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}}},
-        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer", "keys"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "keyed_array"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}},
+        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer", "keys"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "keyed_array"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "fields": {"type": "array", "items": {"$ref": "#/$defs/keyedArrayField"}}}},
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "financial_invariants"}, "line_items_pointer": {"type": "string"}, "subtotal_pointer": {"type": "string"}, "tax_pointer": {"type": "string"}, "total_pointer": {"type": "string"}, "absolute": {"type": "string"}}},
-        {"type": "object", "required": ["id", "implementation_version", "kind", "command"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
-        {"type": "object", "required": ["id", "implementation_version", "kind", "callable"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}}
+        {"type": "object", "required": ["id", "implementation_version", "kind", "command"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"const": "persistent", "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
+        {"type": "object", "required": ["id", "implementation_version", "kind", "callable"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "process_mode": {"const": "persistent", "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}}
       ]
+    },
+    "keyedArrayField": {
+      "type": "object",
+      "required": ["pointer", "evaluator"],
+      "additionalProperties": false,
+      "properties": {
+        "pointer": {"type": "string"},
+        "evaluator": {"enum": ["exact", "normalized_string", "exact_integer", "decimal_tolerance", "canonical_date"]},
+        "absolute": {"type": ["string", "null"]},
+        "case_insensitive": {"type": "boolean", "default": true},
+        "formats": {"type": "array", "items": {"enum": ["iso", "dmy_slash", "mdy_slash"]}}
+      }
     }
   }
 }

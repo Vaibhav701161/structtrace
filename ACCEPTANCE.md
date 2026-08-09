@@ -30,6 +30,11 @@ infrastructure or users. It is not a substitute for CI logs or user feedback.
 | Multi-state gate | empty gates are not configured; evaluator errors, low coverage, not-applicable rows, unscored rows, and small samples cannot authorize deployment |
 | Example projects | recorded, Python, command, document extraction, and tool-selection/argument fixtures ran through the shared scoring path |
 | Invoice hero workflow | 12 nested invoices produced 9/12 versus 9/12 with six discordances, schema validity 10/12 versus 12/12, valid-but-wrong 1 versus 3, and an insufficient-evidence gate |
+| Evidence independence | canonical semantic fingerprints report rows versus unique units; duplicate rows cannot multiply the paired denominator, narrow the independent bootstrap, or satisfy `min_unique_cases` |
+| Golden-answer routing | equal, root, and parent/child overlaps across input, expected, model-visible metadata, and evaluation-only metadata are rejected |
+| Financial diagnosis | line amount, subtotal, tax, and total invariant tests assert exact paths, states, values, and messages |
+| Local artifact security | Unix run directories are `0700`, SQLite/artifacts are `0600`, and replay refuses symlinked manifest artifacts |
+| Source ingestion | configuration, dataset, output, schema, case-count, and JSONL-line limits are enforced before unbounded allocation |
 | Privacy | property tests cover input/label/model-visible metadata redaction and echo removal; a whole-finalized-run scan proves a provider-error secret is absent from JSONL, SQLite, reports, and logs |
 | Process lifecycle | adversarial tests bound persistent EOF shutdown, inherited reader pipes, per-case timeouts, and Unix descendant process termination |
 | Bounded resources | configurable output, stderr, per-case report display, complete report, and single-file limits have enforced hard ceilings; adapter/provider limit paths fail closed |
@@ -37,7 +42,7 @@ infrastructure or users. It is not a substitute for CI logs or user feedback.
 | Configuration safety | runtime validation enforces paths, pointers, callables, timeouts, concurrency, retries, token limits, tolerances, pricing, gates, and report-filter constraints independently of editor tooling |
 | Documentation | mdBook built 43 HTML pages locally, including the explicit scale envelope and release-candidate user protocol |
 | Formatting and linting | `cargo fmt --all --check` and warnings-denied Clippy passed |
-| Test suite | 112 deterministic and property-based tests pass without a provider credential, external model, GPU, or network service |
+| Test suite | `cargo test --workspace` passes without a provider credential, external model, GPU, or network service; CI output tied to the commit is the authoritative test count |
 
 ## Defined but awaiting remote evidence
 

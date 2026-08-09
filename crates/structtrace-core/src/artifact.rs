@@ -108,6 +108,9 @@ pub struct RunManifest {
     /// Fixed variant execution order used by this artifact format.
     #[serde(default = "default_execution_schedule")]
     pub execution_schedule: String,
+    /// Bound local source, interpreter, lockfile, Git, and dirty-tree fingerprint for live runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_fingerprint: Option<String>,
     /// Compilation target architecture and OS.
     pub binary_target: String,
     /// Environment variable names and presence only.
@@ -143,6 +146,7 @@ impl RunManifest {
             gate: GateConfig::default(),
             bootstrap: BootstrapConfig::default(),
             execution_schedule: default_execution_schedule(),
+            implementation_fingerprint: None,
             binary_target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             environment: BTreeMap::new(),
             artifacts: BTreeMap::new(),
@@ -265,6 +269,14 @@ pub struct RunSummary {
     /// Cases with an explicit binary primary outcome for both variants.
     #[serde(default)]
     pub primary_jointly_scored: usize,
+    /// Dataset independence audit used by inferential statistics and gates.
+    pub evidence: EvidenceSummary,
+    /// Paired effect over one representative per semantic evidence unit.
+    pub independent_paired: PairedMetrics,
+    /// Bootstrap interval over independent semantic evidence units.
+    pub independent_bootstrap: BootstrapInterval,
+    /// Paired semantic effect restricted to explicitly scored pass/fail pairs.
+    pub jointly_scored_semantic: SemanticEffectSummary,
     /// Pair-matched operational measurements used by operational gates.
     #[serde(default)]
     pub matched_operational: MatchedOperationalSummary,
@@ -278,6 +290,38 @@ pub struct RunSummary {
     pub evaluator_passes: BTreeMap<String, EvaluatorComparison>,
     /// Field-level regression and improvement counts.
     pub field_hotspots: Vec<FieldHotspot>,
+}
+
+/// Exact-duplicate audit for the matched dataset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceSummary {
+    /// All matched rows, including repeated semantic cases.
+    pub total_rows: usize,
+    /// Distinct fingerprints of input, expected output, and relevant metadata.
+    pub unique_semantic_cases: usize,
+    /// Number of fingerprints represented by more than one row.
+    pub exact_duplicate_groups: usize,
+    /// Largest number of rows sharing one semantic fingerprint.
+    pub largest_duplicate_group: usize,
+    /// Fraction of rows beyond the first member of each fingerprint group.
+    pub duplicate_case_rate: f64,
+    /// Denominator used by independent paired inference and evidence gates.
+    pub effective_gate_denominator: usize,
+}
+
+/// Semantic-only paired analysis, separate from complete-denominator deployment success.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticEffectSummary {
+    /// Pairs with explicit True/False primary outcomes on both variants.
+    pub jointly_scored_cases: usize,
+    /// Operational/error pairs excluded from this semantic-only estimate.
+    pub excluded_pairs: usize,
+    /// Exclusion counts keyed by stable reason.
+    pub exclusion_reasons: BTreeMap<String, usize>,
+    /// Paired transition matrix over jointly scored cases.
+    pub paired: PairedMetrics,
+    /// Paired bootstrap interval when at least one pair is jointly scored.
+    pub bootstrap: Option<BootstrapInterval>,
 }
 
 /// Per-evaluator aggregate.

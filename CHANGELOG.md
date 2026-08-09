@@ -5,6 +5,17 @@ here.
 
 ## Unreleased
 
+- Advance the artifact format to version 5 for duplicate-aware evidence summaries, independent
+  paired inference, and a separately reported jointly scored semantic effect.
+- Remove the pseudo-replicated 120-row invoice demo; the twelve unique fixtures now remain an
+  explicitly insufficient-evidence workflow demonstration.
+- Reject overlapping dataset pointers, unsafe per-case external evaluators, symlinked artifacts,
+  oversized sources, and resume attempts after local implementation changes.
+- Harden Unix run storage permissions and add strict doctor checks for duplicate evidence, golden
+  echoes, callable imports, source bounds, and storage safety.
+- Add normalized, exact-integer, decimal-tolerance, and canonical-date field comparators inside
+  keyed arrays; correct subtotal invariant attribution.
+
 - Establish the independent StructTrace Rust workspace.
 - Define artifact format version 3, report format version 2, and variant protocol version 1.
 - Add recorded, command, Python, and OpenAI-compatible paired execution.
