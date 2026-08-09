@@ -13,7 +13,7 @@ use minijinja::{AutoEscape, Environment};
 use serde::Serialize;
 use serde_json::Value;
 use structtrace_core::{
-    artifact::{PairedCaseRecord, RunManifest, RunSummary},
+    artifact::{PairedCaseRecord, RunManifest, RunStatus, RunSummary},
     config::Config,
     privacy::{REDACTION_MARKER, redact_matching_values, selected_values},
 };
@@ -124,6 +124,8 @@ struct CaseView {
     candidate_evaluators: String,
     baseline_metadata: String,
     candidate_metadata: String,
+    baseline_execution: String,
+    candidate_execution: String,
     baseline_latency: String,
     candidate_latency: String,
 }
@@ -145,9 +147,13 @@ pub struct JsonDiffEntry {
 pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
     let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
     let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    anyhow::ensure!(
+        manifest.status != RunStatus::Complete,
+        "completed run reports are immutable; use the finalized report or export a copy"
+    );
     let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
     let cases: Vec<PairedCaseRecord> = read_jsonl(&run_dir.join("cases.jsonl"))?;
-    let view = build_view(&summary, &manifest, &cases, &config);
+    let view = build_view(&summary, &manifest, &cases, &config)?;
     let mut environment = Environment::new();
     environment.set_auto_escape_callback(|_| AutoEscape::Html);
     environment.add_template("report.html", TEMPLATE)?;
@@ -161,14 +167,14 @@ pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
 
 /// Export the generated report as one self-contained HTML file.
 pub fn export_single_file(run_dir: &Path, destination: &Path) -> anyhow::Result<()> {
-    let generated = generate(run_dir)?;
+    let generated = finalized_report(run_dir)?;
     let bytes = std::fs::read(&generated.index_path)?;
     atomic_write(destination, &bytes)
 }
 
 /// Serve a report on a random loopback-only port until interrupted.
 pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
-    let generated = generate(run_dir)?;
+    let generated = finalized_report(run_dir)?;
     let directory = generated
         .index_path
         .parent()
@@ -189,6 +195,24 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// Resolve an existing report without mutating a completed run.
+pub fn finalized_report(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
+    let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    anyhow::ensure!(
+        manifest.status == RunStatus::Complete,
+        "run `{}` is {:?}; only complete runs have finalized reports",
+        manifest.run_id,
+        manifest.status
+    );
+    let index_path = run_dir.join("report/index.html");
+    anyhow::ensure!(
+        index_path.is_file(),
+        "finalized report is missing at {}",
+        index_path.display()
+    );
+    Ok(GeneratedReport { index_path })
 }
 
 /// Compute a JSON-aware recursive diff.
@@ -285,7 +309,7 @@ fn build_view(
     manifest: &RunManifest,
     records: &[PairedCaseRecord],
     config: &Config,
-) -> ReportView {
+) -> anyhow::Result<ReportView> {
     let structural_rows = vec![
         comparison(
             "Strict JSON",
@@ -333,8 +357,8 @@ fn build_view(
     let cases = records
         .iter()
         .map(|record| case_view(record, config))
-        .collect();
-    ReportView {
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ReportView {
         project_name: config
             .report
             .title
@@ -423,7 +447,7 @@ fn build_view(
             ),
             ("Binary target".to_owned(), manifest.binary_target.clone()),
         ],
-    }
+    })
 }
 
 fn operational_rows(summary: &RunSummary) -> Vec<OperationalRow> {
@@ -451,6 +475,22 @@ fn operational_rows(summary: &RunSummary) -> Vec<OperationalRow> {
             candidate.latency_observations.to_string(),
         ),
         operational(
+            "Matched latency pairs",
+            format!(
+                "{} / {}",
+                summary.matched_operational.latency_pairs, summary.matched_operational.total_pairs
+            ),
+            format!(
+                "{} / {}",
+                summary.matched_operational.latency_pairs, summary.matched_operational.total_pairs
+            ),
+        ),
+        operational(
+            "Matched-pair p95 latency",
+            milliseconds(summary.matched_operational.baseline_p95_latency_ms),
+            milliseconds(summary.matched_operational.candidate_p95_latency_ms),
+        ),
+        operational(
             "Retry attempts",
             baseline.retry_attempts.to_string(),
             candidate.retry_attempts.to_string(),
@@ -469,6 +509,31 @@ fn operational_rows(summary: &RunSummary) -> Vec<OperationalRow> {
             format_cost(
                 candidate.average_cost.as_deref(),
                 candidate.currency.as_deref(),
+            ),
+        ),
+        operational(
+            "Matched cost pairs",
+            format!(
+                "{} / {}",
+                summary.matched_operational.cost_pairs, summary.matched_operational.total_pairs
+            ),
+            format!(
+                "{} / {}",
+                summary.matched_operational.cost_pairs, summary.matched_operational.total_pairs
+            ),
+        ),
+        operational(
+            "Matched-pair average cost",
+            format_cost(
+                summary.matched_operational.baseline_average_cost.as_deref(),
+                summary.matched_operational.currency.as_deref(),
+            ),
+            format_cost(
+                summary
+                    .matched_operational
+                    .candidate_average_cost
+                    .as_deref(),
+                summary.matched_operational.currency.as_deref(),
             ),
         ),
         operational(
@@ -542,7 +607,7 @@ fn research_studies(records: &[PairedCaseRecord]) -> Vec<ResearchStudyView> {
         .collect()
 }
 
-fn case_view(record: &PairedCaseRecord, config: &Config) -> CaseView {
+fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseView> {
     let source = serde_json::json!({
         "id": record.case.id,
         "input": record.case.input,
@@ -550,21 +615,33 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> CaseView {
         "metadata": record.case.metadata,
     });
     let secrets = selected_values(&source, &config.storage.redaction.json_pointers);
-    let mut redacted_value = serde_json::to_value(record).unwrap_or(Value::Null);
+    let mut redacted_value = serde_json::to_value(record)
+        .context("could not build fail-closed report view for a case")?;
     redact_matching_values(&mut redacted_value, &secrets);
-    let mut redacted: PairedCaseRecord =
-        serde_json::from_value(redacted_value).unwrap_or_else(|_| record.clone());
-    redact_raw_text(&mut redacted.baseline_output.raw_output, &secrets);
-    redact_raw_text(&mut redacted.candidate_output.raw_output, &secrets);
+    redact_value_raw_text(&mut redacted_value, "/baseline_output/raw_output", &secrets);
+    redact_value_raw_text(
+        &mut redacted_value,
+        "/candidate_output/raw_output",
+        &secrets,
+    );
     if !config.report.include_raw_outputs || !config.storage.retain_raw_outputs {
-        redacted.baseline_output.raw_output = None;
-        redacted.candidate_output.raw_output = None;
+        remove_object_key(&mut redacted_value, "/baseline_output", "raw_output");
+        remove_object_key(&mut redacted_value, "/candidate_output", "raw_output");
+        strip_provider_echoes(&mut redacted_value, "/baseline_output");
+        strip_provider_echoes(&mut redacted_value, "/candidate_output");
     }
     if !config.report.include_prompts {
-        remove_rendered_prompt(&mut redacted.baseline_output.metadata);
-        remove_rendered_prompt(&mut redacted.candidate_output.metadata);
+        remove_object_key(
+            &mut redacted_value,
+            "/baseline_output/metadata",
+            "rendered_prompt",
+        );
+        remove_object_key(
+            &mut redacted_value,
+            "/candidate_output/metadata",
+            "rendered_prompt",
+        );
     }
-    let record = &redacted;
     let mut filters = vec![record.transition.clone()];
     if matches!(
         record.transition.as_str(),
@@ -586,61 +663,70 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> CaseView {
     {
         filters.push("adapter_error".to_owned());
     }
-    let baseline_parsed = record
-        .baseline_evaluation
-        .parsed_output
-        .clone()
+    let baseline_parsed = redacted_value
+        .pointer("/baseline_evaluation/parsed_output")
+        .cloned()
         .unwrap_or(Value::Null);
-    let candidate_parsed = record
-        .candidate_evaluation
-        .parsed_output
-        .clone()
+    let candidate_parsed = redacted_value
+        .pointer("/candidate_evaluation/parsed_output")
+        .cloned()
         .unwrap_or(Value::Null);
-    CaseView {
-        id: record.case.id.clone(),
-        transition: record.transition.replace('_', " "),
-        filters: filters.join(" "),
-        input: pretty_json(&record.case.input),
-        expected: record
-            .case
-            .expected
-            .as_ref()
-            .map_or_else(|| "Not provided".to_owned(), pretty_json),
-        metadata: record
-            .case
-            .metadata
-            .as_ref()
-            .map_or_else(|| "Not provided".to_owned(), pretty_json),
-        baseline_raw: record
-            .baseline_output
-            .raw_output
-            .clone()
-            .map(|value| truncate_for_report(value, config.limits.max_report_raw_bytes_per_case))
-            .unwrap_or_else(|| "Not retained".to_owned()),
-        candidate_raw: record
-            .candidate_output
-            .raw_output
-            .clone()
-            .map(|value| truncate_for_report(value, config.limits.max_report_raw_bytes_per_case))
-            .unwrap_or_else(|| "Not retained".to_owned()),
+    let mut filter_string = filters.join(" ");
+    redact_string(&mut filter_string, &secrets);
+    Ok(CaseView {
+        id: redacted_value
+            .pointer("/case/id")
+            .and_then(Value::as_str)
+            .unwrap_or(REDACTION_MARKER)
+            .to_owned(),
+        transition: redacted_value
+            .pointer("/transition")
+            .and_then(Value::as_str)
+            .unwrap_or(REDACTION_MARKER)
+            .replace('_', " "),
+        filters: filter_string,
+        input: pretty_json(pointer_or_null(&redacted_value, "/case/input")),
+        expected: optional_pretty(&redacted_value, "/case/expected"),
+        metadata: optional_pretty(&redacted_value, "/case/metadata"),
+        baseline_raw: raw_for_report(
+            &redacted_value,
+            "/baseline_output/raw_output",
+            config.limits.max_report_raw_bytes_per_case,
+        ),
+        candidate_raw: raw_for_report(
+            &redacted_value,
+            "/candidate_output/raw_output",
+            config.limits.max_report_raw_bytes_per_case,
+        ),
         baseline_parsed: pretty_json(&baseline_parsed),
         candidate_parsed: pretty_json(&candidate_parsed),
         diffs: json_diff(&baseline_parsed, &candidate_parsed),
-        baseline_schema_errors: pretty_json(
-            &serde_json::to_value(&record.baseline_evaluation.schema_errors).unwrap_or(Value::Null),
-        ),
-        candidate_schema_errors: pretty_json(
-            &serde_json::to_value(&record.candidate_evaluation.schema_errors)
-                .unwrap_or(Value::Null),
-        ),
-        baseline_evaluators: pretty_json(
-            &serde_json::to_value(&record.baseline_evaluation.evaluators).unwrap_or(Value::Null),
-        ),
-        candidate_evaluators: pretty_json(
-            &serde_json::to_value(&record.candidate_evaluation.evaluators).unwrap_or(Value::Null),
-        ),
-        baseline_metadata: pretty_json(&record.baseline_output.metadata),
-        candidate_metadata: pretty_json(&record.candidate_output.metadata),
+        baseline_schema_errors: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/baseline_evaluation/schema_errors",
+        )),
+        candidate_schema_errors: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/candidate_evaluation/schema_errors",
+        )),
+        baseline_evaluators: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/baseline_evaluation/evaluators",
+        )),
+        candidate_evaluators: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/candidate_evaluation/evaluators",
+        )),
+        baseline_metadata: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/baseline_output/metadata",
+        )),
+        candidate_metadata: pretty_json(pointer_or_null(
+            &redacted_value,
+            "/candidate_output/metadata",
+        )),
+        baseline_execution: execution_view(&redacted_value, "/baseline_output"),
+        candidate_execution: execution_view(&redacted_value, "/candidate_output"),
         baseline_latency: record
             .baseline_output
             .latency_ms
@@ -649,12 +735,91 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> CaseView {
             .candidate_output
             .latency_ms
             .map_or_else(|| "Not recorded".to_owned(), |value| format!("{value} ms")),
+    })
+}
+
+fn execution_view(value: &Value, output_pointer: &str) -> String {
+    let output = pointer_or_null(value, output_pointer);
+    pretty_json(&serde_json::json!({
+        "status": output.pointer("/status"),
+        "error": output.pointer("/error"),
+        "latency_ms": output.pointer("/latency_ms"),
+        "usage": output.pointer("/usage"),
+        "cost": output.pointer("/cost"),
+        "retries": output.pointer("/retries"),
+        "finish_reason": output.pointer("/metadata/finish_reason"),
+    }))
+}
+
+fn pointer_or_null<'a>(value: &'a Value, pointer: &str) -> &'a Value {
+    value.pointer(pointer).unwrap_or(&Value::Null)
+}
+
+fn optional_pretty(value: &Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .map_or_else(|| "Not provided".to_owned(), pretty_json)
+}
+
+fn raw_for_report(value: &Value, pointer: &str, max_bytes: usize) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(|raw| truncate_for_report(raw.to_owned(), max_bytes))
+        .unwrap_or_else(|| "Not retained".to_owned())
+}
+
+fn redact_value_raw_text(value: &mut Value, pointer: &str, secrets: &[Value]) {
+    let raw = value
+        .pointer_mut(pointer)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let Some(mut raw) = raw else {
+        return;
+    };
+    redact_string(&mut raw, secrets);
+    if let Some(target) = value.pointer_mut(pointer) {
+        *target = Value::String(raw);
     }
 }
 
-fn remove_rendered_prompt(metadata: &mut Value) {
-    if let Some(object) = metadata.as_object_mut() {
-        object.remove("rendered_prompt");
+fn redact_string(value: &mut String, secrets: &[Value]) {
+    for secret in secrets {
+        let needle = match secret {
+            Value::String(value) => value.clone(),
+            Value::Null => "null".to_owned(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        if !needle.is_empty() {
+            *value = value.replace(&needle, REDACTION_MARKER);
+        }
+    }
+}
+
+fn remove_object_key(value: &mut Value, object_pointer: &str, key: &str) {
+    if let Some(object) = value
+        .pointer_mut(object_pointer)
+        .and_then(Value::as_object_mut)
+    {
+        object.remove(key);
+    }
+}
+
+fn strip_provider_echoes(value: &mut Value, output_pointer: &str) {
+    remove_object_key(
+        value,
+        &format!("{output_pointer}/metadata"),
+        "provider_response",
+    );
+    if let Some(retries) = value
+        .pointer_mut(&format!("{output_pointer}/retries"))
+        .and_then(Value::as_array_mut)
+    {
+        for retry in retries {
+            if let Some(object) = retry.as_object_mut() {
+                object.remove("response");
+            }
+        }
     }
 }
 
@@ -669,22 +834,6 @@ fn truncate_for_report(mut value: String, max_bytes: usize) -> String {
     value.truncate(boundary);
     value.push_str("\n[StructTrace: raw output truncated for report]");
     value
-}
-
-fn redact_raw_text(raw: &mut Option<String>, secrets: &[Value]) {
-    let Some(raw) = raw else {
-        return;
-    };
-    for secret in secrets {
-        let needle = match secret {
-            Value::String(value) => value.clone(),
-            Value::Null => "null".to_owned(),
-            other => serde_json::to_string(other).unwrap_or_default(),
-        };
-        if !needle.is_empty() {
-            *raw = raw.replace(&needle, REDACTION_MARKER);
-        }
-    }
 }
 
 fn comparison(label: &str, baseline: usize, candidate: usize, total: usize) -> ComparisonRow {
@@ -808,6 +957,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     <h3>Structured diff</h3>{% if case.diffs %}<div class="diff"><div class="head">Path</div><div class="head">Change</div><div class="head">Baseline</div><div class="head">Candidate</div>{% for diff in case.diffs %}<code>{{ diff.path }}</code><span>{{ diff.kind }}</span><code>{{ diff.baseline }}</code><code>{{ diff.candidate }}</code>{% endfor %}</div>{% else %}<p class="empty">Parsed outputs are identical.</p>{% endif %}
     <div class="case-grid"><section><h3>Baseline schema errors</h3><pre class="code">{{ case.baseline_schema_errors }}</pre></section><section><h3>Candidate schema errors</h3><pre class="code">{{ case.candidate_schema_errors }}</pre></section></div>
     <div class="case-grid"><section><h3>Baseline evaluators</h3><pre class="code">{{ case.baseline_evaluators }}</pre></section><section><h3>Candidate evaluators</h3><pre class="code">{{ case.candidate_evaluators }}</pre></section></div>
+    <div class="case-grid"><section><h3>Baseline execution evidence</h3><pre class="code">{{ case.baseline_execution }}</pre></section><section><h3>Candidate execution evidence</h3><pre class="code">{{ case.candidate_execution }}</pre></section></div>
     <div class="case-grid"><section><h3>Baseline adapter metadata</h3><pre class="code">{{ case.baseline_metadata }}</pre></section><section><h3>Candidate adapter metadata</h3><pre class="code">{{ case.candidate_metadata }}</pre></section></div>
     <h3>Case metadata</h3><pre class="code">{{ case.metadata }}</pre>
   </div></details>{% endfor %}</div>
@@ -862,6 +1012,7 @@ mod tests {
             id,
             input,
             expected: Some(expected.clone()),
+            model_visible_metadata: None,
             metadata: None,
             source_line: 1,
         };
@@ -909,6 +1060,7 @@ mod tests {
             errors: 0,
             timeouts: 0,
             operational: OperationalSummary::default(),
+            ..VariantSummary::default()
         };
         let summary = RunSummary {
             artifact_format_version: structtrace_core::ARTIFACT_FORMAT_VERSION,
@@ -916,6 +1068,7 @@ mod tests {
             primary_outcome: "correct".to_owned(),
             baseline: variant.clone(),
             candidate: variant,
+            matched_operational: Default::default(),
             paired,
             bootstrap: BootstrapInterval {
                 lower_pp: 0.0,
@@ -932,7 +1085,7 @@ mod tests {
             field_hotspots: vec![],
         };
         let manifest = RunManifest::new("report-run".to_owned(), "report-test".to_owned());
-        let view = build_view(&summary, &manifest, records, config);
+        let view = build_view(&summary, &manifest, records, config).unwrap();
         let mut environment = Environment::new();
         environment.set_auto_escape_callback(|_| AutoEscape::Html);
         environment.add_template("report.html", TEMPLATE).unwrap();
@@ -1058,6 +1211,7 @@ mod tests {
             id: "one".to_owned(),
             input: json!({"customer_email": secret}),
             expected: Some(json!({"email": secret})),
+            model_visible_metadata: None,
             metadata: None,
             source_line: 1,
         };
@@ -1090,9 +1244,72 @@ mod tests {
             candidate_evaluation: evaluation,
             transition: "both_pass".to_owned(),
         };
-        let view = case_view(&record, &config);
+        let view = case_view(&record, &config).unwrap();
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains(secret));
         assert!(serialized.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn redaction_never_falls_back_for_typed_or_reserved_values() {
+        let config: Config = serde_json::from_value(json!({
+            "version": 1,
+            "project": {"name": "privacy-adversarial"},
+            "storage": {
+                "redaction": {"json_pointers": ["/input/secret"]}
+            },
+            "dataset": {"path": "data.jsonl"},
+            "schema": {"path": "schema.json"},
+            "variants": {
+                "baseline": {"kind": "recorded", "path": "baseline.jsonl"},
+                "candidate": {"kind": "recorded", "path": "candidate.jsonl"}
+            },
+            "evaluators": [{"id": "exact", "kind": "exact_json"}],
+            "outcomes": {"correct": {"all_of": ["exact"]}},
+            "analysis": {"primary_outcome": "correct"}
+        }))
+        .unwrap();
+        for secret in [
+            json!("ok"),
+            json!("error"),
+            json!("both_pass"),
+            json!(1),
+            json!(true),
+        ] {
+            let mut record = passing_record("privacy-case".to_owned(), json!({"secret": secret}));
+            record.case.expected = Some(json!({"echo": secret}));
+            record.baseline_output.metadata = json!({
+                "provider_response": {"echo": secret},
+                "status_echo": secret
+            });
+            record.candidate_output.metadata = record.baseline_output.metadata.clone();
+            let view = case_view(&record, &config).unwrap();
+            let serialized = serde_json::to_string(&view).unwrap();
+            assert!(serialized.contains(REDACTION_MARKER));
+            let literal = serde_json::to_string(&secret).unwrap();
+            assert!(!view.input.contains(&literal));
+            assert!(!view.expected.contains(&literal));
+            assert!(!view.baseline_metadata.contains(&literal));
+            if secret == json!("both_pass") {
+                assert!(!view.filters.contains("both_pass"));
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_raw_output_removes_provider_response_echo() {
+        let mut config = report_config("provider privacy");
+        config.report.include_raw_outputs = false;
+        config.storage.retain_provider_responses = true;
+        let echo = "PROVIDER_ECHO_SENTINEL";
+        let mut record = passing_record("provider-case".to_owned(), json!({"safe": true}));
+        record.baseline_output.metadata = json!({"provider_response": {"content": echo}});
+        record.candidate_output.metadata = record.baseline_output.metadata.clone();
+        record.baseline_output.retries = vec![json!({"response": {"content": echo}})];
+        record.candidate_output.retries = record.baseline_output.retries.clone();
+        let view = case_view(&record, &config).unwrap();
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains(echo));
+        assert!(!serialized.contains("provider_response"));
     }
 }

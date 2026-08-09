@@ -10,11 +10,17 @@ infrastructure or users. It is not a substitute for CI logs or user feedback.
 | Locked clean installation | `cargo install --path crates/structtrace-cli --locked --root <isolated-prefix>` completed |
 | Installed command surface | installed `structtrace --help` and offline `structtrace doctor --format json` passed |
 | Support-ticket demo | installed binary reproduced baseline 10/12 and candidate 8/12 |
-| Accepted-research demo | installed binary reproduced aggregate 136/229 and 130/229 plus exact per-study matrices |
-| Accepted-research replay | zero artifact, row-score, and summary mismatches |
+| Normalized research fixture | installed binary reproduced aggregate 136/229 and 130/229 plus exact per-study matrices; this is not raw research-artifact replay |
+| Research-fixture replay | zero artifact, cross-artifact, row-score, and summary mismatches |
 | Recorded workflow | real-binary init, run, report export, failed gate exit 10, and replay passed |
 | CI gate output | real-binary GitHub mode appended a Markdown metrics table to `$GITHUB_STEP_SUMMARY` and emitted rule annotations |
 | Artifact tamper detection | modifying a finalized report caused replay to return artifact-failure exit code 4 |
+| Gate integrity | default gate rejects a manifest hash mismatch; high-assurance `--verify replay` is available |
+| Label isolation | command, Python, and OpenAI tests prove expected values and evaluation-only metadata do not cross the variant boundary |
+| Evaluator semantics | adversarial tests cover missing pointers, per-field hotspot facts, evaluator errors, not-applicable results, and nonzero exits |
+| Independent replay | replay reconstructs rows from retained dataset plus baseline/candidate inputs and detects cross-artifact tampering even after ordinary hashes are updated |
+| External evaluator receipts | replay verifies definition-, request-, and response-bound facts without re-executing side-effecting programs |
+| Immutable finalized report | export reads the finalized report without changing its bytes; redaction fails closed and strips provider/retry echoes |
 | Python adapter | generated template ran end to end with 2/2 versus 1/2 |
 | Command adapter | generated persistent protocol ran end to end with 2/2 versus 1/2 |
 | OpenAI-compatible adapter | local mock-server tests cover content, usage, exact cost, provider errors, malformed responses, and opt-in retries |
@@ -27,7 +33,7 @@ infrastructure or users. It is not a substitute for CI logs or user feedback.
 | Configuration safety | runtime validation enforces paths, pointers, callables, timeouts, concurrency, retries, token limits, tolerances, pricing, gates, and report-filter constraints independently of editor tooling |
 | Documentation | mdBook built 42 HTML pages; 1,067 generated local references checked with zero missing targets |
 | Formatting and linting | `cargo fmt --all --check` and warnings-denied Clippy passed |
-| Test suite | 76 deterministic and property-based tests pass without a provider credential, external model, GPU, or network service |
+| Test suite | 99 deterministic and property-based tests pass without a provider credential, external model, GPU, or network service |
 
 ## Defined but awaiting remote evidence
 
@@ -37,6 +43,7 @@ infrastructure or users. It is not a substitute for CI logs or user feedback.
 | macOS build and test | workflow defined; requires GitHub Actions runner evidence |
 | Windows build and test | workflow defined; requires GitHub Actions runner evidence |
 | Tagged release archives | workflow defined for Linux, Intel/Apple Silicon macOS, and Windows; not published |
+| Prebuilt installer validation | shell and PowerShell installers and per-asset checksum verification are implemented; end-to-end validation awaits the first tagged release |
 | Private-user validation | not started; requires consenting external users and cannot be simulated honestly |
 
 ## Material boundaries

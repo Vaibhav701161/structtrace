@@ -7,10 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
-use rust_decimal::{
-    Decimal,
-    prelude::{FromPrimitive, ToPrimitive},
-};
+use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::Serialize;
 use serde_json::Value;
 use structtrace_adapters::{
@@ -20,12 +17,12 @@ use structtrace_adapters::{
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{
-        EvaluatorComparison, FieldHotspot, PairedCaseRecord, RunManifest, RunStatus, RunSummary,
-        VariantSummary,
+        EvaluatorComparison, ExternalEvaluatorReceipt, FieldHotspot, MatchedOperationalSummary,
+        PairedCaseRecord, RunManifest, RunStatus, RunSummary, VariantSummary,
     },
     config::{Config, EvaluatorKind, VariantConfig},
     dataset::Dataset,
-    evaluation::{EvaluatorResult, compile_schema, evaluate_case_with_external},
+    evaluation::{EvaluationStatus, EvaluatorResult, compile_schema, evaluate_case_with_external},
     gate::{GateInputs, evaluate_gate},
     hashing::{hash_bytes, hash_canonical_json, hash_file},
     output::{OutputStatus, RecordedOutputs},
@@ -72,8 +69,10 @@ pub fn run_recorded(project_root: &Path, config_path: &Path) -> anyhow::Result<C
         .canonicalize()
         .with_context(|| format!("project root {} does not exist", project_root.display()))?;
     let config_path = resolve(&project_root, config_path);
-    let config = Config::load(&config_path)?;
-    run_recorded_with_config(&project_root, &config_path, config)
+    let config_source_bytes = std::fs::read(&config_path)
+        .with_context(|| format!("could not read configuration {}", config_path.display()))?;
+    let config = Config::from_bytes(&config_path, &config_source_bytes)?;
+    run_recorded_with_snapshot(&project_root, config, config_source_bytes)
 }
 
 /// Run a comparison with validated CLI overrides while retaining the source config hash.
@@ -86,10 +85,20 @@ pub fn run_recorded_with_config(
         .canonicalize()
         .with_context(|| format!("project root {} does not exist", project_root.display()))?;
     let config_path = resolve(&project_root, config_path);
+    let config_source_bytes = std::fs::read(&config_path)
+        .with_context(|| format!("could not read configuration {}", config_path.display()))?;
+    run_recorded_with_snapshot(&project_root, config, config_source_bytes)
+}
+
+fn run_recorded_with_snapshot(
+    project_root: &Path,
+    config: Config,
+    config_source_bytes: Vec<u8>,
+) -> anyhow::Result<CompletedRun> {
     let config = Config::validate(config)?;
-    let dataset_path = resolve(&project_root, &config.dataset.path);
+    let dataset_path = resolve(project_root, &config.dataset.path);
     let dataset = Dataset::read(&dataset_path, &config.dataset.fields)?;
-    let schema_path = resolve(&project_root, &config.schema.path);
+    let schema_path = resolve(project_root, &config.schema.path);
     let schema_bytes = std::fs::read(&schema_path)
         .with_context(|| format!("could not read schema {}", schema_path.display()))?;
     let schema_value: Value = serde_json::from_slice(&schema_bytes)
@@ -97,23 +106,22 @@ pub fn run_recorded_with_config(
     compile_schema(&schema_value)?;
 
     let baseline = read_recorded_variant(
-        &project_root,
+        project_root,
         "baseline",
         config.variants.get("baseline").expect("validated config"),
         &dataset,
     )?;
     let candidate = read_recorded_variant(
-        &project_root,
+        project_root,
         "candidate",
         config.variants.get("candidate").expect("validated config"),
         &dataset,
     )?;
 
     finalize_prepared(
-        &project_root,
-        &config_path,
+        project_root,
+        config_source_bytes,
         config,
-        dataset_path,
         dataset,
         schema_bytes,
         baseline,
@@ -125,9 +133,8 @@ pub fn run_recorded_with_config(
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_prepared(
     project_root: &Path,
-    config_path: &Path,
+    config_source_bytes: Vec<u8>,
     config: Config,
-    dataset_path: PathBuf,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
     mut baseline: PreparedVariant,
@@ -147,9 +154,8 @@ pub fn finalize_prepared(
     )?;
     finalize_prepared_for_run(
         project_root,
-        config_path,
+        config_source_bytes,
         config,
-        dataset_path,
         dataset,
         schema_bytes,
         baseline,
@@ -162,9 +168,8 @@ pub fn finalize_prepared(
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_prepared_for_run(
     project_root: &Path,
-    config_path: &Path,
+    config_source_bytes: Vec<u8>,
     config: Config,
-    dataset_path: PathBuf,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
     baseline: PreparedVariant,
@@ -221,6 +226,7 @@ pub fn finalize_prepared_for_run(
     let mut records = Vec::with_capacity(dataset.cases.len());
     let evaluator_bridge = materialize_evaluator_bridge(&storage_root)?;
     let mut evaluator_stderr = Vec::new();
+    let mut evaluator_receipts = Vec::new();
     for index in 0..dataset.cases.len() {
         let case = &dataset.cases[index];
         let baseline_output = &baseline.rows[index];
@@ -233,6 +239,7 @@ pub fn finalize_prepared_for_run(
             project_root,
             &evaluator_bridge,
             &mut evaluator_stderr,
+            &mut evaluator_receipts,
         );
         let candidate_external = execute_external_evaluators(
             &config,
@@ -242,6 +249,7 @@ pub fn finalize_prepared_for_run(
             project_root,
             &evaluator_bridge,
             &mut evaluator_stderr,
+            &mut evaluator_receipts,
         );
         let baseline_evaluation = evaluate_case_with_external(
             case,
@@ -286,9 +294,10 @@ pub fn finalize_prepared_for_run(
     let run_dir = store.run_dir().to_owned();
     atomic_write_json(&run_dir.join("inputs/configuration.json"), &config)?;
     atomic_write(
-        &run_dir.join("inputs/dataset.jsonl"),
-        &std::fs::read(&dataset_path)?,
+        &run_dir.join("inputs/configuration.source"),
+        &config_source_bytes,
     )?;
+    atomic_write(&run_dir.join("inputs/dataset.jsonl"), &dataset.source_bytes)?;
     atomic_write(&run_dir.join("inputs/schema.json"), &schema_bytes)?;
     atomic_write(
         &run_dir.join("inputs/baseline.jsonl"),
@@ -325,6 +334,12 @@ pub fn finalize_prepared_for_run(
             &evaluator_stderr,
         )?;
     }
+    if !evaluator_receipts.is_empty() {
+        atomic_write_jsonl(
+            &run_dir.join("external-evaluator-receipts.jsonl"),
+            &evaluator_receipts,
+        )?;
+    }
     atomic_write_jsonl(&run_dir.join("cases.jsonl"), &records)?;
     let discordances = records
         .iter()
@@ -342,7 +357,7 @@ pub fn finalize_prepared_for_run(
     )?;
 
     let mut manifest = RunManifest::new(run_id.clone(), config.project.name.clone());
-    manifest.configuration_file_hash = hash_file(config_path)?;
+    manifest.configuration_file_hash = hash_bytes(&config_source_bytes);
     manifest.normalized_configuration_hash = hash_canonical_json(&config)?;
     manifest.dataset_path = config.dataset.path.display().to_string();
     manifest.dataset_hash = dataset.source_hash.clone();
@@ -357,19 +372,27 @@ pub fn finalize_prepared_for_run(
     manifest.gate = config.gate.clone();
     manifest.bootstrap = config.analysis.bootstrap.clone();
     manifest.input_artifacts = BTreeMap::from([
-        (baseline.source_label.clone(), baseline.input_hash.clone()),
-        (candidate.source_label.clone(), candidate.input_hash.clone()),
+        (
+            "inputs/baseline.jsonl".to_owned(),
+            hash_bytes(&baseline.source_bytes),
+        ),
+        (
+            "inputs/candidate.jsonl".to_owned(),
+            hash_bytes(&candidate.source_bytes),
+        ),
     ]);
     for variant in config.variants.values() {
         if let VariantConfig::OpenaiCompatible(adapter) = variant {
-            manifest.environment.insert(
-                adapter.api_key_env.clone(),
-                std::env::var_os(&adapter.api_key_env).is_some(),
-            );
+            if let Some(name) = &adapter.api_key_env {
+                manifest
+                    .environment
+                    .insert(name.clone(), std::env::var_os(name).is_some());
+            }
         }
     }
     for relative in [
         "inputs/configuration.json",
+        "inputs/configuration.source",
         "inputs/dataset.jsonl",
         "inputs/schema.json",
         "inputs/baseline.jsonl",
@@ -379,6 +402,16 @@ pub fn finalize_prepared_for_run(
         "summary.json",
         "summary.md",
     ] {
+        let path = run_dir.join(relative);
+        let digest = hash_file(&path)?;
+        let length = std::fs::metadata(&path)?.len();
+        manifest
+            .artifacts
+            .insert(relative.to_owned(), digest.clone());
+        store.record_artifact(relative, &digest, length)?;
+    }
+    if run_dir.join("external-evaluator-receipts.jsonl").is_file() {
+        let relative = "external-evaluator-receipts.jsonl";
         let path = run_dir.join(relative);
         let digest = hash_file(&path)?;
         let length = std::fs::metadata(&path)?.len();
@@ -434,6 +467,7 @@ pub fn finalize_prepared_for_run(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_external_evaluators(
     config: &Config,
     case: &structtrace_core::dataset::Case,
@@ -442,6 +476,7 @@ fn execute_external_evaluators(
     project_root: &Path,
     bridge_path: &Path,
     retained_stderr: &mut Vec<u8>,
+    retained_receipts: &mut Vec<ExternalEvaluatorReceipt>,
 ) -> BTreeMap<String, EvaluatorResult> {
     let mut results = BTreeMap::new();
     for evaluator in &config.evaluators {
@@ -476,6 +511,7 @@ fn execute_external_evaluators(
             );
             retained_stderr.extend_from_slice(&run.stderr);
         }
+        retained_receipts.push(run.receipt);
         results.insert(evaluator.id.clone(), run.result);
     }
     results
@@ -594,8 +630,9 @@ pub(crate) fn build_summary(
         config.analysis.bootstrap.confidence,
         config.analysis.bootstrap.seed,
     )?;
-    let baseline = variant_summary(records, true);
-    let candidate = variant_summary(records, false);
+    let baseline = variant_summary(records, true, &config.analysis.primary_outcome);
+    let candidate = variant_summary(records, false, &config.analysis.primary_outcome);
+    let matched_operational = matched_operational_summary(records);
     let evaluator_passes = config
         .evaluators
         .iter()
@@ -639,10 +676,18 @@ pub(crate) fn build_summary(
             candidate_schema_validity: rate(candidate.schema_valid, candidate.total),
             candidate_error_rate: rate(candidate.errors, candidate.total),
             candidate_timeout_rate: rate(candidate.timeouts, candidate.total),
-            baseline_p95_latency_ms: baseline.operational.p95_latency_ms,
-            candidate_p95_latency_ms: candidate.operational.p95_latency_ms,
-            baseline_average_cost: average_cost_f64(&baseline),
-            candidate_average_cost: average_cost_f64(&candidate),
+            baseline_p95_latency_ms: matched_operational.baseline_p95_latency_ms,
+            candidate_p95_latency_ms: matched_operational.candidate_p95_latency_ms,
+            latency_coverage: rate(matched_operational.latency_pairs, records.len()),
+            baseline_average_cost: matched_operational
+                .baseline_average_cost
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            candidate_average_cost: matched_operational
+                .candidate_average_cost
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            cost_coverage: rate(matched_operational.cost_pairs, records.len()),
         },
     );
     Ok(RunSummary {
@@ -651,6 +696,7 @@ pub(crate) fn build_summary(
         primary_outcome: config.analysis.primary_outcome.clone(),
         baseline,
         candidate,
+        matched_operational,
         paired,
         bootstrap,
         gate,
@@ -659,7 +705,87 @@ pub(crate) fn build_summary(
     })
 }
 
-fn variant_summary(records: &[PairedCaseRecord], baseline: bool) -> VariantSummary {
+fn matched_operational_summary(records: &[PairedCaseRecord]) -> MatchedOperationalSummary {
+    let latency_pairs = records
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record.baseline_output.latency_ms? as f64,
+                record.candidate_output.latency_ms? as f64,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut cost_pairs = Vec::new();
+    for record in records {
+        let (Some(baseline), Some(candidate)) = (
+            record.baseline_output.cost.as_ref(),
+            record.candidate_output.cost.as_ref(),
+        ) else {
+            continue;
+        };
+        if baseline.currency != candidate.currency {
+            continue;
+        }
+        let (Ok(baseline_amount), Ok(candidate_amount)) = (
+            baseline.amount.parse::<Decimal>(),
+            candidate.amount.parse::<Decimal>(),
+        ) else {
+            continue;
+        };
+        cost_pairs.push((baseline_amount, candidate_amount, baseline.currency.clone()));
+    }
+    let currencies = cost_pairs
+        .iter()
+        .map(|(_, _, currency)| currency.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let comparable_cost_pairs = if currencies.len() == 1 {
+        cost_pairs.len()
+    } else {
+        0
+    };
+    let (baseline_average_cost, candidate_average_cost, currency) = if comparable_cost_pairs > 0 {
+        let denominator = Decimal::from_usize(comparable_cost_pairs).expect("positive count");
+        let baseline = cost_pairs
+            .iter()
+            .map(|(amount, _, _)| *amount)
+            .sum::<Decimal>()
+            / denominator;
+        let candidate = cost_pairs
+            .iter()
+            .map(|(_, amount, _)| *amount)
+            .sum::<Decimal>()
+            / denominator;
+        (
+            Some(baseline.normalize().to_string()),
+            Some(candidate.normalize().to_string()),
+            currencies.first().map(|value| (*value).to_owned()),
+        )
+    } else {
+        (None, None, None)
+    };
+    MatchedOperationalSummary {
+        total_pairs: records.len(),
+        latency_pairs: latency_pairs.len(),
+        baseline_p95_latency_ms: percentile(
+            &latency_pairs.iter().map(|pair| pair.0).collect::<Vec<_>>(),
+            0.95,
+        ),
+        candidate_p95_latency_ms: percentile(
+            &latency_pairs.iter().map(|pair| pair.1).collect::<Vec<_>>(),
+            0.95,
+        ),
+        cost_pairs: comparable_cost_pairs,
+        baseline_average_cost,
+        candidate_average_cost,
+        currency,
+    }
+}
+
+fn variant_summary(
+    records: &[PairedCaseRecord],
+    baseline: bool,
+    primary_outcome: &str,
+) -> VariantSummary {
     let evaluations = records.iter().map(|record| {
         if baseline {
             (&record.baseline_output, &record.baseline_evaluation)
@@ -675,6 +801,15 @@ fn variant_summary(records: &[PairedCaseRecord], baseline: bool) -> VariantSumma
         summary.parse_valid += usize::from(evaluation.parse_valid);
         summary.schema_valid += usize::from(evaluation.schema_valid);
         summary.primary_pass += usize::from(evaluation.primary_pass);
+        match evaluation.outcomes.get(primary_outcome) {
+            Some(structtrace_core::evaluation::OutcomeStatus::True) => {}
+            Some(structtrace_core::evaluation::OutcomeStatus::False) => summary.primary_failed += 1,
+            Some(structtrace_core::evaluation::OutcomeStatus::Error) => summary.primary_error += 1,
+            Some(structtrace_core::evaluation::OutcomeStatus::NotApplicable) => {
+                summary.primary_not_applicable += 1;
+            }
+            None => summary.primary_unscored += 1,
+        }
         summary.valid_but_wrong += usize::from(evaluation.valid_but_wrong);
         summary.errors += usize::from(output.status != OutputStatus::Ok);
         summary.timeouts += usize::from(
@@ -732,46 +867,34 @@ fn variant_summary(records: &[PairedCaseRecord], baseline: bool) -> VariantSumma
 }
 
 fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHotspot> {
-    let mut hotspots = Vec::new();
-    for evaluator in &config.evaluators {
-        let pointers = match &evaluator.kind {
-            EvaluatorKind::JsonPointerExact { pointer, .. }
-            | EvaluatorKind::EnumAccuracy { pointer, .. }
-            | EvaluatorKind::NumericTolerance { pointer, .. }
-            | EvaluatorKind::ToolSelection { pointer, .. } => vec![pointer.clone()],
-            EvaluatorKind::JsonPointersExact { pointers }
-            | EvaluatorKind::ToolArguments { pointers } => {
-                pointers.iter().map(|pair| pair.pointer.clone()).collect()
-            }
-            EvaluatorKind::RequiredFields { pointers } => pointers.clone(),
-            EvaluatorKind::ExactJson => vec!["/".to_owned()],
-            EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. } => Vec::new(),
-        };
-        for pointer in pointers {
-            let mut hotspot = FieldHotspot {
-                pointer,
-                regressions: 0,
-                improvements: 0,
-                candidate_failures: 0,
-            };
-            for record in records {
-                let baseline_pass = record
-                    .baseline_evaluation
-                    .evaluators
-                    .get(&evaluator.id)
-                    .is_some_and(|result| result.passed);
-                let candidate_pass = record
-                    .candidate_evaluation
-                    .evaluators
-                    .get(&evaluator.id)
-                    .is_some_and(|result| result.passed);
-                hotspot.regressions += usize::from(baseline_pass && !candidate_pass);
-                hotspot.improvements += usize::from(!baseline_pass && candidate_pass);
-                hotspot.candidate_failures += usize::from(!candidate_pass);
-            }
-            hotspots.push(hotspot);
+    let evaluator_ids = config
+        .evaluators
+        .iter()
+        .map(|evaluator| evaluator.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut hotspots = BTreeMap::<String, FieldHotspot>::new();
+    for record in records {
+        let baseline = field_statuses(&record.baseline_evaluation.evaluators, &evaluator_ids);
+        let candidate = field_statuses(&record.candidate_evaluation.evaluators, &evaluator_ids);
+        for pointer in baseline.keys().chain(candidate.keys()) {
+            let hotspot = hotspots
+                .entry(pointer.clone())
+                .or_insert_with(|| FieldHotspot {
+                    pointer: pointer.clone(),
+                    regressions: 0,
+                    improvements: 0,
+                    candidate_failures: 0,
+                });
+            let baseline_pass = baseline.get(pointer).copied();
+            let candidate_pass = candidate.get(pointer).copied();
+            hotspot.regressions +=
+                usize::from(baseline_pass == Some(true) && candidate_pass == Some(false));
+            hotspot.improvements +=
+                usize::from(baseline_pass == Some(false) && candidate_pass == Some(true));
+            hotspot.candidate_failures += usize::from(candidate_pass == Some(false));
         }
     }
+    let mut hotspots = hotspots.into_values().collect::<Vec<_>>();
     hotspots.sort_by(|left, right| {
         right
             .regressions
@@ -780,6 +903,30 @@ fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHot
             .then_with(|| left.pointer.cmp(&right.pointer))
     });
     hotspots
+}
+
+fn field_statuses(
+    results: &BTreeMap<String, EvaluatorResult>,
+    evaluator_ids: &std::collections::BTreeSet<&str>,
+) -> BTreeMap<String, bool> {
+    let mut statuses = BTreeMap::<String, bool>::new();
+    for (evaluator_id, result) in results {
+        if !evaluator_ids.contains(evaluator_id.as_str()) {
+            continue;
+        }
+        for field in &result.fields {
+            match field.status {
+                EvaluationStatus::Passed => {
+                    statuses.entry(field.pointer.clone()).or_insert(true);
+                }
+                EvaluationStatus::Failed => {
+                    statuses.insert(field.pointer.clone(), false);
+                }
+                EvaluationStatus::Error | EvaluationStatus::NotApplicable => {}
+            }
+        }
+    }
+    statuses
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -793,15 +940,6 @@ fn percentile(values: &[f64], quantile: f64) -> Option<f64> {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
     Some(values[((values.len() - 1) as f64 * quantile).ceil() as usize])
-}
-
-fn average_cost_f64(summary: &VariantSummary) -> Option<f64> {
-    summary
-        .operational
-        .average_cost
-        .as_deref()
-        .and_then(|value| value.parse::<Decimal>().ok())
-        .and_then(|value| value.to_f64())
 }
 
 fn rate(count: usize, total: usize) -> f64 {
@@ -974,6 +1112,56 @@ gate:
     }
 
     #[test]
+    fn hotspot_attributes_only_the_failing_pointer() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"a\",\"input\":{},\"expected\":{\"priority\":\"high\",\"team\":\"ops\",\"human\":true}}\n",
+        );
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("baseline.jsonl"),
+            "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"priority\\\":\\\"high\\\",\\\"team\\\":\\\"ops\\\",\\\"human\\\":true}\"}\n",
+        );
+        write(
+            &root.path().join("candidate.jsonl"),
+            "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"priority\\\":\\\"low\\\",\\\"team\\\":\\\"ops\\\",\\\"human\\\":true}\"}\n",
+        );
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 1
+project: {name: field-hotspot}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - id: fields
+    kind: json_pointers_exact
+    pointers:
+      - {pointer: /priority, expected_pointer: /priority}
+      - {pointer: /team, expected_pointer: /team}
+      - {pointer: /human, expected_pointer: /human}
+outcomes:
+  correct: {all_of: [fields]}
+analysis:
+  primary_outcome: correct
+  bootstrap: {samples: 100, confidence: 0.95, seed: 17}
+"#,
+        );
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        let regressions = run
+            .summary
+            .field_hotspots
+            .iter()
+            .filter(|hotspot| hotspot.regressions > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(regressions.len(), 1);
+        assert_eq!(regressions[0].pointer, "/priority");
+    }
+
+    #[test]
     fn disabled_raw_retention_removes_source_text_before_persistence() {
         let source = b"{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\",\"metadata\":{},\"retries\":[]}\n".to_vec();
         let mut prepared = PreparedVariant {
@@ -1075,5 +1263,12 @@ analysis:
         assert_eq!(run.summary.candidate.primary_pass, 0);
         let replay = crate::replay::replay_run(&run.run_dir).unwrap();
         assert!(replay.verified);
+        assert_eq!(replay.external_evaluator_receipts_verified, 2);
+        assert_eq!(replay.external_evaluator_programs_reexecuted, 0);
+        assert!(
+            run.run_dir
+                .join("external-evaluator-receipts.jsonl")
+                .is_file()
+        );
     }
 }

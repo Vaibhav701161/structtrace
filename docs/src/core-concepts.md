@@ -1,6 +1,8 @@
 # Core concepts
 
-**Case**: one immutable ID with an input, optional expected result, and optional metadata.
+**Case**: one immutable ID with an input, optional expected result, optional evaluation-only
+metadata, and optional explicitly model-visible metadata. Expected results and evaluation-only
+metadata stay inside the evaluation engine.
 
 **Variant**: the baseline or candidate implementation. It may be a recorded JSONL file, a command, a Python callable, or an OpenAI-compatible endpoint.
 
@@ -14,4 +16,6 @@
 
 **Release gate**: independent user-declared limits on semantic regression, valid-but-wrong growth, schema validity, errors, timeouts, latency, and cost.
 
-**Replay**: hash verification plus full recomputation from retained artifacts.
+**Replay**: hash verification, cross-artifact reconstruction from independently retained dataset
+and variant inputs, full built-in recomputation, and hash-bound verification of external
+evaluator receipts without re-executing side-effecting programs.

@@ -70,7 +70,6 @@ def main() -> None:
         case = {
             "id": case_id,
             "input": request.get("input"),
-            "expected": request.get("expected"),
             "metadata": request.get("metadata"),
         }
         try:

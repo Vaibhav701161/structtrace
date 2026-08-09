@@ -44,6 +44,24 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
             .unwrap()
             .success()
     );
+    let run_dir = std::fs::read_dir(project.join(".structtrace/runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let incomplete_dir = project.join(".structtrace/runs/ZZZZ-INCOMPLETE");
+    std::fs::create_dir_all(&incomplete_dir).unwrap();
+    let mut incomplete_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
+    incomplete_manifest["status"] = serde_json::Value::String("failed".to_owned());
+    std::fs::write(
+        incomplete_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&incomplete_manifest).unwrap(),
+    )
+    .unwrap();
+    let report = run_dir.join("report/index.html");
+    let finalized_report = std::fs::read(&report).unwrap();
     let export = root.path().join("report.html");
     assert!(
         binary()
@@ -60,6 +78,7 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
             .success()
     );
     assert!(export.is_file());
+    assert_eq!(std::fs::read(&report).unwrap(), finalized_report);
     assert!(
         binary()
             .args([
@@ -72,6 +91,19 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
             .unwrap()
             .success()
     );
+    let replay_verified_gate = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "gate",
+            "latest",
+            "--verify",
+            "replay",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(replay_verified_gate.code(), Some(10));
     let github_summary = root.path().join("github-step-summary.md");
     let status = binary()
         .args([
@@ -91,13 +123,24 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
     assert!(github_summary.contains("| Primary outcome |"));
 
-    let run_dir = std::fs::read_dir(project.join(".structtrace/runs"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let report = run_dir.join("report/index.html");
+    let summary_path = run_dir.join("summary.json");
+    let original_summary = std::fs::read(&summary_path).unwrap();
+    let mut tampered_summary = original_summary.clone();
+    tampered_summary.extend_from_slice(b"\n");
+    std::fs::write(&summary_path, tampered_summary).unwrap();
+    let gate_status = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "gate",
+            "latest",
+        ])
+        .status()
+        .unwrap();
+    assert!(!gate_status.success());
+    std::fs::write(&summary_path, original_summary).unwrap();
+
     let mut html = std::fs::read(&report).unwrap();
     html.extend_from_slice(b"<!-- deliberate artifact tamper -->");
     std::fs::write(report, html).unwrap();

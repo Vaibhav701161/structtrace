@@ -4,6 +4,12 @@ Start with the primary outcome and release-gate state, then inspect the structur
 
 Use the paired transition matrix to compare candidate-only improvements with baseline-only regressions. Field hotspots identify evaluator pointers associated with those transitions. The case explorer filters baseline-only, candidate-only, both-fail, valid-but-wrong, parse failures, schema failures, and adapter errors.
 
-Case detail shows input, expected value, raw and parsed outputs, JSON-aware changes, schema errors, evaluator evidence, case metadata, adapter metadata, and latency. Rendered prompts appear inside adapter metadata only when `report.include_prompts: true`; the default is false. Operational measurements are descriptive unless their gate rule is configured.
+Case detail shows input, expected value, raw and parsed outputs, JSON-aware changes, schema errors,
+evaluator evidence, case metadata, adapter metadata, and explicit execution panels for status,
+timeout or adapter error, latency, retries, token usage, cost, and finish reason. Evaluator errors
+and not-applicable results remain distinct from semantic false. Rendered prompts appear inside
+adapter metadata only when `report.include_prompts: true`; the default is false. Operational
+measurements are descriptive unless their gate rule is configured; coverage and matched-pair
+counts are shown separately.
 
 The final section records dataset, schema, normalized configuration, binary target, and artifact-format provenance. The report is generated locally and has no external assets.

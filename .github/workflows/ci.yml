@@ -71,13 +71,13 @@ jobs:
       - run: structtrace doctor
       - run: structtrace demo support-ticket
       - run: structtrace demo research
-      - run: structtrace replay --accepted-research
+      - run: structtrace replay --research-fixture
       - run: structtrace --project-root examples/recorded-output-comparison run
       - name: Deliberate gate regression returns 10
         shell: bash
         run: |
           set +e
-          structtrace --project-root examples/recorded-output-comparison gate latest --format github
+          structtrace --project-root examples/recorded-output-comparison gate latest --verify replay --format github
           code=$?
           test "$code" -eq 10
       - run: structtrace --project-root examples/python-callable run

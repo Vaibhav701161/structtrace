@@ -4,7 +4,7 @@ use std::path::Path;
 
 use structtrace_core::{
     config::{CommandSpec, ProcessMode},
-    dataset::Case,
+    dataset::VariantCase,
 };
 
 use crate::command::{AdapterRun, CommandLimits, run_command};
@@ -14,7 +14,7 @@ pub async fn run_python(
     interpreter: &str,
     callable: &str,
     timeout_ms: u64,
-    cases: &[Case],
+    cases: &[VariantCase],
     working_directory: &Path,
     bridge_path: &Path,
     limits: &CommandLimits,
@@ -48,7 +48,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use structtrace_core::{dataset::Case, output::OutputStatus};
+    use structtrace_core::{dataset::VariantCase, output::OutputStatus};
 
     use super::*;
 
@@ -64,13 +64,11 @@ mod tests {
             .expect("Python is required for bridge tests")
     }
 
-    fn case() -> Case {
-        Case {
+    fn case() -> VariantCase {
+        VariantCase {
             id: "one".to_owned(),
             input: json!({"text": "hello"}),
-            expected: None,
             metadata: None,
-            source_line: 1,
         }
     }
 
@@ -129,5 +127,33 @@ mod tests {
             Some("python_exception")
         );
         assert!(String::from_utf8_lossy(&run.stderr).contains("RuntimeError"));
+    }
+
+    #[tokio::test]
+    async fn python_callable_cannot_receive_expected() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("bridge.py"), BRIDGE_SOURCE).unwrap();
+        fs::write(
+            root.path().join("app.py"),
+            "def keys(case):\n    return {'keys': sorted(case.keys()), 'has_expected': 'expected' in case}\n",
+        )
+        .unwrap();
+        let run = run_python(
+            python_program(),
+            "app:keys",
+            1_000,
+            &[case()],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(run.rows[0].raw_output.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed.pointer("/has_expected"), Some(&json!(false)));
+        assert_eq!(
+            parsed.pointer("/keys"),
+            Some(&json!(["id", "input", "metadata"]))
+        );
     }
 }

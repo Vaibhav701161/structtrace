@@ -11,7 +11,7 @@ use tokio::{
 use serde_json::Value;
 use structtrace_core::{
     config::{CommandSpec, ProcessMode},
-    dataset::Case,
+    dataset::VariantCase,
     output::{OutputError, OutputStatus, VariantOutput},
 };
 
@@ -51,7 +51,7 @@ pub async fn run_command(
     spec: &CommandSpec,
     mode: ProcessMode,
     timeout_ms: u64,
-    cases: &[Case],
+    cases: &[VariantCase],
     working_directory: &Path,
     limits: &CommandLimits,
 ) -> AdapterRun {
@@ -68,7 +68,7 @@ pub async fn run_command(
 async fn run_persistent(
     spec: &CommandSpec,
     timeout_ms: u64,
-    cases: &[Case],
+    cases: &[VariantCase],
     working_directory: &Path,
     limits: &CommandLimits,
 ) -> AdapterRun {
@@ -241,7 +241,19 @@ async fn run_persistent(
             _ => {}
         }
     }
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+    match timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) if !status.success() && terminal_failure.is_none() => {
+            let message = format!("persistent process exited unsuccessfully with {status}");
+            protocol_errors.push(message.clone());
+            for (case, row) in cases.iter().zip(&mut rows) {
+                *row = error_output(&case.id, "process_exit", &message, row.latency_ms);
+            }
+        }
+        Ok(Err(error)) if terminal_failure.is_none() => {
+            protocol_errors.push(format!("could not wait for persistent process: {error}"));
+        }
+        _ => {}
+    }
     let stderr = match stderr_task {
         Some(task) => task.await.unwrap_or_default(),
         None => Vec::new(),
@@ -305,7 +317,7 @@ where
 async fn run_per_case(
     spec: &CommandSpec,
     timeout_ms: u64,
-    cases: &[Case],
+    cases: &[VariantCase],
     working_directory: &Path,
     limits: &CommandLimits,
 ) -> AdapterRun {
@@ -411,7 +423,7 @@ async fn run_per_case(
             ));
             continue;
         }
-        if let Ok(Err(error)) = wait {
+        if let Ok(Err(error)) = &wait {
             rows.push(error_output(
                 &case.id,
                 "process_terminated",
@@ -419,6 +431,17 @@ async fn run_per_case(
                 Some(elapsed_ms(started)),
             ));
             continue;
+        }
+        if let Ok(Ok(status)) = &wait {
+            if !status.success() {
+                rows.push(error_output(
+                    &case.id,
+                    "process_exit",
+                    &format!("per-case process exited unsuccessfully with {status}"),
+                    Some(elapsed_ms(started)),
+                ));
+                continue;
+            }
         }
         let (stdout, overflowed) = match stdout_result {
             Ok(result) => result,
@@ -560,7 +583,7 @@ fn error_output(
     }
 }
 
-fn all_failed(cases: &[Case], kind: &str, message: &str) -> AdapterRun {
+fn all_failed(cases: &[VariantCase], kind: &str, message: &str) -> AdapterRun {
     AdapterRun {
         rows: cases
             .iter()
@@ -655,23 +678,21 @@ for line in sys.stdin:
     print(json.dumps(response), flush=True)
     if args.mode == "duplicate":
         print(json.dumps(response), flush=True)
+    if args.mode == "nonzero":
+        sys.exit(9)
 "#;
 
-    fn cases() -> Vec<Case> {
+    fn cases() -> Vec<VariantCase> {
         vec![
-            Case {
+            VariantCase {
                 id: "one".to_owned(),
                 input: json!({"text": "first"}),
-                expected: Some(json!({"label": "accepted"})),
                 metadata: None,
-                source_line: 1,
             },
-            Case {
+            VariantCase {
                 id: "two".to_owned(),
                 input: json!({"text": "second"}),
-                expected: Some(json!({"label": "accepted"})),
                 metadata: None,
-                source_line: 2,
             },
         ]
     }
@@ -861,6 +882,27 @@ for line in sys.stdin:
             assert_eq!(
                 run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
                 Some("protocol_violation")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonzero_variant_exit_is_an_adapter_error() {
+        for mode in [ProcessMode::Persistent, ProcessMode::PerCase] {
+            let (directory, spec) = fixture("nonzero");
+            let run = run_command(
+                &spec,
+                mode,
+                FIXTURE_TIMEOUT_MS,
+                &cases()[..1],
+                directory.path(),
+                &CommandLimits::default(),
+            )
+            .await;
+            assert_eq!(run.rows[0].status, OutputStatus::Error);
+            assert_eq!(
+                run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
+                Some("process_exit")
             );
         }
     }

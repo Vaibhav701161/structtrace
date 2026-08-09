@@ -169,7 +169,7 @@ project:
 storage:
   root: .structtrace
   retain_raw_outputs: true
-  retain_provider_responses: true
+  retain_provider_responses: false
 
 limits:
   max_output_bytes_per_case: 4194304

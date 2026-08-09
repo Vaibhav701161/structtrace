@@ -9,9 +9,11 @@ use std::{
 
 use serde_json::{Value, json};
 use structtrace_core::{
+    artifact::ExternalEvaluatorReceipt,
     config::{CommandSpec, EvaluatorKind},
     dataset::Case,
     evaluation::{EvaluationStatus, EvaluatorResult},
+    hashing::hash_canonical_json,
     output::VariantOutput,
 };
 use wait_timeout::ChildExt;
@@ -31,6 +33,8 @@ pub struct EvaluatorRun {
     pub result: EvaluatorResult,
     /// Capped standard error emitted by the evaluator.
     pub stderr: Vec<u8>,
+    /// Hash-bound request, response, and executable-definition receipt.
+    pub receipt: ExternalEvaluatorReceipt,
 }
 
 /// Per-invocation execution context shared by command and Python evaluators.
@@ -75,29 +79,86 @@ pub fn run_external_evaluator(
             *timeout_ms,
         ),
         _ => {
-            return EvaluatorRun {
-                result: error(evaluator_id, "evaluator is not an external evaluator"),
-                stderr: Vec::new(),
-            };
+            let result = error(evaluator_id, "evaluator is not an external evaluator");
+            return receipt_run(
+                result,
+                Vec::new(),
+                evaluator_id,
+                case,
+                output,
+                runtime.variant_id,
+                kind,
+            );
         }
     };
-    let request = json!({
-        "protocol": EVALUATOR_PROTOCOL,
-        "protocol_version": structtrace_core::PROTOCOL_VERSION,
-        "evaluator_id": evaluator_id,
-        "case_id": case.id,
-        "case": case,
-        "model_output": output,
-        "variant_metadata": {"variant_id": runtime.variant_id},
-    });
-    execute(
+    let request = evaluator_request(evaluator_id, case, output, runtime.variant_id);
+    let run = execute(
         evaluator_id,
         &command,
         timeout_ms,
         &request,
         runtime.working_directory,
         runtime.limits,
+    );
+    receipt_run(
+        run.result,
+        run.stderr,
+        evaluator_id,
+        case,
+        output,
+        runtime.variant_id,
+        kind,
     )
+}
+
+/// Canonical request object used by execution and replay receipt verification.
+pub fn evaluator_request(
+    evaluator_id: &str,
+    case: &Case,
+    output: &VariantOutput,
+    variant_id: &str,
+) -> Value {
+    json!({
+        "protocol": EVALUATOR_PROTOCOL,
+        "protocol_version": structtrace_core::PROTOCOL_VERSION,
+        "evaluator_id": evaluator_id,
+        "case_id": case.id,
+        "case": case,
+        "model_output": output,
+        "variant_metadata": {"variant_id": variant_id},
+    })
+}
+
+fn receipt_run(
+    result: EvaluatorResult,
+    stderr: Vec<u8>,
+    evaluator_id: &str,
+    case: &Case,
+    output: &VariantOutput,
+    variant_id: &str,
+    kind: &EvaluatorKind,
+) -> EvaluatorRun {
+    let request = evaluator_request(evaluator_id, case, output, variant_id);
+    let response = serde_json::to_value(&result).unwrap_or(Value::Null);
+    let definition = serde_json::to_value(kind).unwrap_or(Value::Null);
+    EvaluatorRun {
+        receipt: ExternalEvaluatorReceipt {
+            evaluator_id: evaluator_id.to_owned(),
+            case_id: case.id.clone(),
+            variant_id: variant_id.to_owned(),
+            request_hash: hash_canonical_json(&request).unwrap_or_default(),
+            response_hash: hash_canonical_json(&response).unwrap_or_default(),
+            definition_hash: hash_canonical_json(&definition).unwrap_or_default(),
+            result: result.clone(),
+        },
+        result,
+        stderr,
+    }
+}
+
+struct EvaluatorProcessResult {
+    result: EvaluatorResult,
+    stderr: Vec<u8>,
 }
 
 fn execute(
@@ -107,7 +168,7 @@ fn execute(
     request: &Value,
     working_directory: &Path,
     limits: &CommandLimits,
-) -> EvaluatorRun {
+) -> EvaluatorProcessResult {
     let mut child = match Command::new(&spec.program)
         .args(&spec.args)
         .current_dir(working_directory)
@@ -118,7 +179,7 @@ fn execute(
     {
         Ok(child) => child,
         Err(failure) => {
-            return EvaluatorRun {
+            return EvaluatorProcessResult {
                 result: error(
                     evaluator_id,
                     format!("could not start evaluator: {failure}"),
@@ -138,7 +199,7 @@ fn execute(
     if let Err(failure) = write_result {
         let _ = child.kill();
         let _ = child.wait();
-        return EvaluatorRun {
+        return EvaluatorProcessResult {
             result: error(
                 evaluator_id,
                 format!("could not write evaluator request: {failure}"),
@@ -158,8 +219,8 @@ fn execute(
     let timed_out = matches!(status, Ok(None));
     if timed_out {
         let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.wait();
     let stdout = stdout_task
         .and_then(|task| task.join().ok())
         .unwrap_or_default();
@@ -167,7 +228,7 @@ fn execute(
         .and_then(|task| task.join().ok())
         .unwrap_or_default();
     if timed_out {
-        return EvaluatorRun {
+        return EvaluatorProcessResult {
             result: error(
                 evaluator_id,
                 format!("evaluator exceeded configured timeout of {timeout_ms} ms"),
@@ -175,16 +236,28 @@ fn execute(
             stderr,
         };
     }
-    if let Err(failure) = status {
-        return EvaluatorRun {
-            result: error(
-                evaluator_id,
-                format!("could not wait for evaluator: {failure}"),
-            ),
-            stderr,
-        };
+    match status {
+        Err(failure) => {
+            return EvaluatorProcessResult {
+                result: error(
+                    evaluator_id,
+                    format!("could not wait for evaluator: {failure}"),
+                ),
+                stderr,
+            };
+        }
+        Ok(Some(exit_status)) if !exit_status.success() => {
+            return EvaluatorProcessResult {
+                result: error(
+                    evaluator_id,
+                    format!("evaluator exited unsuccessfully with {exit_status}"),
+                ),
+                stderr,
+            };
+        }
+        Ok(_) => {}
     }
-    EvaluatorRun {
+    EvaluatorProcessResult {
         result: parse_response(evaluator_id, &stdout),
         stderr,
     }
@@ -254,6 +327,7 @@ fn parse_response(evaluator_id: &str, bytes: &[u8]) -> EvaluatorResult {
             .unwrap_or("External evaluator returned no message.")
             .to_owned(),
         details: value.pointer("/details").cloned().unwrap_or(Value::Null),
+        fields: Vec::new(),
     }
 }
 
@@ -280,6 +354,7 @@ fn error(evaluator_id: &str, message: impl Into<String>) -> EvaluatorResult {
         score: None,
         message: message.into(),
         details: Value::Null,
+        fields: Vec::new(),
     }
 }
 
@@ -337,5 +412,47 @@ mod tests {
         );
         assert!(run.result.passed);
         assert_eq!(run.result.message, "receipt verified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_evaluator_exit_is_error() {
+        let root = tempdir().unwrap();
+        let script = root.path().join("evaluator.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":1,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1}'\nexit 9\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let case: Case = serde_json::from_value(json!({
+            "id": "one", "input": {}, "source_line": 1
+        }))
+        .unwrap();
+        let output: VariantOutput = serde_json::from_value(json!({
+            "case_id": "one", "status": "ok", "raw_output": "{}", "metadata": {}, "retries": []
+        }))
+        .unwrap();
+        let run = run_external_evaluator(
+            "business",
+            &EvaluatorKind::Command {
+                command: CommandSpec {
+                    program: script.display().to_string(),
+                    args: vec![],
+                },
+                timeout_ms: 1000,
+            },
+            &case,
+            &output,
+            EvaluatorRuntime {
+                variant_id: "baseline",
+                working_directory: root.path(),
+                python_bridge: Path::new("unused"),
+                limits: &CommandLimits::default(),
+            },
+        );
+        assert_eq!(run.result.status, EvaluationStatus::Error);
+        assert!(run.result.message.contains("exited unsuccessfully"));
     }
 }

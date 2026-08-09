@@ -22,7 +22,7 @@
       "properties": {
         "root": {"type": "string", "default": ".structtrace"},
         "retain_raw_outputs": {"type": "boolean", "default": true},
-        "retain_provider_responses": {"type": "boolean", "default": true},
+        "retain_provider_responses": {"type": "boolean", "default": false},
         "redaction": {
           "type": "object",
           "additionalProperties": false,
@@ -60,7 +60,7 @@
     "variants": {
       "type": "object",
       "required": ["baseline", "candidate"],
-      "additionalProperties": {"$ref": "#/$defs/variant"},
+      "additionalProperties": false,
       "properties": {
         "baseline": {"$ref": "#/$defs/variant"},
         "candidate": {"$ref": "#/$defs/variant"}
@@ -108,8 +108,8 @@
         "min_candidate_schema_validity": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_error_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_timeout_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "latency": {"type": ["object", "null"], "required": ["max_p95_increase_percent"], "additionalProperties": false, "properties": {"max_p95_increase_percent": {"type": "number", "minimum": 0}}},
-        "cost": {"type": ["object", "null"], "required": ["max_average_increase_percent"], "additionalProperties": false, "properties": {"max_average_increase_percent": {"type": "number", "minimum": 0}}}
+        "latency": {"type": ["object", "null"], "required": ["max_p95_increase_percent"], "additionalProperties": false, "properties": {"max_p95_increase_percent": {"type": "number", "minimum": 0}, "min_coverage": {"type": "number", "minimum": 0, "maximum": 1, "default": 1}}},
+        "cost": {"type": ["object", "null"], "required": ["max_average_increase_percent"], "additionalProperties": false, "properties": {"max_average_increase_percent": {"type": "number", "minimum": 0}, "min_coverage": {"type": "number", "minimum": 0, "maximum": 1, "default": 1}}}
       }
     },
     "report": {
@@ -131,6 +131,7 @@
         "id": {"type": "string", "default": "/id"},
         "input": {"type": "string", "default": "/input"},
         "expected": {"type": "string", "default": "/expected"},
+        "model_visible_metadata": {"type": "string", "default": "/model_visible_metadata"},
         "metadata": {"type": "string", "default": "/metadata"}
       }
     },
@@ -153,12 +154,12 @@
     },
     "openaiVariant": {
       "type": "object",
-      "required": ["kind", "base_url", "api_key_env", "model", "request"],
+      "required": ["kind", "base_url", "model", "request"],
       "additionalProperties": false,
       "properties": {
         "kind": {"const": "openai_compatible"},
         "base_url": {"type": "string"},
-        "api_key_env": {"type": "string", "minLength": 1},
+        "api_key_env": {"type": ["string", "null"], "minLength": 1},
         "model": {"type": "string", "minLength": 1},
         "request": {"type": "object", "required": ["user_template"], "additionalProperties": false, "properties": {"system": {"type": ["string", "null"]}, "user_template": {"type": "string", "minLength": 1}, "temperature": {"type": "number", "minimum": 0, "default": 0}, "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 1000000, "default": 500}}},
         "structured_output": {"type": ["object", "null"], "required": ["mode"], "additionalProperties": false, "properties": {"mode": {"enum": ["json_schema", "json_object"]}, "schema": {"type": ["string", "null"]}}},

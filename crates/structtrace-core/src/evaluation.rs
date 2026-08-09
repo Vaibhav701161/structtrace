@@ -51,6 +51,29 @@ pub struct EvaluatorResult {
     /// Structured evidence for reports and replay.
     #[serde(default)]
     pub details: Value,
+    /// Pointer-level facts produced by field-aware built-in evaluators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<FieldEvaluationFact>,
+}
+
+/// One resolved field comparison used for truthful hotspot attribution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FieldEvaluationFact {
+    /// Output JSON Pointer.
+    pub pointer: String,
+    /// Expected-value JSON Pointer when the evaluator uses a reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_pointer: Option<String>,
+    /// Four-state result for this field only.
+    pub status: EvaluationStatus,
+    /// Concrete expected value when it resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Value>,
+    /// Concrete output value when it resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<Value>,
+    /// Auditable field-specific explanation.
+    pub message: String,
 }
 
 impl EvaluatorResult {
@@ -62,6 +85,7 @@ impl EvaluatorResult {
             score: Some(1.0),
             message: message.into(),
             details,
+            fields: Vec::new(),
         }
     }
 
@@ -73,6 +97,7 @@ impl EvaluatorResult {
             score: Some(0.0),
             message: message.into(),
             details,
+            fields: Vec::new(),
         }
     }
 
@@ -84,7 +109,13 @@ impl EvaluatorResult {
             score: None,
             message: message.into(),
             details: Value::Object(Default::default()),
+            fields: Vec::new(),
         }
+    }
+
+    fn with_fields(mut self, fields: Vec<FieldEvaluationFact>) -> Self {
+        self.fields = fields;
+        self
     }
 }
 
@@ -232,10 +263,8 @@ pub fn evaluate_case_with_external(
         .iter()
         .map(|(name, config)| (name.clone(), compose_outcome(config, &evaluator_results)))
         .collect::<BTreeMap<_, _>>();
-    let primary_pass = outcome_results
-        .get(primary_outcome)
-        .copied()
-        .is_some_and(OutcomeStatus::is_pass);
+    let primary_status = outcome_results.get(primary_outcome).copied();
+    let primary_pass = primary_status.is_some_and(OutcomeStatus::is_pass);
     CaseEvaluation {
         case_id: case.id.clone(),
         adapter_status: output.status,
@@ -247,7 +276,7 @@ pub fn evaluate_case_with_external(
         evaluators: evaluator_results,
         outcomes: outcome_results,
         primary_pass,
-        valid_but_wrong: schema_valid && !primary_pass,
+        valid_but_wrong: schema_valid && primary_status == Some(OutcomeStatus::False),
     }
 }
 
@@ -303,10 +332,33 @@ fn evaluate_builtin(
             *exact_integer,
         ),
         EvaluatorKind::RequiredFields { pointers } => {
-            let missing = pointers
+            let fields = pointers
                 .iter()
-                .filter(|pointer| output.pointer(pointer).is_none_or(Value::is_null))
-                .cloned()
+                .map(|pointer| {
+                    let actual = output.pointer(pointer).cloned();
+                    let passed = actual.as_ref().is_some_and(|value| !value.is_null());
+                    FieldEvaluationFact {
+                        pointer: pointer.clone(),
+                        expected_pointer: None,
+                        status: if passed {
+                            EvaluationStatus::Passed
+                        } else {
+                            EvaluationStatus::Failed
+                        },
+                        expected: None,
+                        actual,
+                        message: if passed {
+                            "Required field was present and non-null.".to_owned()
+                        } else {
+                            "Required field was missing or null.".to_owned()
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let missing = fields
+                .iter()
+                .filter(|field| field.status == EvaluationStatus::Failed)
+                .map(|field| field.pointer.clone())
                 .collect::<Vec<_>>();
             if missing.is_empty() {
                 EvaluatorResult::passed(
@@ -314,12 +366,14 @@ fn evaluate_builtin(
                     "All required fields were present and non-null.",
                     serde_json::json!({"pointers": pointers}),
                 )
+                .with_fields(fields)
             } else {
                 EvaluatorResult::failed(
                     id,
                     "One or more required fields were missing or null.",
                     serde_json::json!({"missing": missing}),
                 )
+                .with_fields(fields)
             }
         }
         EvaluatorKind::ToolSelection {
@@ -345,26 +399,60 @@ fn compare_pointer(
     };
     let actual_value = output.pointer(pointer);
     let expected_value = expected.pointer(expected_pointer);
+    let field = |status, actual: Option<&Value>, reference: Option<&Value>, message: &str| {
+        FieldEvaluationFact {
+            pointer: pointer.to_owned(),
+            expected_pointer: Some(expected_pointer.to_owned()),
+            status,
+            expected: reference.cloned(),
+            actual: actual.cloned(),
+            message: message.to_owned(),
+        }
+    };
     match (actual_value, expected_value) {
         (Some(actual), Some(reference)) if actual == reference => EvaluatorResult::passed(
             id,
             format!("Value at {pointer} matched the expected value."),
             serde_json::json!({"pointer": pointer, "value": actual}),
-        ),
+        )
+        .with_fields(vec![field(
+            EvaluationStatus::Passed,
+            Some(actual),
+            Some(reference),
+            "Values matched.",
+        )]),
         (Some(actual), Some(reference)) => EvaluatorResult::failed(
             id,
             format!("Value at {pointer} did not match."),
             serde_json::json!({"pointer": pointer, "expected": reference, "actual": actual}),
-        ),
-        (None, _) => EvaluatorResult::failed(
-            id,
-            format!("Output pointer {pointer} did not resolve."),
-            serde_json::json!({"pointer": pointer, "failure": "missing_output_field"}),
-        ),
+        )
+        .with_fields(vec![field(
+            EvaluationStatus::Failed,
+            Some(actual),
+            Some(reference),
+            "Values did not match.",
+        )]),
         (_, None) => EvaluatorResult::error(
             id,
             format!("expected pointer {expected_pointer} did not resolve"),
-        ),
+        )
+        .with_fields(vec![field(
+            EvaluationStatus::Error,
+            actual_value,
+            None,
+            "Expected pointer did not resolve.",
+        )]),
+        (None, Some(reference)) => EvaluatorResult::failed(
+            id,
+            format!("Output pointer {pointer} did not resolve."),
+            serde_json::json!({"pointer": pointer, "failure": "missing_output_field"}),
+        )
+        .with_fields(vec![field(
+            EvaluationStatus::Failed,
+            None,
+            Some(reference),
+            "Output pointer did not resolve.",
+        )]),
     }
 }
 
@@ -377,27 +465,48 @@ fn compare_pointer_list(
     let Some(expected) = expected else {
         return EvaluatorResult::error(id, "case has no expected value");
     };
-    let mut failures = Vec::new();
+    let mut fields = Vec::with_capacity(pointers.len());
+    let mut missing_expected = false;
     for pair in pointers {
-        let actual = output.pointer(&pair.pointer);
-        let reference = expected.pointer(&pair.expected_pointer);
-        if actual != reference {
-            failures.push(serde_json::json!({
-                "pointer": pair.pointer,
-                "expected_pointer": pair.expected_pointer,
-                "expected": reference,
-                "actual": actual,
-            }));
-        }
+        let actual = output.pointer(&pair.pointer).cloned();
+        let reference = expected.pointer(&pair.expected_pointer).cloned();
+        let (status, message) = match (&actual, &reference) {
+            (_, None) => {
+                missing_expected = true;
+                (EvaluationStatus::Error, "Expected pointer did not resolve.")
+            }
+            (None, Some(_)) => (EvaluationStatus::Failed, "Output pointer did not resolve."),
+            (Some(actual), Some(reference)) if actual == reference => {
+                (EvaluationStatus::Passed, "Values matched.")
+            }
+            (Some(_), Some(_)) => (EvaluationStatus::Failed, "Values did not match."),
+        };
+        fields.push(FieldEvaluationFact {
+            pointer: pair.pointer.clone(),
+            expected_pointer: Some(pair.expected_pointer.clone()),
+            status,
+            expected: reference,
+            actual,
+            message: message.to_owned(),
+        });
     }
-    if failures.is_empty() {
-        EvaluatorResult::passed(id, "All selected fields matched.", Value::Null)
+    let failures = fields
+        .iter()
+        .filter(|field| field.status == EvaluationStatus::Failed)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_expected {
+        EvaluatorResult::error(id, "one or more expected pointers did not resolve")
+            .with_fields(fields)
+    } else if failures.is_empty() {
+        EvaluatorResult::passed(id, "All selected fields matched.", Value::Null).with_fields(fields)
     } else {
         EvaluatorResult::failed(
             id,
             format!("{} selected field(s) did not match.", failures.len()),
             serde_json::json!({"failures": failures}),
         )
+        .with_fields(fields)
     }
 }
 
@@ -628,6 +737,7 @@ mod tests {
             id: "a".to_owned(),
             input: Value::Null,
             expected: Some(json!({"priority": "high"})),
+            model_visible_metadata: None,
             metadata: None,
             source_line: 1,
         };
@@ -657,6 +767,130 @@ mod tests {
         assert!(result.schema_valid);
         assert!(!result.primary_pass);
         assert!(result.valid_but_wrong);
+    }
+
+    fn pointer_pairs() -> Vec<PointerPair> {
+        vec![
+            PointerPair {
+                pointer: "/a".to_owned(),
+                expected_pointer: "/a".to_owned(),
+            },
+            PointerPair {
+                pointer: "/b".to_owned(),
+                expected_pointer: "/b".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn pointer_list_missing_both_is_not_pass() {
+        let result = compare_pointer_list("fields", &json!({}), Some(&json!({})), &pointer_pairs());
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn pointer_list_missing_expected_is_error() {
+        let result = compare_pointer_list(
+            "fields",
+            &json!({"a": 1, "b": 2}),
+            Some(&json!({"a": 1})),
+            &pointer_pairs(),
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.fields[1].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn pointer_list_missing_output_is_failure() {
+        let result = compare_pointer_list(
+            "fields",
+            &json!({"a": 1}),
+            Some(&json!({"a": 1, "b": 2})),
+            &pointer_pairs(),
+        );
+        assert_eq!(result.status, EvaluationStatus::Failed);
+        assert_eq!(result.fields[1].status, EvaluationStatus::Failed);
+    }
+
+    #[test]
+    fn pointer_list_compares_only_resolved_values() {
+        let result = compare_pointer_list(
+            "fields",
+            &json!({"a": 1, "b": 9}),
+            Some(&json!({"a": 1, "b": 2})),
+            &pointer_pairs(),
+        );
+        assert_eq!(result.status, EvaluationStatus::Failed);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Passed);
+        assert_eq!(result.fields[1].status, EvaluationStatus::Failed);
+        assert_eq!(result.fields[1].actual, Some(json!(9)));
+        assert_eq!(result.fields[1].expected, Some(json!(2)));
+    }
+
+    fn valid_output_with_primary_status(status: EvaluationStatus) -> CaseEvaluation {
+        let schema = compile_schema(&json!({"type": "object"})).unwrap();
+        let case = Case {
+            id: "status".to_owned(),
+            input: Value::Null,
+            expected: None,
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let evaluators = vec![EvaluatorConfig {
+            id: "external".to_owned(),
+            kind: EvaluatorKind::Command {
+                command: crate::config::CommandSpec {
+                    program: "unused".to_owned(),
+                    args: vec![],
+                },
+                timeout_ms: 1000,
+            },
+        }];
+        let outcomes = BTreeMap::from([(
+            "semantic".to_owned(),
+            OutcomeConfig {
+                all_of: vec!["external".to_owned()],
+                any_of: vec![],
+            },
+        )]);
+        let external = BTreeMap::from([(
+            "external".to_owned(),
+            EvaluatorResult {
+                evaluator_id: "external".to_owned(),
+                status,
+                passed: status == EvaluationStatus::Passed,
+                score: None,
+                message: "fixture".to_owned(),
+                details: Value::Null,
+                fields: vec![],
+            },
+        )]);
+        evaluate_case_with_external(
+            &case,
+            &output("{}"),
+            &schema,
+            &evaluators,
+            &outcomes,
+            "semantic",
+            &external,
+        )
+    }
+
+    #[test]
+    fn evaluator_error_is_not_valid_but_wrong() {
+        assert!(!valid_output_with_primary_status(EvaluationStatus::Error).valid_but_wrong);
+    }
+
+    #[test]
+    fn not_applicable_is_not_valid_but_wrong() {
+        assert!(!valid_output_with_primary_status(EvaluationStatus::NotApplicable).valid_but_wrong);
+    }
+
+    #[test]
+    fn semantic_false_is_valid_but_wrong() {
+        assert!(valid_output_with_primary_status(EvaluationStatus::Failed).valid_but_wrong);
     }
 
     #[test]

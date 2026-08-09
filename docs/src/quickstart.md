@@ -1,6 +1,19 @@
 # Quickstart
 
-Install from the repository with stable Rust 1.87 or newer:
+After a binary release is published, install on macOS or Linux without Rust:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.ps1 | iex
+```
+
+Until the first binary release, contributors can install from source with stable Rust 1.87 or
+newer:
 
 ```bash
 cargo install --path crates/structtrace-cli --locked

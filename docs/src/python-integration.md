@@ -8,7 +8,9 @@ cd my-check
 structtrace run
 ```
 
-A callable receives the complete case envelope as a dictionary. It may return a dictionary or a JSON string:
+A callable receives a label-free case envelope containing `id`, `input`, and optional
+`model_visible_metadata`. It never receives the golden expected result or evaluation-only
+metadata. It may return a dictionary or a JSON string:
 
 ```python
 def baseline(case: dict) -> dict:

@@ -18,7 +18,7 @@ use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::RunStatus,
     config::{Config, VariantConfig},
-    dataset::Dataset,
+    dataset::{Dataset, VariantCase},
     evaluation::compile_schema,
     hashing::{hash_bytes, hash_canonical_json, hash_file},
     output::RecordedOutputs,
@@ -75,7 +75,9 @@ async fn run_configured_inner(
         .canonicalize()
         .with_context(|| format!("project root {} does not exist", project_root.display()))?;
     let config_path = resolve(&project_root, config_path);
-    let config = Config::load(&config_path)?;
+    let config_source_bytes = std::fs::read(&config_path)
+        .with_context(|| format!("could not read configuration {}", config_path.display()))?;
+    let config = Config::from_bytes(&config_path, &config_source_bytes)?;
     let dataset_path = resolve(&project_root, &config.dataset.path);
     let dataset = Dataset::read(&dataset_path, &config.dataset.fields)?;
     let schema_path = resolve(&project_root, &config.schema.path);
@@ -98,7 +100,7 @@ async fn run_configured_inner(
     let expected = ExecutionCheckpoint {
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
         run_id: resume_run_id.clone().unwrap_or_default(),
-        configuration_file_hash: hash_file(&config_path)?,
+        configuration_file_hash: hash_bytes(&config_source_bytes),
         normalized_configuration_hash: hash_canonical_json(&config)?,
         dataset_hash: dataset.source_hash.clone(),
         schema_hash: hash_bytes(&schema_bytes),
@@ -146,9 +148,10 @@ async fn run_configured_inner(
                     &serde_json::to_vec_pretty(&config)?,
                 )?;
                 atomic_write(
-                    run_dir.join("inputs/dataset.jsonl"),
-                    &std::fs::read(&dataset_path)?,
+                    run_dir.join("inputs/configuration.source"),
+                    &config_source_bytes,
                 )?;
+                atomic_write(run_dir.join("inputs/dataset.jsonl"), &dataset.source_bytes)?;
                 atomic_write(run_dir.join("inputs/schema.json"), &schema_bytes)?;
                 write_checkpoint(run_dir, &checkpoint)?;
                 store.record_event(
@@ -193,9 +196,8 @@ async fn run_configured_inner(
 
     let completed = finalize_prepared_for_run(
         &project_root,
-        &config_path,
+        config_source_bytes,
         config,
-        dataset_path,
         dataset,
         schema_bytes,
         baseline,
@@ -306,6 +308,11 @@ async fn prepare_variant(
     bridge_path: &Path,
     limits: &structtrace_core::config::LimitsConfig,
 ) -> anyhow::Result<PreparedVariant> {
+    let variant_cases = dataset
+        .cases
+        .iter()
+        .map(VariantCase::from)
+        .collect::<Vec<_>>();
     match variant {
         VariantConfig::Recorded { path } => {
             let path = resolve(project_root, path);
@@ -330,7 +337,7 @@ async fn prepare_variant(
                 command,
                 *process_mode,
                 *timeout_ms,
-                &dataset.cases,
+                &variant_cases,
                 project_root,
                 &CommandLimits {
                     max_output_bytes: limits.max_output_bytes_per_case,
@@ -349,7 +356,7 @@ async fn prepare_variant(
                 interpreter,
                 callable,
                 *timeout_ms,
-                &dataset.cases,
+                &variant_cases,
                 project_root,
                 bridge_path,
                 &CommandLimits {
@@ -386,7 +393,7 @@ async fn prepare_variant(
             }
             let run = run_openai_compatible(
                 adapter,
-                &dataset.cases,
+                &variant_cases,
                 output_schema.as_ref(),
                 limits.max_output_bytes_per_case,
             )
@@ -599,6 +606,63 @@ analysis: {primary_outcome: correct}
     }
 
     #[tokio::test]
+    async fn source_file_change_during_run_does_not_change_retained_input() {
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|program| {
+                std::process::Command::new(program)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("Python is required for configured adapter tests");
+        let root = tempdir().unwrap();
+        let original = "{\"id\":\"one\",\"input\":{},\"expected\":{\"label\":\"yes\"}}\n";
+        std::fs::write(root.path().join("data.jsonl"), original).unwrap();
+        std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
+        std::fs::write(
+            root.path().join("variant.py"),
+            "import json, pathlib, sys\nfor line in sys.stdin:\n request=json.loads(line)\n pathlib.Path('data.jsonl').write_text('{\"id\":\"tampered\",\"input\":{}}\\n')\n print(json.dumps({'protocol':'structtrace.variant','protocol_version':1,'case_id':request['case_id'],'status':'ok','output':{'label':'yes'}}), flush=True)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("structtrace.yaml"),
+            format!(
+                r#"version: 1
+project: {{name: immutable-source}}
+dataset: {{path: data.jsonl}}
+schema: {{path: schema.json}}
+variants:
+  baseline:
+    kind: command
+    command: {{program: "{python}", args: ["variant.py"]}}
+  candidate:
+    kind: command
+    command: {{program: "{python}", args: ["variant.py"]}}
+evaluators:
+  - {{id: exact, kind: exact_json}}
+outcomes:
+  correct: {{all_of: [exact]}}
+analysis: {{primary_outcome: correct}}
+"#
+            ),
+        )
+        .unwrap();
+        let run = run_configured(root.path(), Path::new("structtrace.yaml"))
+            .await
+            .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(root.path().join("data.jsonl")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(run.run_dir.join("inputs/dataset.jsonl")).unwrap(),
+            original
+        );
+        assert!(crate::replay::replay_run(&run.run_dir).unwrap().verified);
+    }
+
+    #[tokio::test]
     async fn completed_variant_is_restored_without_reinvocation() {
         let root = tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("inputs")).unwrap();
@@ -608,12 +672,14 @@ analysis: {primary_outcome: correct}
             id: "one".to_owned(),
             input: json!({}),
             expected: Some(json!({"label": "yes"})),
+            model_visible_metadata: None,
             metadata: None,
             source_line: 1,
         };
         let dataset = Dataset {
             cases: vec![case],
             source_hash: "dataset".to_owned(),
+            source_bytes: b"dataset".to_vec(),
         };
         let mut checkpoint = checkpoint();
         checkpoint

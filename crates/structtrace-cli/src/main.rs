@@ -15,6 +15,7 @@ use structtrace_core::{
     config::{Config, VariantConfig},
     dataset::Dataset,
     evaluation::compile_schema,
+    hashing::hash_file,
 };
 
 mod bundled_demo;
@@ -113,7 +114,7 @@ enum Commands {
     },
     /// Generate, export, or serve a completed local report.
     Report {
-        /// Run ULID or `latest`.
+        /// Run ULID, `latest` complete, or `latest-any`.
         #[arg(default_value = "latest")]
         run: String,
         /// Open the loopback report URL in the default browser.
@@ -128,18 +129,21 @@ enum Commands {
     },
     /// Apply configured deployment thresholds to a completed run.
     Gate {
-        /// Run ULID or `latest`.
+        /// Run ULID, `latest` complete, or `latest-any`.
         #[arg(default_value = "latest")]
         run: String,
+        /// Integrity verification performed before applying the stored gate.
+        #[arg(long, value_enum, default_value = "hash")]
+        verify: GateVerification,
     },
     /// Recompute retained scores, summaries, intervals, and gate results.
     Replay {
-        /// Run ULID or `latest`.
+        /// Run ULID, `latest` complete, or `latest-any`.
         #[arg(default_value = "latest")]
         run: String,
-        /// Generate and verify the bundled accepted-research fixture.
-        #[arg(long)]
-        accepted_research: bool,
+        /// Verify normalized transition matrices, not original model artifacts.
+        #[arg(long, alias = "accepted-research")]
+        research_fixture: bool,
     },
     /// Report schema facts and potential sensitivity boundaries without rewriting it.
     Inspect {
@@ -154,6 +158,14 @@ enum Commands {
 enum DemoKind {
     SupportTicket,
     Research,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GateVerification {
+    /// Verify the manifest-bound summary hash.
+    Hash,
+    /// Replay retained artifacts and require complete verification.
+    Replay,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -313,7 +325,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             if *open || *serve {
                 structtrace_report::serve(&run_dir, *open).await?;
             } else if export.is_none() {
-                let report = structtrace_report::generate(&run_dir)?;
+                let report = structtrace_report::finalized_report(&run_dir)?;
                 if !cli.quiet {
                     match cli.format {
                         OutputFormat::Json => {
@@ -325,12 +337,12 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             }
             Ok(0)
         }
-        Commands::Gate { run } => gate(cli, &resolve_run(cli, run)?),
+        Commands::Gate { run, verify } => gate(cli, &resolve_run(cli, run)?, *verify),
         Commands::Replay {
             run,
-            accepted_research,
+            research_fixture,
         } => {
-            let run_dir = if *accepted_research {
+            let run_dir = if *research_fixture {
                 bundled_demo::run_research(&cli.project_root)?.run_dir
             } else {
                 resolve_run(cli, run)?
@@ -351,6 +363,10 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                             report.artifact_hash_mismatches.len()
                         );
                         println!(
+                            "- Cross-artifact mismatches: {}",
+                            report.cross_artifact_mismatches.len()
+                        );
+                        println!(
                             "- Row-score mismatches: {}",
                             report.row_score_mismatches.len()
                         );
@@ -366,13 +382,25 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                             report.variant_outputs_replayed
                         );
                         println!(
-                            "Evaluator results recomputed: {}",
-                            report.evaluator_results_recomputed
+                            "Built-in evaluator results recomputed: {}",
+                            report.built_in_evaluator_results_recomputed
+                        );
+                        println!(
+                            "External evaluator receipts verified: {}",
+                            report.external_evaluator_receipts_verified
+                        );
+                        println!(
+                            "External evaluator programs re-executed: {}",
+                            report.external_evaluator_programs_reexecuted
                         );
                         println!();
                         println!(
                             "Artifact hash mismatches:     {}",
                             report.artifact_hash_mismatches.len()
+                        );
+                        println!(
+                            "Cross-artifact mismatches:  {}",
+                            report.cross_artifact_mismatches.len()
                         );
                         println!(
                             "Row-score mismatches:         {}",
@@ -549,8 +577,20 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
     Ok(())
 }
 
-fn gate(cli: &Cli, run_dir: &Path) -> anyhow::Result<u8> {
+fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u8> {
     ensure_complete(run_dir)?;
+    verify_manifest_artifact(run_dir, "summary.json")?;
+    if matches!(verify, GateVerification::Replay) {
+        let replay = structtrace_engine::replay_run(run_dir)?;
+        anyhow::ensure!(
+            replay.verified,
+            "replay verification failed: {} artifact hash, {} cross-artifact, {} row-score, and {} summary mismatch(es)",
+            replay.artifact_hash_mismatches.len(),
+            replay.cross_artifact_mismatches.len(),
+            replay.row_score_mismatches.len(),
+            replay.summary_mismatches.len()
+        );
+    }
     let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
     if !cli.quiet {
         match cli.format {
@@ -754,12 +794,15 @@ fn doctor(cli: &Cli) -> anyhow::Result<u8> {
                             checks.push(serde_json::json!({"check": format!("variant.{name}.python"), "passed": exists, "detail": interpreter}));
                         }
                         VariantConfig::OpenaiCompatible(adapter) => {
-                            let present = std::env::var_os(&adapter.api_key_env).is_some();
+                            let present = adapter
+                                .api_key_env
+                                .as_deref()
+                                .is_none_or(|name| std::env::var_os(name).is_some());
                             passed &= present;
                             checks.push(serde_json::json!({
                                 "check": format!("variant.{name}.credential"),
                                 "passed": present,
-                                "detail": {"environment_variable": adapter.api_key_env, "present": present, "network_checked": false},
+                                "detail": {"environment_variable": adapter.api_key_env, "present": present, "authentication_required": adapter.api_key_env.is_some(), "network_checked": false},
                             }));
                             if let Some(path) = adapter
                                 .structured_output
@@ -927,17 +970,29 @@ fn resolve_run(cli: &Cli, selector: &str) -> anyhow::Result<PathBuf> {
         root.join(".structtrace")
     };
     let runs = storage.join("runs");
-    if selector == "latest" {
+    if selector == "latest" || selector == "latest-any" {
+        let require_complete = selector == "latest";
         let mut candidates = std::fs::read_dir(&runs)
             .with_context(|| format!("no StructTrace runs found under {}", runs.display()))?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter(|entry| {
+                !require_complete
+                    || read_json::<RunManifest>(&entry.path().join("manifest.json"))
+                        .is_ok_and(|manifest| manifest.status == RunStatus::Complete)
+            })
             .collect::<Vec<_>>();
         candidates.sort_by_key(std::fs::DirEntry::file_name);
         return candidates
             .last()
             .map(std::fs::DirEntry::path)
-            .context("no StructTrace run directories were found");
+            .with_context(|| {
+                if require_complete {
+                    "no completed StructTrace run directories were found"
+                } else {
+                    "no StructTrace run directories were found"
+                }
+            });
     }
     anyhow::ensure!(
         !selector.is_empty()
@@ -958,6 +1013,20 @@ fn ensure_complete(run_dir: &Path) -> anyhow::Result<()> {
         "run `{}` is {:?}, not complete",
         manifest.run_id,
         manifest.status
+    );
+    Ok(())
+}
+
+fn verify_manifest_artifact(run_dir: &Path, relative: &str) -> anyhow::Result<()> {
+    let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    let expected = manifest
+        .artifacts
+        .get(relative)
+        .with_context(|| format!("manifest does not bind required artifact `{relative}`"))?;
+    let actual = hash_file(&run_dir.join(relative))?;
+    anyhow::ensure!(
+        &actual == expected,
+        "artifact `{relative}` failed manifest hash verification: expected {expected}, observed {actual}"
     );
     Ok(())
 }

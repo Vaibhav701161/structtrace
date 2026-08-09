@@ -12,10 +12,15 @@ StructTrace is a local-first regression harness for structured LLM outputs. It e
 ```text
 matched cases        baseline + candidate       one evidence bundle
 ─────────────        ────────────────────       ───────────────────
-input + expected  -> strict output capture  -> parse and schema facts
-                  -> deterministic scoring  -> paired transitions
-                  -> operational metrics    -> report, gate, replay
+input only        -> baseline + candidate   -> strict output capture
+expected + eval   ------------------------> deterministic scoring
+                                             -> paired transitions
+                                             -> report, gate, replay
 ```
+
+The execution boundary is deliberate: adapters can receive the case input and explicitly
+model-visible metadata, but never the golden `expected` value or evaluation-only metadata.
+Only the evaluation engine can access labels.
 
 ## See the failure that schema metrics miss
 
@@ -56,7 +61,23 @@ The report is one self-contained HTML file. It contains no CDN assets, analytics
 
 ## Install
 
-StructTrace uses stable Rust 1.87 or newer.
+Release binaries are built for Linux x86-64, macOS Intel, macOS Apple Silicon, and Windows
+x86-64. The installers verify a release-published SHA-256 checksum before replacing the binary.
+
+macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.ps1 | iex
+```
+
+Until the first binary release is published, contributors can install from source with stable
+Rust 1.87 or newer:
 
 ```bash
 git clone https://github.com/Vaibhav701161/structtrace.git
@@ -65,6 +86,10 @@ cargo install --path crates/structtrace-cli --locked
 structtrace --help
 structtrace doctor
 ```
+
+The shell installer places the binary in `~/.local/bin` by default. The PowerShell installer
+uses `%LOCALAPPDATA%\Programs\StructTrace`. Each installer prints its exact uninstall command.
+Release archives also receive GitHub build-provenance attestations.
 
 ## Five-minute workflow
 
@@ -97,9 +122,9 @@ Initialization refuses to overwrite existing StructTrace files.
 | Recorded JSONL | outputs already exist | no process, Python, or provider required |
 | Command | application is in any language | versioned JSONL over stdin/stdout; no shell |
 | Python callable | application exposes a Python function | bundled bridge; exceptions retained as failures |
-| OpenAI-compatible | comparing models or request settings | explicit endpoint, bounded concurrency, opt-in retries |
+| OpenAI-compatible | comparing models or request settings | explicit endpoint, optional bearer auth, bounded concurrency, opt-in backoff |
 
-All adapters produce the same `VariantOutput` envelope and enter the same storage, evaluation, report, gate, and replay path. Adapter errors, timeouts, malformed responses, and missing outputs never shrink the denominator.
+All adapters receive a label-free case view and produce the same `VariantOutput` envelope before entering the same storage, evaluation, report, gate, and replay path. Adapter errors, timeouts, malformed responses, nonzero exits, and missing outputs never shrink the denominator.
 
 ## Evaluators and outcomes
 
@@ -150,17 +175,24 @@ gate:
   max_timeout_rate: 0.0
   latency:
     max_p95_increase_percent: 25
+    min_coverage: 1.0
   cost:
     max_average_increase_percent: 20
+    min_coverage: 1.0
 ```
 
 ```bash
 structtrace gate latest                 # human output
 structtrace gate latest --format json   # automation
 structtrace gate latest --format github # Actions annotations
+structtrace gate latest --verify replay # high-assurance CI
 ```
 
-A completed quality regression returns exit code `10`; malformed input, execution failure, artifact corruption, and protocol failure use distinct codes.
+The default gate verifies the manifest-bound `summary.json` hash before applying the stored
+decision. `--verify replay` additionally reconstructs the run from retained source artifacts.
+Operational rules compare matched case observations and enforce their configured measurement
+coverage. A completed quality regression returns exit code `10`; malformed input, execution
+failure, artifact corruption, and protocol failure use distinct codes.
 
 ## Durable and replayable by design
 
@@ -171,13 +203,20 @@ manifest.json              BLAKE3 provenance and lifecycle
 run.sqlite3                versioned durable store
 inputs/                    retained config, dataset, schema, outputs
 cases.jsonl                complete paired case records
+external-evaluator-receipts.jsonl  hash-bound external evaluator facts, when used
 discordances.jsonl         regression and valid-but-wrong slice
 summary.json / summary.md  machine and human summaries
 logs/                      separated adapter diagnostics
 report/index.html          offline report
 ```
 
-`structtrace replay` verifies manifest-bound hashes and recomputes parsing, schema validation, evaluators, outcomes, valid-but-wrong classification, transitions, McNemar, bootstrap intervals, and every gate rule. Resume is allowed only when all bound experimental inputs still match.
+`structtrace replay` independently reconstructs cases from the retained dataset and baseline and
+candidate output JSONL, verifies cross-artifact consistency, and recomputes parsing, schema
+validation, built-in evaluators, outcomes, valid-but-wrong classification, transitions, McNemar,
+bootstrap intervals, and every gate rule. Side-effecting external evaluator programs are not
+re-executed: their definition-, request-, and response-bound receipts are verified instead. Local
+hashes establish integrity and consistency, not cryptographic authorship. Resume is allowed only
+when all bound experimental inputs still match.
 
 ## Privacy boundary
 
@@ -192,7 +231,11 @@ storage:
       - /input/phone
 ```
 
-Raw retention is enforced before portable output artifacts are written. Report redaction also removes matching echoes from parsed output and evaluator evidence. The report server binds to a random loopback-only address.
+Raw retention is enforced before portable output artifacts are written. Full provider-response
+retention defaults to off. Report redaction is fail-closed and also removes matching echoes from
+parsed output, evaluator evidence, provider response bodies, and retry records. The report server
+binds to a random loopback-only address. Opening or exporting a completed report serves or copies
+the immutable finalized HTML rather than regenerating it.
 
 Output, subprocess diagnostics, and report embedding are bounded independently. Defaults are conservative and every setting has a compiled hard ceiling:
 
@@ -207,7 +250,8 @@ Oversized command, Python, or provider output fails closed and remains in the de
 
 ## Research foundation, without universal claims
 
-The offline research demo reproduces three accepted paired matrices from the Contract Sensitivity Lab evidence chain:
+The offline research fixture reproduces three normalized accepted paired matrices from the
+Contract Sensitivity Lab evidence chain:
 
 | Study | Baseline | Candidate | Candidate-only | Baseline-only |
 |---|---:|---:|---:|---:|
@@ -215,7 +259,11 @@ The offline research demo reproduces three accepted paired matrices from the Con
 | Canonical Llama | 92/150 | 82/150 | 6 | 16 |
 | Executable tool pilot | 26/30 | 24/30 | 1 | 3 |
 
-The point is not that one representation universally wins. The same class of contract-preserving change produced different effects across evaluated systems. StructTrace exists so teams measure the effect on their own model, prompt, schema, backend, and workload.
+This fixture verifies the published transition counts and statistics; it is not a replay of the
+original raw model-generation artifacts. The point is not that one representation universally
+wins. The same class of contract-preserving change produced different effects across evaluated
+systems. StructTrace exists so teams measure the effect on their own model, prompt, schema,
+backend, and workload.
 
 ## Architecture
 
@@ -252,7 +300,7 @@ External usability evidence is deliberately tracked separately from automated co
 
 ## Product boundaries
 
-StructTrace does not automatically rewrite schemas, optimize prompts, choose a winning representation, or guarantee model quality. It does not require an LLM judge for its central workflow. It is a measurement and release-evidence system: it makes structural, semantic, executable, and operational changes visible before deployment.
+StructTrace does not automatically rewrite schemas, optimize prompts, choose a winning representation, or guarantee model quality. It does not require an LLM judge for its central workflow. It is a measurement and release-evidence system: it makes structural, semantic, executable, and operational changes visible before deployment. Version 1 uses fixed baseline-then-candidate execution and variant-level resume; interleaved live-provider scheduling, case-level paid-call resume, and chunked very-large reports remain explicit post-alpha work.
 
 ## Contributing and security
 

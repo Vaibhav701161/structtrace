@@ -7,7 +7,7 @@ project:
 storage:
   root: .structtrace
   retain_raw_outputs: true
-  retain_provider_responses: true
+  retain_provider_responses: false
 
 dataset:
   path: data/golden.jsonl

@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{CoreError, Result, config::DatasetFields, error::read_error, hashing::hash_bytes};
 
-/// One immutable matched case.
+/// One immutable matched case retained inside the evaluation boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Case {
     /// Non-empty unique identifier.
@@ -17,11 +17,40 @@ pub struct Case {
     /// Optional reference used by deterministic evaluators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<Value>,
-    /// Optional tags or user metadata.
+    /// Optional metadata that may be shown to the implementation under test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_visible_metadata: Option<Value>,
+    /// Optional evaluator-only tags or metadata. This never crosses a variant
+    /// adapter boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
     /// Original one-based source line.
     pub source_line: usize,
+}
+
+/// The deliberately restricted case view supplied to an implementation.
+///
+/// Expected values and evaluator-only metadata are structurally absent, so an
+/// adapter cannot leak them accidentally through serialization or templates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VariantCase {
+    /// Matched case ID.
+    pub id: String,
+    /// Model or application input.
+    pub input: Value,
+    /// Explicitly model-visible metadata only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+impl From<&Case> for VariantCase {
+    fn from(case: &Case) -> Self {
+        Self {
+            id: case.id.clone(),
+            input: case.input.clone(),
+            metadata: case.model_visible_metadata.clone(),
+        }
+    }
 }
 
 /// Parsed cases plus the hash of exact source bytes.
@@ -31,13 +60,21 @@ pub struct Dataset {
     pub cases: Vec<Case>,
     /// BLAKE3 digest of exact source bytes.
     pub source_hash: String,
+    /// Exact immutable source bytes captured at ingestion.
+    pub source_bytes: Vec<u8>,
 }
 
 impl Dataset {
     /// Read, validate, and preserve a JSONL dataset.
     pub fn read(path: &Path, fields: &DatasetFields) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(read_error(path))?;
-        let text = std::str::from_utf8(&bytes).map_err(|error| CoreError::Dataset {
+        Self::from_bytes(&bytes, fields)
+    }
+
+    /// Parse already-captured bytes so execution and finalization use one
+    /// immutable dataset snapshot.
+    pub fn from_bytes(bytes: &[u8], fields: &DatasetFields) -> Result<Self> {
+        let text = std::str::from_utf8(bytes).map_err(|error| CoreError::Dataset {
             line: 1,
             message: format!("dataset is not valid UTF-8: {error}"),
         })?;
@@ -82,6 +119,7 @@ impl Dataset {
                 id,
                 input,
                 expected: row.pointer(&fields.expected).cloned(),
+                model_visible_metadata: row.pointer(&fields.model_visible_metadata).cloned(),
                 metadata: row.pointer(&fields.metadata).cloned(),
                 source_line: line_number,
             });
@@ -94,7 +132,8 @@ impl Dataset {
         }
         Ok(Self {
             cases,
-            source_hash: hash_bytes(&bytes),
+            source_hash: hash_bytes(bytes),
+            source_bytes: bytes.to_vec(),
         })
     }
 }
@@ -144,5 +183,19 @@ mod tests {
         file.write_all(b"\"}\n").unwrap();
         let error = Dataset::read(file.path(), &DatasetFields::default()).unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn evaluation_metadata_is_not_model_visible() {
+        let bytes = b"{\"id\":\"a\",\"input\":{},\"expected\":{\"label\":\"gold\"},\"model_visible_metadata\":{\"locale\":\"en\"},\"metadata\":{\"private_label\":\"billing\"}}\n";
+        let dataset = Dataset::from_bytes(bytes, &DatasetFields::default()).unwrap();
+        let variant = VariantCase::from(&dataset.cases[0]);
+        let encoded = serde_json::to_value(variant).unwrap();
+        assert_eq!(
+            encoded.pointer("/metadata/locale"),
+            Some(&Value::String("en".to_owned()))
+        );
+        assert!(encoded.pointer("/expected").is_none());
+        assert!(!encoded.to_string().contains("billing"));
     }
 }

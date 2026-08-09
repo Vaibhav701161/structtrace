@@ -10,6 +10,7 @@ use crate::{
     config::{BootstrapConfig, GateConfig},
     dataset::Case,
     evaluation::CaseEvaluation,
+    evaluation::EvaluatorResult,
     gate::GateDecision,
     output::VariantOutput,
     statistics::{BootstrapInterval, PairedMetrics},
@@ -30,6 +31,25 @@ pub struct PairedCaseRecord {
     pub candidate_evaluation: CaseEvaluation,
     /// Primary paired category.
     pub transition: String,
+}
+
+/// Hash-bound receipt for one deliberately non-reexecuted external evaluator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExternalEvaluatorReceipt {
+    /// Evaluator identity.
+    pub evaluator_id: String,
+    /// Matched case identity.
+    pub case_id: String,
+    /// Baseline or candidate identity.
+    pub variant_id: String,
+    /// Canonical hash of the exact evaluator request object.
+    pub request_hash: String,
+    /// Canonical hash of the parsed evaluator response fact.
+    pub response_hash: String,
+    /// Canonical hash of the configured executable or callable definition.
+    pub definition_hash: String,
+    /// Parsed response fact reused during replay.
+    pub result: EvaluatorResult,
 }
 
 /// Explicit lifecycle state retained in the manifest and database.
@@ -147,7 +167,19 @@ pub struct VariantSummary {
     pub schema_valid: usize,
     /// Primary semantic or executable successes.
     pub primary_pass: usize,
-    /// Structurally valid but primary-outcome failures.
+    /// Primary outcomes that ran and explicitly failed.
+    #[serde(default)]
+    pub primary_failed: usize,
+    /// Primary outcomes that could not be evaluated reliably.
+    #[serde(default)]
+    pub primary_error: usize,
+    /// Primary outcomes explicitly marked not applicable.
+    #[serde(default)]
+    pub primary_not_applicable: usize,
+    /// Rows without a named primary outcome result.
+    #[serde(default)]
+    pub primary_unscored: usize,
+    /// Structurally valid outputs with an explicit false primary outcome.
     pub valid_but_wrong: usize,
     /// Adapter errors, including missing outputs.
     pub errors: usize,
@@ -188,6 +220,27 @@ pub struct OperationalSummary {
     pub mixed_currencies: bool,
 }
 
+/// Operational measurements observed on both members of the same pair.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MatchedOperationalSummary {
+    /// Complete paired denominator.
+    pub total_pairs: usize,
+    /// Pairs with latency on both variants.
+    pub latency_pairs: usize,
+    /// Baseline p95 over latency-matched pairs.
+    pub baseline_p95_latency_ms: Option<f64>,
+    /// Candidate p95 over latency-matched pairs.
+    pub candidate_p95_latency_ms: Option<f64>,
+    /// Pairs with comparable cost on both variants.
+    pub cost_pairs: usize,
+    /// Baseline average cost over cost-matched pairs.
+    pub baseline_average_cost: Option<String>,
+    /// Candidate average cost over cost-matched pairs.
+    pub candidate_average_cost: Option<String>,
+    /// Shared user-declared currency for matched costs.
+    pub currency: Option<String>,
+}
+
 /// Portable summary generated from complete-denominator case artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunSummary {
@@ -201,6 +254,9 @@ pub struct RunSummary {
     pub baseline: VariantSummary,
     /// Candidate aggregate.
     pub candidate: VariantSummary,
+    /// Pair-matched operational measurements used by operational gates.
+    #[serde(default)]
+    pub matched_operational: MatchedOperationalSummary,
     /// Paired primary transition matrix and effect.
     pub paired: PairedMetrics,
     /// Seeded paired bootstrap interval.

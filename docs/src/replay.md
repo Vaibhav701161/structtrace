@@ -3,11 +3,24 @@
 ```bash
 structtrace replay latest
 structtrace replay <run-id>
-structtrace replay --accepted-research
+structtrace replay --research-fixture
 ```
 
-Replay first verifies every manifest-bound artifact hash and refuses unsafe paths. It then recomputes strict parsing, schema errors, all deterministic evaluator results, outcomes, primary passes, valid-but-wrong flags, paired transitions, effect estimates, exact McNemar, paired bootstrap interval, and release rules.
+Replay first verifies every manifest-bound artifact hash and refuses unsafe paths. It independently
+reads the retained dataset and baseline and candidate output JSONL, reconstructs each paired case,
+and checks the reconstruction against the derived case artifact. It then recomputes strict
+parsing, schema errors, built-in deterministic evaluator results, outcomes, primary passes,
+valid-but-wrong flags, paired transitions, effect estimates, exact McNemar, paired bootstrap
+interval, and release rules.
 
-The result reports artifact mismatches, row-score mismatches, summary mismatches, and missing or incompatible artifacts separately. A successful replay requires zero mismatches in every category.
+Side-effecting custom command and Python evaluators are deliberately not re-executed. StructTrace
+instead verifies receipts bound to the evaluator definition, exact request, parsed response fact,
+case, and variant. Replay reports built-in results recomputed, external receipts verified, external
+programs re-executed, artifact hash mismatches, cross-artifact mismatches, row-score mismatches,
+and summary mismatches separately. A successful replay requires zero mismatches in every category.
 
-When raw retention is disabled, some invalid-output distinctions cannot be reconstructed. That limitation is explicit; replay does not fabricate missing raw evidence.
+`--research-fixture` verifies normalized transition matrices from the accepted research record. It
+does not claim to replay the original raw Qwen, Llama, or tool-call generation artifacts.
+
+Local hashes establish run integrity and internal consistency, not authorship. Signed manifests
+are not currently part of the format.

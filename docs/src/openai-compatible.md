@@ -5,6 +5,7 @@ The focused provider adapter calls `/chat/completions` on an explicitly configur
 ```yaml
 kind: openai_compatible
 base_url: http://127.0.0.1:8000/v1
+# Optional for unauthenticated local endpoints:
 api_key_env: LOCAL_LLM_API_KEY
 model: candidate-model
 request:
@@ -18,4 +19,9 @@ structured_output:
 retries: 0
 ```
 
-The environment variable name and presence are retained, never its value. Provider errors and malformed partial responses remain failures. Retries are disabled by default; when enabled, every attempt is retained. Pricing is never inferred, because provider price tables change independently from a run.
+Omit `api_key_env` for an unauthenticated local endpoint. When configured, the environment
+variable name and presence are retained, never its value. Provider errors and malformed partial
+responses remain failures. Retries are disabled by default; when enabled, every attempt is
+retained and uses bounded exponential backoff, honoring numeric `Retry-After` seconds when
+provided. Full provider response retention defaults to false. Pricing is never inferred, because
+provider price tables change independently from a run.

@@ -15,6 +15,14 @@ storage:
       - /input/phone
 ```
 
-Raw retention is enforced before output JSONL and paired case artifacts are finalized. Report redaction replaces selected values and their echoes in output and evaluator evidence with `[REDACTED]`. Disabling raw retention reduces case-level debugging and may limit replay of malformed original text.
+Raw retention is enforced before output JSONL and paired case artifacts are finalized. Full
+provider-response retention defaults to false. Report redaction fails closed: if a safe report
+view cannot be constructed, report creation returns an error rather than falling back to the
+original value. Selected values and their echoes in output, evaluator evidence, provider response
+bodies, retry records, and filters are replaced with `[REDACTED]`. Disabling raw retention reduces
+case-level debugging.
 
 `limits.max_report_raw_bytes_per_case` separately bounds how much retained raw output can be embedded for each variant in the HTML report. Truncation is display-only and is marked explicitly in the case view.
+
+A finalized report belongs to the completed evidence bundle. Opening, serving, or exporting it
+never regenerates the report in place.

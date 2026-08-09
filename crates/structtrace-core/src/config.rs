@@ -109,7 +109,7 @@ impl Default for StorageConfig {
         Self {
             root: PathBuf::from(".structtrace"),
             retain_raw_outputs: true,
-            retain_provider_responses: true,
+            retain_provider_responses: false,
             redaction: RedactionConfig::default(),
         }
     }
@@ -151,7 +151,9 @@ pub struct DatasetFields {
     pub input: String,
     /// Optional expected value.
     pub expected: String,
-    /// Optional metadata.
+    /// Optional metadata exposed to baseline and candidate implementations.
+    pub model_visible_metadata: String,
+    /// Optional evaluation-only metadata.
     pub metadata: String,
 }
 
@@ -161,6 +163,7 @@ impl Default for DatasetFields {
             id: "/id".to_owned(),
             input: "/input".to_owned(),
             expected: "/expected".to_owned(),
+            model_visible_metadata: "/model_visible_metadata".to_owned(),
             metadata: "/metadata".to_owned(),
         }
     }
@@ -249,8 +252,10 @@ fn default_python() -> String {
 pub struct OpenAiCompatibleConfig {
     /// Endpoint root, usually ending in `/v1`.
     pub base_url: String,
-    /// Environment variable containing the credential.
-    pub api_key_env: String,
+    /// Optional environment variable containing the credential. Omit for an
+    /// explicitly unauthenticated local endpoint.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     /// Provider model identifier.
     pub model: String,
     /// Prompt and decoding configuration.
@@ -500,6 +505,9 @@ pub struct GateConfig {
 pub struct LatencyGateConfig {
     /// Maximum candidate p95 increase relative to baseline.
     pub max_p95_increase_percent: f64,
+    /// Minimum fraction of paired cases with latency on both variants.
+    #[serde(default = "default_operational_gate_coverage")]
+    pub min_coverage: f64,
 }
 
 /// Operational cost gate.
@@ -508,6 +516,13 @@ pub struct LatencyGateConfig {
 pub struct CostGateConfig {
     /// Maximum candidate average cost increase relative to baseline.
     pub max_average_increase_percent: f64,
+    /// Minimum fraction of paired cases with comparable cost on both variants.
+    #[serde(default = "default_operational_gate_coverage")]
+    pub min_coverage: f64,
+}
+
+fn default_operational_gate_coverage() -> f64 {
+    1.0
 }
 
 /// HTML report preferences.
@@ -539,11 +554,16 @@ impl Config {
     /// Load YAML or JSON and validate cross-field invariants.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(read_error(path))?;
+        Self::from_bytes(path, &bytes)
+    }
+
+    /// Parse an immutable configuration snapshot captured by the caller.
+    pub fn from_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<Self> {
         let config = if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            serde_json::from_slice(&bytes)
+            serde_json::from_slice(bytes)
                 .map_err(|error| CoreError::Configuration(format!("{}: {error}", path.display())))?
         } else {
-            serde_yaml_ng::from_slice(&bytes)
+            serde_yaml_ng::from_slice(bytes)
                 .map_err(|error| CoreError::Configuration(format!("{}: {error}", path.display())))?
         };
         Self::validate(config)
@@ -568,6 +588,18 @@ impl Config {
                     "variants.{required} is required"
                 )));
             }
+        }
+        if config.variants.len() != 2 {
+            let extras = config
+                .variants
+                .keys()
+                .filter(|name| name.as_str() != "baseline" && name.as_str() != "candidate")
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(CoreError::Configuration(format!(
+                "version 1 supports exactly baseline and candidate variants; unsupported variants: {}",
+                extras.join(", ")
+            )));
         }
         if config.dataset.format != "jsonl" {
             return Err(CoreError::Configuration(format!(
@@ -653,6 +685,10 @@ impl Config {
             ("dataset.fields.id", &config.dataset.fields.id),
             ("dataset.fields.input", &config.dataset.fields.input),
             ("dataset.fields.expected", &config.dataset.fields.expected),
+            (
+                "dataset.fields.model_visible_metadata",
+                &config.dataset.fields.model_visible_metadata,
+            ),
             ("dataset.fields.metadata", &config.dataset.fields.metadata),
         ] {
             validate_json_pointer(name, pointer)?;
@@ -712,7 +748,6 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
         VariantConfig::OpenaiCompatible(adapter) => {
             for (field, value) in [
                 ("base_url", adapter.base_url.as_str()),
-                ("api_key_env", adapter.api_key_env.as_str()),
                 ("model", adapter.model.as_str()),
                 (
                     "request.user_template",
@@ -724,6 +759,15 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
                         "{name}.{field} must not be empty"
                     )));
                 }
+            }
+            if adapter
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.api_key_env must be omitted or non-empty"
+                )));
             }
             validate_timeout(&format!("{name}.timeout_ms"), adapter.timeout_ms)?;
             if adapter.concurrency == 0 || adapter.concurrency > HARD_MAX_CONCURRENCY {
@@ -974,10 +1018,31 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
                 .as_ref()
                 .map(|item| item.max_average_increase_percent),
         ),
+        (
+            "latency.min_coverage",
+            gate.latency.as_ref().map(|item| item.min_coverage),
+        ),
+        (
+            "cost.min_coverage",
+            gate.cost.as_ref().map(|item| item.min_coverage),
+        ),
     ] {
-        if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        let is_coverage = name.ends_with("min_coverage");
+        if value.is_some_and(|value| {
+            !value.is_finite()
+                || if is_coverage {
+                    !(0.0..=1.0).contains(&value)
+                } else {
+                    value < 0.0
+                }
+        }) {
             return Err(CoreError::Configuration(format!(
-                "gate.{name} must be a finite non-negative number"
+                "gate.{name} must be {}",
+                if is_coverage {
+                    "between 0 and 1"
+                } else {
+                    "a finite non-negative number"
+                }
             )));
         }
     }
@@ -1049,6 +1114,19 @@ mod tests {
         let mut config = minimal();
         config.variants.remove("candidate");
         assert!(Config::validate(config).is_err());
+    }
+
+    #[test]
+    fn extra_variant_is_rejected() {
+        let mut config = minimal();
+        config.variants.insert(
+            "shadow".to_owned(),
+            VariantConfig::Recorded {
+                path: "shadow.jsonl".into(),
+            },
+        );
+        let error = Config::validate(config).unwrap_err();
+        assert!(error.to_string().contains("unsupported variants: shadow"));
     }
 
     #[test]

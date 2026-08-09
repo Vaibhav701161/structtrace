@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use structtrace_core::{PROTOCOL_VERSION, dataset::Case, output::Usage};
+use structtrace_core::{PROTOCOL_VERSION, dataset::VariantCase, output::Usage};
 
 use crate::VARIANT_PROTOCOL;
 
@@ -17,22 +17,18 @@ pub struct VariantRequest {
     pub case_id: String,
     /// Application input.
     pub input: Value,
-    /// Optional expected output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected: Option<Value>,
-    /// Optional case metadata.
+    /// Optional metadata explicitly designated as model-visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
 
-impl From<&Case> for VariantRequest {
-    fn from(case: &Case) -> Self {
+impl From<&VariantCase> for VariantRequest {
+    fn from(case: &VariantCase) -> Self {
         Self {
             protocol: VARIANT_PROTOCOL.to_owned(),
             protocol_version: PROTOCOL_VERSION,
             case_id: case.id.clone(),
             input: case.input.clone(),
-            expected: case.expected.clone(),
             metadata: case.metadata.clone(),
         }
     }
@@ -126,5 +122,17 @@ mod tests {
             metadata: Value::Null,
         };
         assert!(validate_response(&response, "expected").is_err());
+    }
+
+    #[test]
+    fn variant_request_never_contains_expected() {
+        let case = VariantCase {
+            id: "case-1".to_owned(),
+            input: json!({"question": "safe"}),
+            metadata: Some(json!({"locale": "en"})),
+        };
+        let value = serde_json::to_value(VariantRequest::from(&case)).unwrap();
+        assert!(value.get("expected").is_none());
+        assert_eq!(value.pointer("/metadata/locale"), Some(&json!("en")));
     }
 }

@@ -3,15 +3,15 @@
 use std::{str::FromStr, time::Duration};
 
 use futures::{StreamExt, stream};
-use minijinja::{Environment, context};
+use minijinja::{Environment, UndefinedBehavior, context};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use structtrace_core::{
     config::OpenAiCompatibleConfig,
-    dataset::Case,
+    dataset::VariantCase,
     output::{Cost, OutputError, OutputStatus, Usage, VariantOutput},
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 use url::Url;
 
 use crate::command::AdapterRun;
@@ -21,33 +21,33 @@ const PROVIDER_ENVELOPE_OVERHEAD_BYTES: usize = 1024 * 1024;
 /// Execute matched cases against an explicitly configured endpoint.
 pub async fn run_openai_compatible(
     config: &OpenAiCompatibleConfig,
-    cases: &[Case],
+    cases: &[VariantCase],
     output_schema: Option<&Value>,
     max_output_bytes: usize,
 ) -> AdapterRun {
-    let api_key = match std::env::var(&config.api_key_env) {
-        Ok(value) if !value.is_empty() => value,
-        _ => {
-            return AdapterRun {
-                rows: cases
-                    .iter()
-                    .map(|case| {
-                        error_output(
-                            &case.id,
-                            "missing_secret",
-                            &format!(
-                                "required environment variable {} is not set",
-                                config.api_key_env
-                            ),
-                            None,
-                            Vec::new(),
-                        )
-                    })
-                    .collect(),
-                stderr: Vec::new(),
-                protocol_errors: Vec::new(),
-            };
-        }
+    let api_key = match config.api_key_env.as_deref() {
+        Some(name) => match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Some(value),
+            _ => {
+                return AdapterRun {
+                    rows: cases
+                        .iter()
+                        .map(|case| {
+                            error_output(
+                                &case.id,
+                                "missing_secret",
+                                &format!("required environment variable {name} is not set"),
+                                None,
+                                Vec::new(),
+                            )
+                        })
+                        .collect(),
+                    stderr: Vec::new(),
+                    protocol_errors: Vec::new(),
+                };
+            }
+        },
+        None => None,
     };
     let endpoint = match endpoint_url(&config.base_url) {
         Ok(value) => value,
@@ -119,10 +119,10 @@ pub async fn run_openai_compatible(
 async fn run_case(
     client: reqwest::Client,
     endpoint: Url,
-    api_key: String,
+    api_key: Option<String>,
     config: OpenAiCompatibleConfig,
     output_schema: Option<Value>,
-    case: Case,
+    case: VariantCase,
     max_output_bytes: usize,
 ) -> VariantOutput {
     let prompt = match render_prompt(&config.request.user_template, &case) {
@@ -188,13 +188,14 @@ async fn run_case(
     let mut retries = Vec::new();
     for attempt in 0..=config.retries {
         let attempt_started = Instant::now();
-        let response = client
+        let mut request = client
             .post(endpoint.clone())
-            .bearer_auth(&api_key)
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await;
+            .json(&body);
+        if let Some(api_key) = &api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await;
         match response {
             Err(error) => {
                 if attempt < config.retries {
@@ -204,6 +205,7 @@ async fn run_case(
                         "message": error.to_string(),
                         "latency_ms": elapsed_ms(attempt_started),
                     }));
+                    sleep(retry_delay(attempt, None)).await;
                     continue;
                 }
                 return error_output(
@@ -220,6 +222,12 @@ async fn run_case(
             }
             Ok(response) => {
                 let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs);
                 let response_limit =
                     max_output_bytes.saturating_add(PROVIDER_ENVELOPE_OVERHEAD_BYTES);
                 let payload = match read_limited_response(response, response_limit).await {
@@ -257,6 +265,7 @@ async fn run_case(
                             "response": value,
                             "latency_ms": elapsed_ms(attempt_started),
                         }));
+                        sleep(retry_delay(attempt, retry_after)).await;
                         continue;
                     }
                     return error_output(
@@ -286,6 +295,13 @@ async fn run_case(
         Some(elapsed_ms(started)),
         retries,
     )
+}
+
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        let exponent = attempt.min(8);
+        Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent))
+    })
 }
 
 async fn read_limited_response(
@@ -392,14 +408,14 @@ fn calculate_cost(config: &OpenAiCompatibleConfig, usage: &Usage) -> Option<Cost
     })
 }
 
-fn render_prompt(template: &str, case: &Case) -> anyhow::Result<String> {
-    let environment = Environment::new();
+fn render_prompt(template: &str, case: &VariantCase) -> anyhow::Result<String> {
+    let mut environment = Environment::new();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
     Ok(environment.render_str(
         template,
         context! {
             id => case.id,
             input => case.input,
-            expected => case.expected,
             metadata => case.metadata,
         },
     )?)
@@ -516,7 +532,7 @@ mod tests {
     fn config(base_url: String, retries: u32) -> OpenAiCompatibleConfig {
         OpenAiCompatibleConfig {
             base_url,
-            api_key_env: "PATH".to_owned(),
+            api_key_env: Some("PATH".to_owned()),
             model: "mock-model".to_owned(),
             request: OpenAiRequestConfig {
                 system: Some("Classify".to_owned()),
@@ -536,14 +552,17 @@ mod tests {
         }
     }
 
-    fn case() -> Case {
-        Case {
+    fn case() -> VariantCase {
+        VariantCase {
             id: "one".to_owned(),
             input: json!({"text": "accepted"}),
-            expected: None,
             metadata: None,
-            source_line: 1,
         }
+    }
+
+    #[test]
+    fn openai_template_cannot_access_expected() {
+        assert!(render_prompt("{{ expected }}", &case()).is_err());
     }
 
     #[tokio::test]
@@ -554,6 +573,16 @@ mod tests {
         assert_eq!(run.rows[0].usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(run.rows[0].cost.as_ref().unwrap().amount, "0.00008");
         assert!(run.rows[0].metadata.get("provider_response").is_some());
+        assert_eq!(*attempts.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_local_endpoint_is_supported() {
+        let (base_url, attempts) = server("success").await;
+        let mut local = config(base_url, 0);
+        local.api_key_env = None;
+        let run = run_openai_compatible(&local, &[case()], None, 1024).await;
+        assert_eq!(run.rows[0].status, OutputStatus::Ok);
         assert_eq!(*attempts.lock().unwrap(), 1);
     }
 

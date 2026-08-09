@@ -2,7 +2,10 @@
 
 The top-level fields are `version`, `project`, `storage`, `limits`, `dataset`, `schema`, `variants`, `evaluators`, `outcomes`, `analysis`, `gate`, and `report`.
 
-Version `1` is the only accepted version. `variants.baseline` and `variants.candidate` are required. Evaluator IDs must be unique. Every outcome must define exactly one non-empty `all_of` or `any_of` list, and every referenced evaluator must exist. `analysis.primary_outcome` must name a configured outcome.
+Version `1` is the only accepted configuration version. `variants.baseline` and
+`variants.candidate` are required and are the only accepted variant keys in v1. Evaluator IDs
+must be unique. Every outcome must define exactly one non-empty `all_of` or `any_of` list, and
+every referenced evaluator must exist. `analysis.primary_outcome` must name a configured outcome.
 
 Bootstrap settings are deterministic:
 
@@ -29,3 +32,6 @@ limits:
 ```
 
 The output limit applies to command, Python, and OpenAI-compatible adapter content. Standard error beyond its retained limit is drained but not stored. The report limit truncates only the shareable HTML view; scored artifacts remain unchanged according to the storage-retention policy. Zero values and values above the compiled hard ceilings fail configuration validation before execution.
+
+Latency and cost gate blocks accept `min_coverage` in `[0, 1]`, defaulting to `1.0`. Their
+comparisons are computed only from case IDs with observations for both variants.

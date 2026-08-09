@@ -23,10 +23,14 @@ pub struct GateInputs<'a> {
     pub baseline_p95_latency_ms: Option<f64>,
     /// Optional candidate p95 latency.
     pub candidate_p95_latency_ms: Option<f64>,
+    /// Fraction of all pairs included in the matched latency comparison.
+    pub latency_coverage: f64,
     /// Optional baseline average cost.
     pub baseline_average_cost: Option<f64>,
     /// Optional candidate average cost.
     pub candidate_average_cost: Option<f64>,
+    /// Fraction of all pairs included in the matched cost comparison.
+    pub cost_coverage: f64,
 }
 
 /// One transparent gate-rule result.
@@ -95,6 +99,13 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         .latency
         .as_ref()
         .map(|item| item.max_p95_increase_percent);
+    let latency_min_coverage = config.latency.as_ref().map(|item| item.min_coverage);
+    rules.push(minimum_rule(
+        "min_matched_latency_coverage",
+        latency_min_coverage,
+        inputs.latency_coverage,
+        "matched latency coverage",
+    ));
     rules.push(relative_increase_rule(
         "max_p95_latency_increase_percent",
         latency_threshold,
@@ -106,6 +117,13 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         .cost
         .as_ref()
         .map(|item| item.max_average_increase_percent);
+    let cost_min_coverage = config.cost.as_ref().map(|item| item.min_coverage);
+    rules.push(minimum_rule(
+        "min_matched_cost_coverage",
+        cost_min_coverage,
+        inputs.cost_coverage,
+        "matched cost coverage",
+    ));
     rules.push(relative_increase_rule(
         "max_average_cost_increase_percent",
         cost_threshold,
@@ -209,7 +227,10 @@ fn not_evaluated(name: &str, message: String) -> GateRuleResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::{config::GateConfig, statistics::paired_metrics};
+    use crate::{
+        config::{GateConfig, LatencyGateConfig},
+        statistics::paired_metrics,
+    };
 
     use super::*;
 
@@ -232,12 +253,47 @@ mod tests {
                 candidate_timeout_rate: 0.0,
                 baseline_p95_latency_ms: None,
                 candidate_p95_latency_ms: None,
+                latency_coverage: 0.0,
                 baseline_average_cost: None,
                 candidate_average_cost: None,
+                cost_coverage: 0.0,
             },
         );
         assert!(!decision.passed);
         assert_eq!(decision.rules[0].passed, Some(false));
         assert_eq!(decision.rules[2].passed, Some(true));
+    }
+
+    #[test]
+    fn operational_improvement_cannot_hide_missing_matched_measurements() {
+        let primary = paired_metrics(&[(true, true), (true, true)]);
+        let config = GateConfig {
+            latency: Some(LatencyGateConfig {
+                max_p95_increase_percent: 25.0,
+                min_coverage: 1.0,
+            }),
+            ..GateConfig::default()
+        };
+        let decision = evaluate_gate(
+            &config,
+            &GateInputs {
+                primary: &primary,
+                baseline_valid_but_wrong_rate: 0.0,
+                candidate_valid_but_wrong_rate: 0.0,
+                candidate_schema_validity: 1.0,
+                candidate_error_rate: 0.0,
+                candidate_timeout_rate: 0.0,
+                baseline_p95_latency_ms: Some(100.0),
+                candidate_p95_latency_ms: Some(50.0),
+                latency_coverage: 0.5,
+                baseline_average_cost: None,
+                candidate_average_cost: None,
+                cost_coverage: 0.0,
+            },
+        );
+        assert!(!decision.passed);
+        assert_eq!(decision.rules[5].rule, "min_matched_latency_coverage");
+        assert_eq!(decision.rules[5].passed, Some(false));
+        assert_eq!(decision.rules[6].passed, Some(true));
     }
 }
