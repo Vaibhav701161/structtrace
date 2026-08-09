@@ -8,9 +8,9 @@ cd my-check
 structtrace run
 ```
 
-A callable receives a label-free case envelope containing `id`, `input`, and optional
-`model_visible_metadata`. It never receives the golden expected result or evaluation-only
-metadata. It may return a dictionary or a JSON string:
+A callable receives a label-free case envelope containing `input` and optional
+`model_visible_metadata`. It never receives the dataset ID, golden expected result, or
+evaluation-only metadata. It may return a dictionary or a JSON string:
 
 ```python
 def baseline(case: dict) -> dict:
@@ -29,4 +29,7 @@ variants:
     timeout_ms: 60000
 ```
 
-StructTrace invokes the callable through its versioned JSONL bridge. Exceptions are returned as redaction-safe error envelopes and tracebacks go to the variant stderr log. Async Python callables are refused rather than executed ambiguously.
+StructTrace invokes the callable through its versioned JSONL bridge. Synchronous and `async def`
+callables are supported. Exceptions retain only the exception class by default, never a traceback
+or exception message. Malformed requests and non-JSON-serializable return values become per-case
+error envelopes; a bad case does not terminate the persistent worker.

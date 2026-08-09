@@ -6,7 +6,9 @@ and Unix storage permissions in addition to the ordinary environment checks.
 
 **Configuration refused:** unknown fields, missing baseline/candidate variants, duplicate evaluator IDs, undefined outcome references, and unsupported versions fail closed. Validate against `schemas/structtrace.schema.json` for editor feedback.
 
-**All command cases failed:** confirm the executable is available from the project root, protocol responses go to stdout, logs go to stderr, and every response repeats the exact case ID and protocol version.
+**All command cases failed:** confirm the executable is available from the project root, protocol
+responses go to stdout, logs go to stderr, and every response repeats the exact opaque execution
+token and protocol version.
 
 **Python import failed:** run from the project root and verify the configured `module:callable` can be imported by the selected interpreter.
 

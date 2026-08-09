@@ -18,7 +18,6 @@ serde_json.workspace = true
 structtrace-core = { path = "../structtrace-core" }
 tempfile.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

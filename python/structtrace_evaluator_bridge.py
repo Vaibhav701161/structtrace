@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import inspect
 import json
 import os
 import sys
-import traceback
 from typing import Any, Callable
 
 PROTOCOL = "structtrace.evaluator"
@@ -32,13 +32,29 @@ def main() -> None:
     for line in sys.stdin:
         if not line.strip():
             continue
-        request = json.loads(line)
-        evaluator_id = str(request.get("evaluator_id", ""))
-        case_id = str(request.get("case_id", ""))
+        evaluator_id = ""
+        case_id = ""
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
+            evaluator_id = str(request.get("evaluator_id", ""))
+            case_id = str(request.get("case_id", ""))
+        except (json.JSONDecodeError, ValueError) as error:
+            response = {
+                "protocol": PROTOCOL,
+                "protocol_version": PROTOCOL_VERSION,
+                "evaluator_id": evaluator_id,
+                "case_id": case_id,
+                "status": "error",
+                "message": type(error).__name__,
+            }
+            print(json.dumps(response), flush=True)
+            continue
         try:
             result = target(request)
             if inspect.isawaitable(result):
-                raise TypeError("async Python evaluators are not supported")
+                result = asyncio.run(result)
             if isinstance(result, bool):
                 result = {"status": "passed" if result else "failed", "score": 1 if result else 0}
             if not isinstance(result, dict):
@@ -51,16 +67,26 @@ def main() -> None:
                 **result,
             }
         except Exception as error:  # noqa: BLE001 - converted into protocol evidence
-            traceback.print_exc(file=sys.stderr)
             response = {
                 "protocol": PROTOCOL,
                 "protocol_version": PROTOCOL_VERSION,
                 "evaluator_id": evaluator_id,
                 "case_id": case_id,
                 "status": "error",
-                "message": f"{type(error).__name__}: {error}",
+                "message": type(error).__name__,
             }
-        print(json.dumps(response, ensure_ascii=False), flush=True)
+        try:
+            encoded = json.dumps(response, ensure_ascii=False)
+        except (TypeError, ValueError) as error:
+            encoded = json.dumps({
+                "protocol": PROTOCOL,
+                "protocol_version": PROTOCOL_VERSION,
+                "evaluator_id": evaluator_id,
+                "case_id": case_id,
+                "status": "error",
+                "message": type(error).__name__,
+            })
+        print(encoded, flush=True)
 
 
 if __name__ == "__main__":

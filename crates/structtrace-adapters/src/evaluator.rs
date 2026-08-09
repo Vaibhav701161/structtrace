@@ -7,12 +7,13 @@ use std::{
     time::Duration,
 };
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use structtrace_core::{
     artifact::ExternalEvaluatorReceipt,
     config::{CommandSpec, EvaluatorKind, ProcessMode},
     dataset::Case,
-    evaluation::{EvaluationStatus, EvaluatorResult},
+    evaluation::{EvaluationStatus, EvaluatorResult, FieldEvaluationFact},
     hashing::hash_canonical_json,
     output::VariantOutput,
 };
@@ -29,6 +30,25 @@ pub const EVALUATOR_PROTOCOL: &str = "structtrace.evaluator";
 /// Bundled Python evaluator bridge source.
 pub const EVALUATOR_BRIDGE_SOURCE: &str =
     include_str!("../../../python/structtrace_evaluator_bridge.py");
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvaluatorResponse {
+    protocol: String,
+    protocol_version: u32,
+    evaluator_id: String,
+    #[serde(default)]
+    case_id: Option<String>,
+    status: String,
+    #[serde(default)]
+    score: Option<f64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    details: Option<Value>,
+    #[serde(default)]
+    fields: Vec<FieldEvaluationFact>,
+}
 
 /// Result plus capped evaluator diagnostics.
 #[derive(Debug, Clone)]
@@ -653,7 +673,7 @@ fn parse_response_inner(
             ),
         );
     }
-    let value: Value = match serde_json::from_str(lines[0]) {
+    let response: EvaluatorResponse = match serde_json::from_str(lines[0]) {
         Ok(value) => value,
         Err(failure) => {
             return error(
@@ -662,47 +682,57 @@ fn parse_response_inner(
             );
         }
     };
-    if value.pointer("/protocol").and_then(Value::as_str) != Some(EVALUATOR_PROTOCOL)
-        || value.pointer("/protocol_version").and_then(Value::as_u64)
-            != Some(u64::from(structtrace_core::PROTOCOL_VERSION))
-        || value.pointer("/evaluator_id").and_then(Value::as_str) != Some(evaluator_id)
+    if response.protocol != EVALUATOR_PROTOCOL
+        || response.protocol_version != structtrace_core::PROTOCOL_VERSION
+        || response.evaluator_id != evaluator_id
     {
         return error(
             evaluator_id,
             "evaluator response identity or protocol did not match",
         );
     }
-    if expected_case_id.is_some()
-        && value.pointer("/case_id").and_then(Value::as_str) != expected_case_id
-    {
+    if expected_case_id.is_some() && response.case_id.as_deref() != expected_case_id {
         return error(
             evaluator_id,
             "evaluator response case identity did not match",
         );
     }
-    let status = match value.pointer("/status").and_then(Value::as_str) {
-        Some("passed") => EvaluationStatus::Passed,
-        Some("failed") => EvaluationStatus::Failed,
-        Some("error") => EvaluationStatus::Error,
-        Some("not_applicable") => EvaluationStatus::NotApplicable,
+    let status = match response.status.as_str() {
+        "passed" => EvaluationStatus::Passed,
+        "failed" => EvaluationStatus::Failed,
+        "error" => EvaluationStatus::Error,
+        "not_applicable" => EvaluationStatus::NotApplicable,
         _ => return error(evaluator_id, "evaluator response has an unsupported status"),
     };
-    let score = value.pointer("/score").and_then(Value::as_f64);
+    let score = response.score;
     if score.is_some_and(|score| !(0.0..=1.0).contains(&score)) {
         return error(evaluator_id, "evaluator score must be between zero and one");
+    }
+    let fields = response.fields;
+    if !fields.iter().all(|field| {
+        (field.pointer.is_empty() || field.pointer.starts_with('/'))
+            && field
+                .expected_pointer
+                .as_ref()
+                .is_none_or(|pointer| pointer.is_empty() || pointer.starts_with('/'))
+    }) {
+        return error(
+            evaluator_id,
+            "evaluator field facts contain invalid JSON Pointers",
+        );
     }
     EvaluatorResult {
         evaluator_id: evaluator_id.to_owned(),
         status,
         passed: status == EvaluationStatus::Passed,
         score,
-        message: value
-            .pointer("/message")
-            .and_then(Value::as_str)
+        message: response
+            .message
+            .as_deref()
             .unwrap_or("External evaluator returned no message.")
             .to_owned(),
-        details: value.pointer("/details").cloned().unwrap_or(Value::Null),
-        fields: Vec::new(),
+        details: response.details.unwrap_or(Value::Null),
+        fields,
     }
 }
 
@@ -736,6 +766,51 @@ fn error(evaluator_id: &str, message: impl Into<String>) -> EvaluatorResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_evaluator_field_facts_are_validated_and_preserved() {
+        let response = serde_json::json!({
+            "protocol": EVALUATOR_PROTOCOL,
+            "protocol_version": structtrace_core::PROTOCOL_VERSION,
+            "evaluator_id": "invoice",
+            "case_id": "one",
+            "status": "failed",
+            "fields": [{
+                "pointer": "/tax",
+                "status": "failed",
+                "expected": "18.00",
+                "actual": "8.00",
+                "message": "tax mismatch"
+            }]
+        });
+        let result = parse_response_for_case(
+            "invoice",
+            "one",
+            serde_json::to_string(&response).unwrap().as_bytes(),
+        );
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.fields[0].pointer, "/tax");
+        assert_eq!(result.fields[0].status, EvaluationStatus::Failed);
+    }
+
+    #[test]
+    fn external_evaluator_unknown_fields_are_rejected() {
+        let response = serde_json::json!({
+            "protocol": EVALUATOR_PROTOCOL,
+            "protocol_version": structtrace_core::PROTOCOL_VERSION,
+            "evaluator_id": "business",
+            "case_id": "one",
+            "status": "passed",
+            "unexpected": true
+        });
+        let result = parse_response_for_case(
+            "business",
+            "one",
+            serde_json::to_string(&response).unwrap().as_bytes(),
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert!(result.message.contains("unknown field"));
+    }
 
     #[cfg(unix)]
     use tempfile::tempdir;

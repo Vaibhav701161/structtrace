@@ -27,7 +27,9 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "json_pointers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+            "json_pointers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+            "text_mode": {"enum": ["exact_structured", "aggressive_textual"], "default": "exact_structured"},
+            "custom_patterns": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
           }
         }
       }
@@ -42,6 +44,7 @@
         "max_schema_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
         "max_cases": {"type": "integer", "minimum": 1, "maximum": 10000000, "default": 1000000},
         "max_jsonl_line_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
+        "max_replay_artifact_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 536870912},
         "max_output_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 4194304},
         "max_stderr_bytes_per_process": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 1048576},
         "max_report_raw_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 4194304, "default": 262144},
@@ -56,7 +59,8 @@
       "properties": {
         "path": {"type": "string"},
         "format": {"const": "jsonl", "default": "jsonl"},
-        "fields": {"$ref": "#/$defs/datasetFields"}
+        "fields": {"$ref": "#/$defs/datasetFields"},
+        "evidence_unit": {"$ref": "#/$defs/evidenceUnit"}
       }
     },
     "schema": {
@@ -100,7 +104,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "samples": {"type": "integer", "minimum": 1, "default": 10000},
+            "samples": {"type": "integer", "minimum": 1, "maximum": 1000000, "default": 10000},
             "confidence": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1, "default": 0.95},
             "seed": {"type": "integer", "minimum": 0, "default": 17}
           }
@@ -150,6 +154,18 @@
         "metadata": {"type": "string", "default": "/metadata"}
       }
     },
+    "evidenceUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {"required": ["pointer"], "not": {"required": ["include"]}},
+        {"required": ["include"], "not": {"required": ["pointer"]}}
+      ],
+      "properties": {
+        "pointer": {"type": "string"},
+        "include": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true}
+      }
+    },
     "commandSpec": {
       "type": "object",
       "required": ["program"],
@@ -159,11 +175,19 @@
         "args": {"type": "array", "items": {"type": "string"}}
       }
     },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "digest": {"type": ["string", "null"], "minLength": 1},
+        "sources": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
     "variant": {
       "oneOf": [
         {"type": "object", "required": ["kind", "path"], "additionalProperties": false, "properties": {"kind": {"const": "recorded"}, "path": {"type": "string"}}},
-        {"type": "object", "required": ["kind", "command"], "additionalProperties": false, "properties": {"kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
-        {"type": "object", "required": ["kind", "callable"], "additionalProperties": false, "properties": {"kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
+        {"type": "object", "required": ["kind", "command"], "additionalProperties": false, "properties": {"kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}, "implementation": {"$ref": "#/$defs/implementation"}}},
+        {"type": "object", "required": ["kind", "callable"], "additionalProperties": false, "properties": {"kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}, "implementation": {"$ref": "#/$defs/implementation"}}},
         {"$ref": "#/$defs/openaiVariant"}
       ]
     },
@@ -200,7 +224,7 @@
         {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "numeric_tolerance"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "absolute": {"type": ["string", "null"]}, "relative": {"type": ["string", "null"]}, "exact_integer": {"type": "boolean"}}},
         {"type": "object", "required": ["id", "kind", "pointers"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "required_fields"}, "pointers": {"type": "array", "items": {"type": "string"}, "minItems": 1}}},
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "tool_selection"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}}},
-        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer", "keys"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "keyed_array"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "fields": {"type": "array", "items": {"$ref": "#/$defs/keyedArrayField"}}}},
+        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer", "keys", "fields"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "keyed_array"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "fields": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/keyedArrayField"}}}},
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "financial_invariants"}, "line_items_pointer": {"type": "string"}, "subtotal_pointer": {"type": "string"}, "tax_pointer": {"type": "string"}, "total_pointer": {"type": "string"}, "absolute": {"type": "string"}}},
         {"type": "object", "required": ["id", "implementation_version", "kind", "command"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"const": "persistent", "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
         {"type": "object", "required": ["id", "implementation_version", "kind", "callable"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "process_mode": {"const": "persistent", "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}}

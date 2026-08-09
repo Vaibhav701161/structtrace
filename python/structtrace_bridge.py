@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import inspect
 import json
 import os
 import sys
-import traceback
 from typing import Any, Callable
 
 PROTOCOL = "structtrace.variant"
@@ -45,16 +45,15 @@ def success(case_id: str, value: Any) -> dict[str, Any]:
     return envelope
 
 
-def failure(case_id: str, error: BaseException) -> dict[str, Any]:
-    traceback.print_exc(file=sys.stderr)
+def failure(case_id: str, error: BaseException, kind: str = "python_exception") -> dict[str, Any]:
     return {
         "protocol": PROTOCOL,
         "protocol_version": PROTOCOL_VERSION,
         "case_id": case_id,
         "status": "error",
         "error": {
-            "kind": "python_exception",
-            "message": f"{type(error).__name__}: {error}",
+            "kind": kind,
+            "message": f"{type(error).__name__}",
         },
     }
 
@@ -65,21 +64,31 @@ def main() -> None:
     args = parser.parse_args()
     target = load_callable(args.callable)
     for line in sys.stdin:
-        request = json.loads(line)
-        case_id = str(request.get("case_id", ""))
+        case_id = ""
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
+            case_id = str(request.get("case_id", ""))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(json.dumps(failure(case_id, error, "protocol_error")), flush=True)
+            continue
         case = {
-            "id": case_id,
             "input": request.get("input"),
             "metadata": request.get("metadata"),
         }
         try:
             value = target(case)
             if inspect.isawaitable(value):
-                raise TypeError("async Python callables are not supported by this bridge")
+                value = asyncio.run(value)
             response = success(case_id, value)
         except Exception as error:  # noqa: BLE001 - converted into protocol evidence
             response = failure(case_id, error)
-        print(json.dumps(response, ensure_ascii=False), flush=True)
+        try:
+            encoded = json.dumps(response, ensure_ascii=False)
+        except (TypeError, ValueError) as error:
+            encoded = json.dumps(failure(case_id, error, "non_serializable_output"))
+        print(encoded, flush=True)
 
 
 if __name__ == "__main__":

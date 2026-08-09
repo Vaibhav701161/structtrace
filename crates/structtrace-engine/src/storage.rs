@@ -10,7 +10,7 @@ use structtrace_core::{
 };
 
 /// Current SQLite schema migration version.
-pub const DATABASE_VERSION: i64 = 1;
+pub const DATABASE_VERSION: i64 = 2;
 
 /// Durable local run store.
 pub struct RunStore {
@@ -154,13 +154,15 @@ impl RunStore {
     /// Persist an immutable case envelope in display order.
     pub fn insert_case(&self, ordinal: usize, case: &Case) -> anyhow::Result<()> {
         self.connection.execute(
-            "INSERT INTO cases (ordinal, case_id, input_json, expected_json, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO cases (ordinal, case_id, input_json, expected_json, model_visible_metadata_json, metadata_json, source_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 i64::try_from(ordinal)?,
                 case.id,
                 serde_json::to_string(&case.input)?,
                 optional_json(case.expected.as_ref())?,
+                optional_json(case.model_visible_metadata.as_ref())?,
                 optional_json(case.metadata.as_ref())?,
+                i64::try_from(case.source_line)?,
             ],
         )?;
         Ok(())
@@ -330,7 +332,9 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 case_id TEXT PRIMARY KEY,
                 input_json TEXT NOT NULL,
                 expected_json TEXT,
-                metadata_json TEXT
+                model_visible_metadata_json TEXT,
+                metadata_json TEXT,
+                source_line INTEGER NOT NULL
             );
             CREATE TABLE variants (
                 variant_id TEXT PRIMARY KEY,
@@ -373,7 +377,17 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 blake3 TEXT NOT NULL,
                 byte_length INTEGER NOT NULL
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
+            COMMIT;
+            "#,
+        )?;
+    } else if version == 1 {
+        connection.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE cases ADD COLUMN model_visible_metadata_json TEXT;
+            ALTER TABLE cases ADD COLUMN source_line INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 2;
             COMMIT;
             "#,
         )?;

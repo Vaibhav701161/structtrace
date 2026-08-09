@@ -14,9 +14,17 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 
 /// Hash the exact bytes of a file.
 pub fn hash_file(path: &Path) -> Result<String> {
-    std::fs::read(path)
-        .map(|bytes| hash_bytes(&bytes))
-        .map_err(read_error(path))
+    let mut file = std::fs::File::open(path).map_err(read_error(path))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(read_error(path))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Read a regular file without allocating beyond a caller-declared byte ceiling.

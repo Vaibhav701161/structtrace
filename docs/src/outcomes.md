@@ -11,7 +11,11 @@ outcomes:
       - state_receipt
 ```
 
-`all_of` requires every listed evaluator to pass. `any_of` passes when at least one listed evaluator passes, unless the remaining state is only errors or non-applicable results. Empty compositions and unknown evaluator IDs fail configuration validation.
+`all_of` uses `False > Error > NotApplicable > True` precedence: a known failure dominates
+uncertainty, an error dominates non-applicability, and every evaluator must pass for `True`.
+`any_of` uses `True > Error > False > NotApplicable`: a known pass dominates an error; without a
+pass, an error remains an error; all non-applicable results produce `NotApplicable`; otherwise the
+outcome is `False`. Empty compositions and unknown evaluator IDs fail validation.
 
 Choose the primary result explicitly:
 

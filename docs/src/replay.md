@@ -19,8 +19,9 @@ case, and variant. Replay reports built-in results recomputed, external receipts
 programs re-executed, artifact hash mismatches, cross-artifact mismatches, row-score mismatches,
 and summary mismatches separately. A successful replay requires zero mismatches in every category.
 
-`--research-fixture` verifies normalized transition matrices from the accepted research record. It
-does not claim to replay the original raw Qwen, Llama, or tool-call generation artifacts.
+`--research-fixture` creates and verifies three separate normalized transition-matrix runs from the
+accepted research record. It calculates no pooled effect or gate and does not claim to replay the
+original raw Qwen, Llama, or tool-call generation artifacts.
 
 Local hashes establish run integrity and internal consistency, not authorship. Signed manifests
 are not currently part of the format.

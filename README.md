@@ -25,9 +25,10 @@ expected + eval   ------------------------> deterministic scoring
                                              -> report, gate, replay
 ```
 
-The execution boundary is deliberate: adapters can receive the case input and explicitly
-model-visible metadata, but never the golden `expected` value or evaluation-only metadata.
-Only the evaluation engine can access labels.
+The execution boundary is deliberate: adapters receive an opaque transport token, case input, and
+explicitly model-visible metadata, but never the dataset ID, golden `expected` value, or
+evaluation-only metadata. OpenAI prompt templates receive no identifier. Only the evaluation
+engine retains the token-to-dataset-ID mapping and can access labels.
 
 ## Hero workflow: invoice extraction migration
 
@@ -50,8 +51,9 @@ structtrace init invoice-extractor --preset extraction
 
 The bundled demo is deliberately an honest 12-case workflow demonstration: both variants pass
 9/12, with three regressions and three improvements. Its gate is `INSUFFICIENT EVIDENCE` because a
-small fixture must not be presented as release evidence. StructTrace fingerprints semantic cases,
-reports duplicates, resamples one unit per fingerprint, and requires an explicit unique-case gate.
+small fixture must not be presented as release evidence. StructTrace uses an explicit evidence-unit
+definition, excludes operational metadata from the default fingerprint, and refuses a release
+decision when repeated observations in one unit conflict. No input row is selected by position.
 Its exact hotspot acceptance test requires:
 
 | Pointer | Regressions | Improvements | Candidate failures |
@@ -70,8 +72,8 @@ Its exact hotspot acceptance test requires:
 - deterministic extraction, classification, and tool-argument evaluators;
 - valid-but-wrong counts as a first-class result;
 - a complete-denominator deployment-success view and separate jointly scored semantic view;
-- an independent paired 2x2 matrix over canonical semantic fingerprints;
-- duplicate-aware exact McNemar testing and seeded paired bootstrap interval;
+- an order-invariant paired 2x2 matrix over explicit evidence units;
+- conflict-aware exact McNemar testing and a bounded seeded paired bootstrap interval;
 - field-level regression and improvement hotspots;
 - mean, median, and p95 latency, retries, token use, and user-priced cost;
 - a filterable case explorer with JSON-aware diffs;
@@ -273,7 +275,8 @@ address. Opening a completed report serves its immutable finalized bundle; the o
 export copies a finalized size-limited derivative. `--export-share` creates a new aggregate-only
 directory with every case-level value omitted.
 
-Output, subprocess diagnostics, and report embedding are bounded independently. Defaults are conservative and every setting has a compiled hard ceiling:
+Output, subprocess diagnostics, report embedding, bootstrap samples, and total bootstrap work are
+bounded independently. Defaults are conservative and every setting has a compiled hard ceiling:
 
 ```yaml
 limits:
@@ -283,6 +286,7 @@ limits:
   max_schema_bytes: 16777216
   max_cases: 1000000
   max_jsonl_line_bytes: 16777216
+  max_replay_artifact_bytes: 536870912
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144
@@ -294,8 +298,8 @@ Oversized command, Python, or provider output fails closed and remains in the de
 
 ## Research foundation, without universal claims
 
-The offline research fixture reproduces three normalized accepted paired matrices from the
-Contract Sensitivity Lab evidence chain:
+The offline research command produces three separate normalized runs and a non-inferential index
+from the Contract Sensitivity Lab evidence chain:
 
 | Study | Baseline | Candidate | Candidate-only | Baseline-only |
 |---|---:|---:|---:|---:|
@@ -303,10 +307,10 @@ Contract Sensitivity Lab evidence chain:
 | Canonical Llama | 92/150 | 82/150 | 6 | 16 |
 | Executable tool pilot | 26/30 | 24/30 | 1 | 3 |
 
-This fixture verifies the published transition counts and statistics; it is not a replay of the
-original raw model-generation artifacts. The point is not that one representation universally
-wins. The same class of contract-preserving change produced different effects across evaluated
-systems. StructTrace exists so teams measure the effect on their own model, prompt, schema,
+These fixtures verify the published per-study transition counts and statistics; they are not a
+replay of the original raw model-generation artifacts. StructTrace deliberately calculates no
+pooled effect or cross-study release gate. The same class of contract-preserving change produced
+different effects across evaluated systems, so teams must measure their own model, prompt, schema,
 backend, and workload.
 
 ## Architecture

@@ -1,7 +1,8 @@
 //! Recorded-output envelope and exact ID matching.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, str::FromStr};
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,6 +56,7 @@ pub struct Cost {
 
 /// One recorded or adapter-produced case result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VariantOutput {
     /// Dataset case ID.
     pub case_id: String,
@@ -186,6 +188,61 @@ impl RecordedOutputs {
                     line: line_number,
                     message: "successful output requires raw_output or parsed_output".to_owned(),
                 });
+            }
+            match row.status {
+                OutputStatus::Ok => {
+                    if row.error.is_some() {
+                        return Err(CoreError::RecordedOutput {
+                            line: line_number,
+                            message: "successful output must not contain error".to_owned(),
+                        });
+                    }
+                    if let (Some(raw), Some(parsed)) = (&row.raw_output, &row.parsed_output) {
+                        let raw_value: Value = serde_json::from_str(raw).map_err(|error| {
+                            CoreError::RecordedOutput {
+                                line: line_number,
+                                message: format!(
+                                    "raw_output conflicts with parsed_output: {error}"
+                                ),
+                            }
+                        })?;
+                        if &raw_value != parsed {
+                            return Err(CoreError::RecordedOutput {
+                                line: line_number,
+                                message:
+                                    "raw_output and parsed_output represent different JSON values"
+                                        .to_owned(),
+                            });
+                        }
+                    }
+                }
+                OutputStatus::Error | OutputStatus::Missing => {
+                    if row.error.is_none()
+                        || row.raw_output.is_some()
+                        || row.parsed_output.is_some()
+                    {
+                        return Err(CoreError::RecordedOutput {
+                            line: line_number,
+                            message:
+                                "error or missing output requires error and forbids output values"
+                                    .to_owned(),
+                        });
+                    }
+                }
+            }
+            if let Some(cost) = &row.cost {
+                let amount =
+                    Decimal::from_str(&cost.amount).map_err(|_| CoreError::RecordedOutput {
+                        line: line_number,
+                        message: "cost amount must be a valid decimal".to_owned(),
+                    })?;
+                if amount.is_sign_negative() || cost.currency.trim().is_empty() {
+                    return Err(CoreError::RecordedOutput {
+                        line: line_number,
+                        message: "cost amount must be non-negative and currency non-empty"
+                            .to_owned(),
+                    });
+                }
             }
             let row_id = row.case_id.clone();
             if by_id.insert(row_id.clone(), row).is_some() {

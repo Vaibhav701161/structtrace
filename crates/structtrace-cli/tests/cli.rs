@@ -15,6 +15,46 @@ fn help_and_doctor_succeed() {
 }
 
 #[test]
+fn strict_doctor_fails_expected_leaf_and_label_bearing_id_leakage() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("data.jsonl"),
+        "{\"id\":\"currency-usd\",\"input\":{\"hint\":\"USD\"},\"expected\":{\"currency\":\"USD\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
+    let output = "{\"case_id\":\"currency-usd\",\"status\":\"ok\",\"raw_output\":\"{}\"}\n";
+    std::fs::write(root.path().join("baseline.jsonl"), output).unwrap();
+    std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
+    std::fs::write(
+        root.path().join("structtrace.yaml"),
+        r#"version: 1
+project: {name: leakage-test}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators: [{id: exact, kind: exact_json}]
+outcomes: {correct: {all_of: [exact]}}
+analysis: {primary_outcome: correct}
+"#,
+    )
+    .unwrap();
+    let status = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            root.path().to_str().unwrap(),
+            "doctor",
+            "--strict",
+        ])
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[test]
 fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() {
     let root = tempdir().unwrap();
     let project = root.path().join("project");
@@ -116,6 +156,20 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .unwrap();
     assert!(!report_status.success());
     std::fs::write(&case_chunk, original_chunk).unwrap();
+    let unbound = run_dir.join("report/unbound.html");
+    std::fs::write(&unbound, "untrusted").unwrap();
+    let report_status = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "report",
+            "latest",
+        ])
+        .status()
+        .unwrap();
+    assert!(!report_status.success());
+    std::fs::remove_file(unbound).unwrap();
     assert!(
         binary()
             .args([
@@ -140,7 +194,7 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         ])
         .status()
         .unwrap();
-    assert_eq!(replay_verified_gate.code(), Some(10));
+    assert_eq!(replay_verified_gate.code(), Some(12));
     let github_summary = root.path().join("github-step-summary.md");
     let status = binary()
         .args([
@@ -154,9 +208,9 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .env("GITHUB_STEP_SUMMARY", &github_summary)
         .status()
         .unwrap();
-    assert_eq!(status.code(), Some(10));
+    assert_eq!(status.code(), Some(12));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
-    assert!(github_summary.contains("## StructTrace release gate: failed"));
+    assert!(github_summary.contains("## StructTrace release gate: insufficient evidence"));
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
     assert!(github_summary.contains("| Primary outcome |"));
 

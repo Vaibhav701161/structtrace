@@ -2,9 +2,10 @@
 
 Start with the primary outcome and release-gate state, then inspect the structural-versus-semantic table. If schema validity improved while correctness fell, the valid-but-wrong row shows how much failure moved behind a valid contract.
 
-Check the evidence-independence table before interpreting the paired estimate. Total rows, unique
-semantic cases, duplicate groups, and largest group show whether repeated data reduced the
-effective denominator. Use the independent paired transition matrix to compare candidate-only improvements with baseline-only
+Check the evidence-independence table before interpreting the paired estimate. Captured rows,
+evidence units, inference denominator, duplicate groups, conflicting groups, and the configured
+inference-unit definition explain exactly which population supports the gate. The separate
+descriptive row totals make no independence claim. Use the independent paired transition matrix to compare candidate-only improvements with baseline-only
 regressions. Field hotspots identify evaluator pointers associated with those transitions. The case
 explorer searches redacted IDs and metadata, filters outcome, validity, adapter, evaluator-error,
 not-applicable, and unscored states, and paginates 25 cases at a time.

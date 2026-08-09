@@ -6,18 +6,23 @@ use std::{
     collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Context;
+use axum::response::IntoResponse;
 use minijinja::{AutoEscape, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use structtrace_core::{
-    artifact::{PairedCaseRecord, RunManifest, RunStatus, RunSummary},
-    config::Config,
+    artifact::{PairedCaseRecord, RunManifest, RunStatus, RunSummary, VariantSummary},
+    config::{Config, TextRedactionMode},
     gate::{GateRuleStatus, GateStatus},
     hashing::hash_file,
-    privacy::{REDACTION_MARKER, redact_matching_values, redact_text, selected_values},
+    privacy::{
+        REDACTION_MARKER, redact_matching_values_with_policy, redact_text_with_policy,
+        selected_values,
+    },
 };
 use tempfile::NamedTempFile;
 
@@ -46,12 +51,16 @@ struct ReportView {
     unique_cases: usize,
     duplicate_groups: usize,
     largest_duplicate_group: usize,
+    conflicting_groups: usize,
+    inference_unit: String,
+    evidence_denominator: usize,
     semantic_jointly_scored: usize,
     semantic_excluded: usize,
     semantic_difference: String,
     baseline_primary: MetricView,
     candidate_primary: MetricView,
     structural_rows: Vec<ComparisonRow>,
+    descriptive_rows: Vec<ComparisonRow>,
     transition: TransitionView,
     research_studies: Vec<ResearchStudyView>,
     gate_rules: Vec<GateRuleView>,
@@ -363,16 +372,89 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{}/", address.port());
     println!("StructTrace report: {url}");
     if open_browser {
-        open::that(&url).context("could not open the default browser")?;
+        if let Err(error) = open::that(&url) {
+            eprintln!(
+                "warning: could not open the default browser ({error}); the verified report remains available at {url}"
+            );
+        }
     }
-    let service =
-        axum::Router::new().fallback_service(tower_http::services::ServeDir::new(directory));
+    let assets = Arc::new(load_verified_report_assets(&directory)?);
+    let service = axum::Router::new()
+        .fallback(serve_verified_asset)
+        .with_state(assets);
     axum::serve(listener, service)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
     Ok(())
+}
+
+type VerifiedReportAssets = BTreeMap<String, (String, axum::body::Bytes)>;
+
+fn load_verified_report_assets(directory: &Path) -> anyhow::Result<VerifiedReportAssets> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        output: &mut VerifiedReportAssets,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            anyhow::ensure!(
+                !file_type.is_symlink(),
+                "report asset must not be a symlink"
+            );
+            if file_type.is_dir() {
+                visit(root, &path, output)?;
+            } else if file_type.is_file() {
+                let relative = path
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let content_type = match path.extension().and_then(|value| value.to_str()) {
+                    Some("html") => "text/html; charset=utf-8",
+                    Some("json") => "application/json; charset=utf-8",
+                    _ => "application/octet-stream",
+                };
+                output.insert(
+                    relative,
+                    (
+                        content_type.to_owned(),
+                        axum::body::Bytes::from(std::fs::read(path)?),
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut assets = BTreeMap::new();
+    visit(directory, directory, &mut assets)?;
+    Ok(assets)
+}
+
+async fn serve_verified_asset(
+    axum::extract::State(assets): axum::extract::State<Arc<VerifiedReportAssets>>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    let requested = uri.path().trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    if requested.contains("..") || requested.contains('\\') {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    let Some((content_type, bytes)) = assets.get(requested) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, content_type.as_str())],
+        bytes.clone(),
+    )
+        .into_response()
 }
 
 /// Resolve an existing report without mutating a completed run.
@@ -397,7 +479,44 @@ pub fn finalized_report(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
     {
         verify_bound_artifact(run_dir, &manifest, relative)?;
     }
+    let expected = manifest
+        .artifacts
+        .keys()
+        .filter(|relative| relative.starts_with("report/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut observed = std::collections::BTreeSet::new();
+    collect_report_files(run_dir, &run_dir.join("report"), &mut observed)?;
+    anyhow::ensure!(
+        observed == expected,
+        "report directory contains files that are missing, unbound, or not allowlisted"
+    );
     Ok(GeneratedReport { index_path })
+}
+
+fn collect_report_files(
+    run_dir: &Path,
+    directory: &Path,
+    output: &mut std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        anyhow::ensure!(!file_type.is_symlink(), "report contains a symbolic link");
+        if file_type.is_dir() {
+            collect_report_files(run_dir, &path, output)?;
+        } else if file_type.is_file() {
+            output.insert(
+                path.strip_prefix(run_dir)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        } else {
+            anyhow::bail!("report contains a non-regular filesystem entry");
+        }
+    }
+    Ok(())
 }
 
 fn verify_bound_artifact(
@@ -538,62 +657,11 @@ fn build_view(
     records: &[PairedCaseRecord],
     config: &Config,
 ) -> anyhow::Result<ReportView> {
-    let structural_rows = vec![
-        comparison(
-            "Strict JSON",
-            summary.baseline.parse_valid,
-            summary.candidate.parse_valid,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Schema valid",
-            summary.baseline.schema_valid,
-            summary.candidate.schema_valid,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Primary outcome pass",
-            summary.baseline.primary_pass,
-            summary.candidate.primary_pass,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Explicit primary failure",
-            summary.baseline.primary_failed,
-            summary.candidate.primary_failed,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Primary evaluator error",
-            summary.baseline.primary_error,
-            summary.candidate.primary_error,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Primary not applicable",
-            summary.baseline.primary_not_applicable,
-            summary.candidate.primary_not_applicable,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Primary unscored",
-            summary.baseline.primary_unscored,
-            summary.candidate.primary_unscored,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Valid but wrong",
-            summary.baseline.valid_but_wrong,
-            summary.candidate.valid_but_wrong,
-            summary.baseline.total,
-        ),
-        comparison(
-            "Adapter error or missing output",
-            summary.baseline.errors,
-            summary.candidate.errors,
-            summary.baseline.total,
-        ),
-    ];
+    let structural_rows = summary_rows(&summary.baseline, &summary.candidate);
+    let descriptive_rows = summary_rows(
+        &summary.descriptive_baseline,
+        &summary.descriptive_candidate,
+    );
     let evaluator_rows = summary
         .evaluator_passes
         .iter()
@@ -656,6 +724,9 @@ fn build_view(
         unique_cases: summary.evidence.unique_semantic_cases,
         duplicate_groups: summary.evidence.exact_duplicate_groups,
         largest_duplicate_group: summary.evidence.largest_duplicate_group,
+        conflicting_groups: summary.evidence.conflicting_repeated_groups,
+        inference_unit: summary.evidence.inference_unit.clone(),
+        evidence_denominator: summary.evidence.effective_gate_denominator,
         semantic_jointly_scored: summary.jointly_scored_semantic.jointly_scored_cases,
         semantic_excluded: summary.jointly_scored_semantic.excluded_pairs,
         semantic_difference: format!(
@@ -665,6 +736,7 @@ fn build_view(
         baseline_primary: metric(summary.baseline.primary_pass, summary.baseline.total),
         candidate_primary: metric(summary.candidate.primary_pass, summary.candidate.total),
         structural_rows,
+        descriptive_rows,
         transition: TransitionView {
             both_pass: summary.paired.both_pass,
             baseline_only: summary.paired.baseline_only_pass,
@@ -726,12 +798,20 @@ fn build_view(
                 summary.evidence.total_rows.to_string(),
             ),
             (
-                "Unique semantic cases".to_owned(),
+                "Configured evidence units".to_owned(),
                 summary.evidence.unique_semantic_cases.to_string(),
             ),
             (
                 "Exact duplicate groups".to_owned(),
                 summary.evidence.exact_duplicate_groups.to_string(),
+            ),
+            (
+                "Inference unit".to_owned(),
+                summary.evidence.inference_unit.clone(),
+            ),
+            (
+                "Conflicting repeated groups".to_owned(),
+                summary.evidence.conflicting_repeated_groups.to_string(),
             ),
             (
                 "Primary scored cases".to_owned(),
@@ -747,7 +827,7 @@ fn build_view(
                 "Jointly scored cases".to_owned(),
                 format!(
                     "{} / {}",
-                    summary.primary_jointly_scored, summary.evidence.total_rows
+                    summary.primary_jointly_scored, summary.evidence.effective_gate_denominator
                 ),
             ),
             (
@@ -808,6 +888,65 @@ fn build_view(
             ("Binary target".to_owned(), manifest.binary_target.clone()),
         ],
     })
+}
+
+fn summary_rows(baseline: &VariantSummary, candidate: &VariantSummary) -> Vec<ComparisonRow> {
+    vec![
+        comparison(
+            "Strict JSON",
+            baseline.parse_valid,
+            candidate.parse_valid,
+            baseline.total,
+        ),
+        comparison(
+            "Schema valid",
+            baseline.schema_valid,
+            candidate.schema_valid,
+            baseline.total,
+        ),
+        comparison(
+            "Primary outcome pass",
+            baseline.primary_pass,
+            candidate.primary_pass,
+            baseline.total,
+        ),
+        comparison(
+            "Explicit primary failure",
+            baseline.primary_failed,
+            candidate.primary_failed,
+            baseline.total,
+        ),
+        comparison(
+            "Primary evaluator error",
+            baseline.primary_error,
+            candidate.primary_error,
+            baseline.total,
+        ),
+        comparison(
+            "Primary not applicable",
+            baseline.primary_not_applicable,
+            candidate.primary_not_applicable,
+            baseline.total,
+        ),
+        comparison(
+            "Primary unscored",
+            baseline.primary_unscored,
+            candidate.primary_unscored,
+            baseline.total,
+        ),
+        comparison(
+            "Valid but wrong",
+            baseline.valid_but_wrong,
+            candidate.valid_but_wrong,
+            baseline.total,
+        ),
+        comparison(
+            "Adapter error or missing output",
+            baseline.errors,
+            candidate.errors,
+            baseline.total,
+        ),
+    ]
 }
 
 fn directory_size(path: &Path) -> anyhow::Result<u64> {
@@ -990,14 +1129,27 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         "metadata": record.case.metadata,
     });
     let secrets = selected_values(&source, &config.storage.redaction.json_pointers);
+    let aggressive = matches!(
+        config.storage.redaction.text_mode,
+        TextRedactionMode::AggressiveTextual
+    );
+    let patterns = &config.storage.redaction.custom_patterns;
     let mut redacted_value = serde_json::to_value(record)
         .context("could not build fail-closed report view for a case")?;
-    redact_matching_values(&mut redacted_value, &secrets);
-    redact_value_raw_text(&mut redacted_value, "/baseline_output/raw_output", &secrets);
+    redact_matching_values_with_policy(&mut redacted_value, &secrets, aggressive, patterns);
+    redact_value_raw_text(
+        &mut redacted_value,
+        "/baseline_output/raw_output",
+        &secrets,
+        aggressive,
+        patterns,
+    );
     redact_value_raw_text(
         &mut redacted_value,
         "/candidate_output/raw_output",
         &secrets,
+        aggressive,
+        patterns,
     );
     if !config.report.include_raw_outputs || !config.storage.retain_raw_outputs {
         remove_object_key(&mut redacted_value, "/baseline_output", "raw_output");
@@ -1063,7 +1215,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         .cloned()
         .unwrap_or(Value::Null);
     let mut filter_string = filters.join(" ");
-    redact_text(&mut filter_string, &secrets);
+    redact_text_with_policy(&mut filter_string, &secrets, aggressive, patterns);
     Ok(CaseView {
         id: redacted_value
             .pointer("/case/id")
@@ -1161,7 +1313,13 @@ fn raw_for_report(value: &Value, pointer: &str, max_bytes: usize) -> String {
         .unwrap_or_else(|| "Not retained".to_owned())
 }
 
-fn redact_value_raw_text(value: &mut Value, pointer: &str, secrets: &[Value]) {
+fn redact_value_raw_text(
+    value: &mut Value,
+    pointer: &str,
+    secrets: &[Value],
+    aggressive: bool,
+    patterns: &[String],
+) {
     let raw = value
         .pointer_mut(pointer)
         .and_then(|value| value.as_str())
@@ -1169,7 +1327,7 @@ fn redact_value_raw_text(value: &mut Value, pointer: &str, secrets: &[Value]) {
     let Some(mut raw) = raw else {
         return;
     };
-    redact_text(&mut raw, secrets);
+    redact_text_with_policy(&mut raw, secrets, aggressive, patterns);
     if let Some(target) = value.pointer_mut(pointer) {
         *target = Value::String(raw);
     }
@@ -1279,6 +1437,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
   <meta name="color-scheme" content="light dark">
   <title>{{ project_name }} · StructTrace</title>
   <style>
@@ -1305,15 +1464,20 @@ const TEMPLATE: &str = r##"<!doctype html>
   <section class="hero"><div><div class="eyebrow">Structured-output release evidence</div><h1>{{ project_name }}</h1><p class="muted">Run {{ run_id }}</p></div><div class="gate {{ gate_class }}">{{ gate_label }}</div></section>
   {% if share_derivative %}<div class="panel"><strong>Aggregate-only share derivative</strong><p class="muted">Case inputs, expected values, outputs, prompts, adapter metadata, and evaluation metadata were deliberately omitted. Use the hash-bound local run for case-level audit.</p></div>{% endif %}
   <section class="metrics" aria-label="Executive summary">
-    <div class="metric"><span>Baseline primary outcome</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
-    <div class="metric"><span>Candidate primary outcome</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
+    <div class="metric"><span>Baseline primary outcome · evidence units</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
+    <div class="metric"><span>Candidate primary outcome · evidence units</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
     <div class="metric"><span>Independent paired difference</span><strong>{{ difference }}</strong>candidate minus baseline</div>
-    <div class="metric"><span>Independent bootstrap interval</span><strong>{{ interval }}</strong>one unit per semantic fingerprint</div>
+    <div class="metric"><span>Independent bootstrap interval</span><strong>{{ interval }}</strong>one configured evidence unit per pair</div>
   </section>
 
   <h2>Evidence independence</h2>
-  <p class="muted">Exact semantic duplicates remain visible descriptively but cannot multiply the inferential denominator or satisfy the unique-evidence gate.</p>
-  <table><thead><tr><th>Total rows</th><th>Unique semantic cases</th><th>Duplicate groups</th><th>Largest group</th></tr></thead><tbody><tr><td class="num">{{ total_rows }}</td><td class="num">{{ unique_cases }}</td><td class="num">{{ duplicate_groups }}</td><td class="num">{{ largest_duplicate_group }}</td></tr></tbody></table>
+  <p class="muted">Exact semantic duplicates remain visible descriptively but cannot multiply the inferential denominator. Conflicting repeated observations are excluded from inference and force an insufficient-evidence gate.</p>
+  <table><thead><tr><th>Captured rows</th><th>Evidence units</th><th>Inference denominator</th><th>Duplicate groups</th><th>Conflicting groups</th><th>Largest group</th></tr></thead><tbody><tr><td class="num">{{ total_rows }}</td><td class="num">{{ unique_cases }}</td><td class="num">{{ evidence_denominator }}</td><td class="num">{{ duplicate_groups }}</td><td class="num">{{ conflicting_groups }}</td><td class="num">{{ largest_duplicate_group }}</td></tr></tbody></table>
+  <p class="muted">Inference unit: <code>{{ inference_unit }}</code></p>
+
+  <h3>Descriptive execution totals</h3>
+  <p class="muted">All captured rows, including repeats. These values make no independence claim and are not used by the release gate.</p>
+  <table><thead><tr><th>Metric across all captured rows</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody>{% for row in descriptive_rows %}<tr><td>{{ row.label }}</td><td class="num">{{ row.baseline.count }}/{{ row.baseline.total }} · {{ row.baseline.percent }}</td><td class="num">{{ row.candidate.count }}/{{ row.candidate.total }} · {{ row.candidate.percent }}</td></tr>{% endfor %}</tbody></table>
 
   <h2>Deployment success versus semantic effect</h2>
   <p class="muted">The release gate uses complete-denominator deployment success. The semantic-only estimate includes only independent pairs where both primary outcomes explicitly resolved to true or false; operational failures are not relabeled as semantic errors.</p>
@@ -1482,7 +1646,9 @@ mod tests {
             run_id: "report-run".to_owned(),
             primary_outcome: "correct".to_owned(),
             baseline: variant.clone(),
-            candidate: variant,
+            candidate: variant.clone(),
+            descriptive_baseline: variant.clone(),
+            descriptive_candidate: variant,
             primary_jointly_scored: total,
             evidence: structtrace_core::artifact::EvidenceSummary {
                 total_rows: total,
@@ -1491,6 +1657,8 @@ mod tests {
                 largest_duplicate_group: usize::from(total > 0),
                 duplicate_case_rate: 0.0,
                 effective_gate_denominator: total,
+                conflicting_repeated_groups: 0,
+                inference_unit: "fingerprint:/input,/expected,/model_visible_metadata".to_owned(),
             },
             independent_paired: paired.clone(),
             independent_bootstrap: BootstrapInterval {
@@ -1508,6 +1676,7 @@ mod tests {
                 bootstrap: None,
             },
             matched_operational: Default::default(),
+            descriptive_matched_operational: Default::default(),
             paired,
             bootstrap: BootstrapInterval {
                 lower_pp: 0.0,

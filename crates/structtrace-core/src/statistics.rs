@@ -4,7 +4,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result};
+use crate::{
+    CoreError, Result,
+    config::{HARD_MAX_BOOTSTRAP_SAMPLES, HARD_MAX_BOOTSTRAP_WORK_UNITS},
+};
 
 /// Complete paired binary transition matrix and effect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -117,10 +120,18 @@ pub fn paired_bootstrap(
             "paired bootstrap requires at least one case".to_owned(),
         ));
     }
-    if samples == 0 || !(0.0..1.0).contains(&confidence) {
-        return Err(CoreError::Statistics(
-            "samples must be positive and confidence must be between 0 and 1".to_owned(),
-        ));
+    if samples == 0 || samples > HARD_MAX_BOOTSTRAP_SAMPLES || !(0.0..1.0).contains(&confidence) {
+        return Err(CoreError::Statistics(format!(
+            "samples must be between 1 and {HARD_MAX_BOOTSTRAP_SAMPLES}; confidence must be between 0 and 1"
+        )));
+    }
+    let work = samples
+        .checked_mul(pairs.len())
+        .ok_or_else(|| CoreError::Statistics("bootstrap work estimate overflowed".to_owned()))?;
+    if work > HARD_MAX_BOOTSTRAP_WORK_UNITS {
+        return Err(CoreError::Statistics(format!(
+            "bootstrap requires {work} resampling operations; hard limit is {HARD_MAX_BOOTSTRAP_WORK_UNITS}"
+        )));
     }
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut effects = Vec::with_capacity(samples);
@@ -185,6 +196,15 @@ mod tests {
             paired_bootstrap(&pairs, 1_000, 0.95, 17).unwrap(),
             paired_bootstrap(&pairs, 1_000, 0.95, 17).unwrap()
         );
+    }
+
+    #[test]
+    fn bootstrap_hard_limits_prevent_unbounded_allocation_and_work() {
+        let pairs = vec![(true, true); 101];
+        assert!(
+            paired_bootstrap(&[(true, true)], HARD_MAX_BOOTSTRAP_SAMPLES + 1, 0.95, 17).is_err()
+        );
+        assert!(paired_bootstrap(&pairs, HARD_MAX_BOOTSTRAP_SAMPLES, 0.95, 17).is_err());
     }
 
     proptest! {

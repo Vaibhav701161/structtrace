@@ -8,6 +8,7 @@ use crate::VARIANT_PROTOCOL;
 
 /// Request sent on subprocess standard input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VariantRequest {
     /// Protocol identity.
     pub protocol: String,
@@ -36,6 +37,7 @@ impl From<&VariantCase> for VariantRequest {
 
 /// Successful or failed subprocess response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VariantResponse {
     /// Protocol identity.
     pub protocol: String,
@@ -64,6 +66,7 @@ pub struct VariantResponse {
 
 /// Error returned through a subprocess protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolError {
     /// Stable application error category.
     pub kind: String,
@@ -89,14 +92,34 @@ pub fn validate_response(response: &VariantResponse, case_id: &str) -> anyhow::R
         response.case_id
     );
     match response.status.as_str() {
-        "ok" => anyhow::ensure!(
-            response.output.is_some() || response.raw_output.is_some(),
-            "successful response requires output or raw_output"
-        ),
-        "error" => anyhow::ensure!(
-            response.error.is_some(),
-            "error response requires an error envelope"
-        ),
+        "ok" => {
+            anyhow::ensure!(
+                response.output.is_some() || response.raw_output.is_some(),
+                "successful response requires output or raw_output"
+            );
+            anyhow::ensure!(
+                response.error.is_none(),
+                "successful response must not contain an error envelope"
+            );
+            if let (Some(output), Some(raw)) = (&response.output, &response.raw_output) {
+                let parsed: Value = serde_json::from_str(raw)
+                    .map_err(|error| anyhow::anyhow!("raw_output is not JSON: {error}"))?;
+                anyhow::ensure!(
+                    &parsed == output,
+                    "output and raw_output represent different JSON values"
+                );
+            }
+        }
+        "error" => {
+            anyhow::ensure!(
+                response.error.is_some(),
+                "error response requires an error envelope"
+            );
+            anyhow::ensure!(
+                response.output.is_none() && response.raw_output.is_none(),
+                "error response must not contain output or raw_output"
+            );
+        }
         other => anyhow::bail!("unsupported response status `{other}`"),
     }
     Ok(())
@@ -134,5 +157,30 @@ mod tests {
         let value = serde_json::to_value(VariantRequest::from(&case)).unwrap();
         assert!(value.get("expected").is_none());
         assert_eq!(value.pointer("/metadata/locale"), Some(&json!("en")));
+    }
+
+    #[test]
+    fn contradictory_and_unknown_response_fields_are_rejected() {
+        let contradictory: VariantResponse = serde_json::from_value(serde_json::json!({
+            "protocol": VARIANT_PROTOCOL,
+            "protocol_version": PROTOCOL_VERSION,
+            "case_id": "one",
+            "status": "ok",
+            "output": {"label": "yes"},
+            "raw_output": "{\"label\":\"no\"}"
+        }))
+        .unwrap();
+        assert!(validate_response(&contradictory, "one").is_err());
+        assert!(
+            serde_json::from_value::<VariantResponse>(serde_json::json!({
+                "protocol": VARIANT_PROTOCOL,
+                "protocol_version": PROTOCOL_VERSION,
+                "case_id": "one",
+                "status": "error",
+                "error": {"kind": "failed", "message": "safe"},
+                "unknown": true
+            }))
+            .is_err()
+        );
     }
 }

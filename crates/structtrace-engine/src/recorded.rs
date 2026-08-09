@@ -24,7 +24,7 @@ use structtrace_core::{
         FieldHotspot, MatchedOperationalSummary, PairedCaseRecord, RunManifest, RunStatus,
         RunSummary, SemanticEffectSummary, VariantSummary,
     },
-    config::{Config, EvaluatorKind, VariantConfig},
+    config::{Config, EvaluatorKind, EvidenceUnitConfig, VariantConfig},
     dataset::Dataset,
     evaluation::{
         EvaluationStatus, EvaluatorResult, OutcomeStatus, compile_schema,
@@ -708,9 +708,42 @@ pub(crate) fn build_summary(
     records: &[PairedCaseRecord],
 ) -> anyhow::Result<RunSummary> {
     let all_records = records.iter().collect::<Vec<_>>();
-    let baseline = variant_summary(&all_records, true, &config.analysis.primary_outcome);
-    let candidate = variant_summary(&all_records, false, &config.analysis.primary_outcome);
-    let matched_operational = matched_operational_summary(&all_records);
+    let descriptive_baseline =
+        variant_summary(&all_records, true, &config.analysis.primary_outcome);
+    let descriptive_candidate =
+        variant_summary(&all_records, false, &config.analysis.primary_outcome);
+    let descriptive_matched_operational = matched_operational_summary(&all_records);
+    let evidence_groups = semantic_evidence_groups(records, &config.dataset.evidence_unit)?;
+    let mut representative_records = Vec::new();
+    let mut conflicting_repeated_groups = 0usize;
+    for indices in evidence_groups.values() {
+        let signatures = indices
+            .iter()
+            .map(|index| analysis_signature(&records[*index]))
+            .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+        if signatures.len() > 1 {
+            conflicting_repeated_groups += 1;
+            continue;
+        }
+        representative_records.push(
+            indices
+                .iter()
+                .map(|index| &records[*index])
+                .min_by(|left, right| left.case.id.cmp(&right.case.id))
+                .expect("evidence group is non-empty"),
+        );
+    }
+    let baseline = variant_summary(
+        &representative_records,
+        true,
+        &config.analysis.primary_outcome,
+    );
+    let candidate = variant_summary(
+        &representative_records,
+        false,
+        &config.analysis.primary_outcome,
+    );
+    let matched_operational = matched_operational_summary(&representative_records);
     let evaluator_passes = config
         .evaluators
         .iter()
@@ -718,17 +751,16 @@ pub(crate) fn build_summary(
             (
                 evaluator.id.clone(),
                 EvaluatorComparison {
-                    baseline: evaluator_state_counts(records, &evaluator.id, true),
-                    candidate: evaluator_state_counts(records, &evaluator.id, false),
+                    baseline: evaluator_state_counts(&representative_records, &evaluator.id, true),
+                    candidate: evaluator_state_counts(
+                        &representative_records,
+                        &evaluator.id,
+                        false,
+                    ),
                 },
             )
         })
         .collect();
-    let evidence_groups = semantic_evidence_groups(records)?;
-    let representative_records = evidence_groups
-        .values()
-        .filter_map(|indices| indices.first().map(|index| &records[*index]))
-        .collect::<Vec<_>>();
     let independent_pairs = representative_records
         .iter()
         .map(|record| {
@@ -739,12 +771,22 @@ pub(crate) fn build_summary(
         })
         .collect::<Vec<_>>();
     let independent_paired = paired_metrics(&independent_pairs);
-    let independent_bootstrap = paired_bootstrap(
-        &independent_pairs,
-        config.analysis.bootstrap.samples,
-        config.analysis.bootstrap.confidence,
-        config.analysis.bootstrap.seed,
-    )?;
+    let independent_bootstrap = if independent_pairs.is_empty() {
+        structtrace_core::statistics::BootstrapInterval {
+            lower_pp: 0.0,
+            upper_pp: 0.0,
+            confidence: config.analysis.bootstrap.confidence,
+            samples: 0,
+            seed: config.analysis.bootstrap.seed,
+        }
+    } else {
+        paired_bootstrap(
+            &independent_pairs,
+            config.analysis.bootstrap.samples,
+            config.analysis.bootstrap.confidence,
+            config.analysis.bootstrap.seed,
+        )?
+    };
     let evidence = EvidenceSummary {
         total_rows: records.len(),
         unique_semantic_cases: evidence_groups.len(),
@@ -757,20 +799,11 @@ pub(crate) fn build_summary(
             records.len().saturating_sub(evidence_groups.len()),
             records.len(),
         ),
-        effective_gate_denominator: evidence_groups.len(),
+        effective_gate_denominator: representative_records.len(),
+        conflicting_repeated_groups,
+        inference_unit: evidence_unit_label(&config.dataset.evidence_unit),
     };
-    let independent_baseline = variant_summary(
-        &representative_records,
-        true,
-        &config.analysis.primary_outcome,
-    );
-    let independent_candidate = variant_summary(
-        &representative_records,
-        false,
-        &config.analysis.primary_outcome,
-    );
-    let independent_operational = matched_operational_summary(&representative_records);
-    let jointly_scored = count_jointly_scored(records.iter().map(|record| {
+    let jointly_scored = count_jointly_scored(representative_records.iter().map(|record| {
         (
             record
                 .baseline_evaluation
@@ -790,65 +823,50 @@ pub(crate) fn build_summary(
     let gate = evaluate_gate(
         &config.gate,
         &GateInputs {
-            total_cases: records.len(),
+            total_cases: evidence.effective_gate_denominator,
             unique_cases: evidence.unique_semantic_cases,
             duplicate_case_rate: evidence.duplicate_case_rate,
+            conflicting_repeated_groups: evidence.conflicting_repeated_groups,
             primary_scored_rate: rate(
                 jointly_scored_semantic.jointly_scored_cases,
                 evidence.effective_gate_denominator,
             ),
             primary_evaluator_error_rate: rate(
-                independent_baseline
-                    .primary_error
-                    .max(independent_candidate.primary_error),
+                baseline.primary_error.max(candidate.primary_error),
                 evidence.effective_gate_denominator,
             ),
             primary_not_applicable_rate: rate(
-                independent_baseline
+                baseline
                     .primary_not_applicable
-                    .max(independent_candidate.primary_not_applicable),
+                    .max(candidate.primary_not_applicable),
                 evidence.effective_gate_denominator,
             ),
             primary_unscored_rate: rate(
-                independent_baseline
-                    .primary_unscored
-                    .max(independent_candidate.primary_unscored),
+                baseline.primary_unscored.max(candidate.primary_unscored),
                 evidence.effective_gate_denominator,
             ),
             primary: &independent_paired,
-            baseline_valid_but_wrong_rate: rate(
-                independent_baseline.valid_but_wrong,
-                independent_baseline.total,
-            ),
-            candidate_valid_but_wrong_rate: rate(
-                independent_candidate.valid_but_wrong,
-                independent_candidate.total,
-            ),
-            candidate_schema_validity: rate(
-                independent_candidate.schema_valid,
-                independent_candidate.total,
-            ),
-            candidate_error_rate: rate(independent_candidate.errors, independent_candidate.total),
-            candidate_timeout_rate: rate(
-                independent_candidate.timeouts,
-                independent_candidate.total,
-            ),
-            baseline_p95_latency_ms: independent_operational.baseline_p95_latency_ms,
-            candidate_p95_latency_ms: independent_operational.candidate_p95_latency_ms,
+            baseline_valid_but_wrong_rate: rate(baseline.valid_but_wrong, baseline.total),
+            candidate_valid_but_wrong_rate: rate(candidate.valid_but_wrong, candidate.total),
+            candidate_schema_validity: rate(candidate.schema_valid, candidate.total),
+            candidate_error_rate: rate(candidate.errors, candidate.total),
+            candidate_timeout_rate: rate(candidate.timeouts, candidate.total),
+            baseline_p95_latency_ms: matched_operational.baseline_p95_latency_ms,
+            candidate_p95_latency_ms: matched_operational.candidate_p95_latency_ms,
             latency_coverage: rate(
-                independent_operational.latency_pairs,
+                matched_operational.latency_pairs,
                 evidence.effective_gate_denominator,
             ),
-            baseline_average_cost: independent_operational
+            baseline_average_cost: matched_operational
                 .baseline_average_cost
                 .as_deref()
                 .and_then(|value| value.parse().ok()),
-            candidate_average_cost: independent_operational
+            candidate_average_cost: matched_operational
                 .candidate_average_cost
                 .as_deref()
                 .and_then(|value| value.parse().ok()),
             cost_coverage: rate(
-                independent_operational.cost_pairs,
+                matched_operational.cost_pairs,
                 evidence.effective_gate_denominator,
             ),
         },
@@ -859,22 +877,26 @@ pub(crate) fn build_summary(
         primary_outcome: config.analysis.primary_outcome.clone(),
         baseline,
         candidate,
+        descriptive_baseline,
+        descriptive_candidate,
         primary_jointly_scored: jointly_scored,
         evidence,
         independent_paired: independent_paired.clone(),
         independent_bootstrap: independent_bootstrap.clone(),
         jointly_scored_semantic,
         matched_operational,
+        descriptive_matched_operational,
         paired: independent_paired.clone(),
         bootstrap: independent_bootstrap.clone(),
         gate,
         evaluator_passes,
-        field_hotspots: field_hotspots(config, records),
+        field_hotspots: field_hotspots(config, &representative_records),
     })
 }
 
 fn semantic_evidence_groups(
     records: &[PairedCaseRecord],
+    config: &EvidenceUnitConfig,
 ) -> anyhow::Result<BTreeMap<String, Vec<usize>>> {
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, record) in records.iter().enumerate() {
@@ -882,14 +904,75 @@ fn semantic_evidence_groups(
             "input": record.case.input,
             "expected": record.case.expected,
             "model_visible_metadata": record.case.model_visible_metadata,
-            "evaluation_metadata": record.case.metadata,
+            "metadata": record.case.metadata,
         });
+        let evidence_value = if let Some(pointer) = &config.pointer {
+            semantic_case.pointer(pointer).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "dataset.evidence_unit.pointer `{pointer}` did not resolve for case `{}`",
+                    record.case.id
+                )
+            })?
+        } else {
+            let include = config.include.clone().unwrap_or_else(|| {
+                vec![
+                    "/input".to_owned(),
+                    "/expected".to_owned(),
+                    "/model_visible_metadata".to_owned(),
+                ]
+            });
+            let mut selected = serde_json::Map::new();
+            for pointer in include {
+                let value = semantic_case.pointer(&pointer).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dataset.evidence_unit.include pointer `{pointer}` did not resolve for case `{}`",
+                        record.case.id
+                    )
+                })?;
+                selected.insert(pointer, value);
+            }
+            Value::Object(selected)
+        };
         groups
-            .entry(hash_canonical_json(&semantic_case)?)
+            .entry(hash_canonical_json(&evidence_value)?)
             .or_default()
             .push(index);
     }
     Ok(groups)
+}
+
+fn evidence_unit_label(config: &EvidenceUnitConfig) -> String {
+    if let Some(pointer) = &config.pointer {
+        format!("pointer:{pointer}")
+    } else if let Some(include) = &config.include {
+        format!("fingerprint:{}", include.join(","))
+    } else {
+        "fingerprint:/input,/expected,/model_visible_metadata".to_owned()
+    }
+}
+
+fn analysis_signature(record: &PairedCaseRecord) -> anyhow::Result<String> {
+    let mut baseline_evaluation = serde_json::to_value(&record.baseline_evaluation)?;
+    let mut candidate_evaluation = serde_json::to_value(&record.candidate_evaluation)?;
+    for evaluation in [&mut baseline_evaluation, &mut candidate_evaluation] {
+        if let Some(object) = evaluation.as_object_mut() {
+            object.remove("case_id");
+        }
+    }
+    let output_signature = |output: &structtrace_core::output::VariantOutput| {
+        serde_json::json!({
+            "status": output.status,
+            "raw_output": output.raw_output,
+            "parsed_output": output.parsed_output,
+            "error": output.error,
+        })
+    };
+    Ok(hash_canonical_json(&serde_json::json!({
+        "baseline_output": output_signature(&record.baseline_output),
+        "candidate_output": output_signature(&record.candidate_output),
+        "baseline_evaluation": baseline_evaluation,
+        "candidate_evaluation": candidate_evaluation,
+    }))?)
 }
 
 fn semantic_effect(
@@ -1113,7 +1196,7 @@ fn variant_summary(
     summary
 }
 
-fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHotspot> {
+fn field_hotspots(config: &Config, records: &[&PairedCaseRecord]) -> Vec<FieldHotspot> {
     let evaluator_ids = config
         .evaluators
         .iter()
@@ -1172,12 +1255,13 @@ fn field_statuses(
             continue;
         }
         for field in &result.fields {
+            let pointer = normalize_hotspot_pointer(&field.pointer);
             match field.status {
                 EvaluationStatus::Passed => {
-                    statuses.entry(field.pointer.clone()).or_insert(true);
+                    statuses.entry(pointer).or_insert(true);
                 }
                 EvaluationStatus::Failed => {
-                    statuses.insert(field.pointer.clone(), false);
+                    statuses.insert(pointer, false);
                 }
                 EvaluationStatus::Error | EvaluationStatus::NotApplicable => {}
             }
@@ -1186,8 +1270,22 @@ fn field_statuses(
     statuses
 }
 
+fn normalize_hotspot_pointer(pointer: &str) -> String {
+    pointer
+        .split('/')
+        .map(|segment| {
+            if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
+                "*"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn evaluator_state_counts(
-    records: &[PairedCaseRecord],
+    records: &[&PairedCaseRecord],
     evaluator_id: &str,
     baseline: bool,
 ) -> EvaluatorStateCounts {
@@ -1266,6 +1364,7 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
     format!(
         "# StructTrace run: {project_name}\n\n\
          **Release gate: {gate}**\n\n\
+         Independent evidence-unit results (used for inference and gate):\n\n\
          | Metric | Baseline | Candidate |\n\
          |---|---:|---:|\n\
          | Primary outcome | {}/{} | {}/{} |\n\
@@ -1273,8 +1372,12 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
          | Schema valid | {}/{} | {}/{} |\n\
          | Valid but wrong | {}/{} | {}/{} |\n\n\
          Total rows: **{}**  \n\
-         Unique semantic cases: **{}**  \n\
+         Configured evidence units: **{}**  \n\
          Exact duplicate groups: **{}**  \n\
+         Conflicting repeated groups: **{}**  \n\
+         Effective inference denominator: **{}**  \n\
+         Inference unit: **{}**  \n\
+         Descriptive all-row primary results: baseline **{}/{}**, candidate **{}/{}** (no independence claim)  \n\
          Independent paired difference: **{:+.2} percentage points**  \n\
          Candidate-only wins: **{}**  \n\
          Baseline-only wins: **{}**  \n\
@@ -1301,6 +1404,13 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
         summary.evidence.total_rows,
         summary.evidence.unique_semantic_cases,
         summary.evidence.exact_duplicate_groups,
+        summary.evidence.conflicting_repeated_groups,
+        summary.evidence.effective_gate_denominator,
+        summary.evidence.inference_unit,
+        summary.descriptive_baseline.primary_pass,
+        summary.descriptive_baseline.total,
+        summary.descriptive_candidate.primary_pass,
+        summary.descriptive_candidate.total,
         summary.paired.difference_pp,
         summary.paired.candidate_only_pass,
         summary.paired.baseline_only_pass,
@@ -1804,7 +1914,7 @@ analysis:
         let mut outputs = String::new();
         for index in 0..1000 {
             dataset.push_str(&format!(
-                "{{\"id\":\"case-{index:04}\",\"input\":{{}},\"expected\":{{\"label\":\"yes\"}}}}\n"
+                "{{\"id\":\"case-{index:04}\",\"input\":{{\"sequence\":{index}}},\"expected\":{{\"label\":\"yes\"}}}}\n"
             ));
             outputs.push_str(&format!(
                 "{{\"case_id\":\"case-{index:04}\",\"status\":\"ok\",\"raw_output\":\"{{\\\"label\\\":\\\"yes\\\"}}\"}}\n"
@@ -1909,11 +2019,109 @@ gate:
         assert_eq!(run.summary.paired.baseline_only_pass, 1);
         assert_eq!(
             run.summary.gate.status,
-            structtrace_core::gate::GateStatus::Failed
+            structtrace_core::gate::GateStatus::InsufficientEvidence
         );
         assert!(run.summary.gate.rules.iter().any(|rule| {
             rule.rule == "min_unique_cases"
                 && rule.status == structtrace_core::gate::GateRuleStatus::InsufficientEvidence
         }));
+    }
+
+    #[test]
+    fn conflicting_duplicate_evidence_is_order_invariant_and_blocks_gate() {
+        fn execute(dataset_rows: &str) -> RunSummary {
+            let root = tempdir().unwrap();
+            write(&root.path().join("data.jsonl"), dataset_rows);
+            write(
+                &root.path().join("baseline.jsonl"),
+                "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\"}\n{\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"no\\\"}\"}\n",
+            );
+            write(
+                &root.path().join("candidate.jsonl"),
+                "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"no\\\"}\"}\n{\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\"}\n",
+            );
+            write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+            write(
+                &root.path().join("structtrace.yaml"),
+                r#"version: 1
+project: {name: conflict-audit}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: label, kind: json_pointer_exact, pointer: /label, expected_pointer: /label}
+outcomes: {correct: {all_of: [label]}}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+gate:
+  min_cases: 1
+  min_unique_cases: 1
+  max_duplicate_case_rate: 1
+  min_primary_scored_rate: 1
+  max_primary_evaluator_error_rate: 0
+  max_primary_not_applicable_rate: 0
+  max_primary_unscored_rate: 0
+  max_primary_regression_pp: 0
+"#,
+            );
+            run_recorded(root.path(), Path::new("structtrace.yaml"))
+                .unwrap()
+                .summary
+        }
+
+        let a_first = execute(
+            "{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n",
+        );
+        let b_first = execute(
+            "{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n",
+        );
+        for summary in [&a_first, &b_first] {
+            assert_eq!(summary.evidence.conflicting_repeated_groups, 1);
+            assert_eq!(summary.evidence.effective_gate_denominator, 0);
+            assert_eq!(summary.paired.total, 0);
+            assert_eq!(
+                summary.gate.status,
+                structtrace_core::gate::GateStatus::InsufficientEvidence
+            );
+        }
+        assert_eq!(a_first.paired, b_first.paired);
+        assert_eq!(a_first.bootstrap, b_first.bootstrap);
+        assert_eq!(a_first.gate, b_first.gate);
+    }
+
+    #[test]
+    fn operational_metadata_does_not_manufacture_independent_evidence() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"},\"metadata\":{\"trace_id\":\"one\",\"timestamp\":\"2026-01-01\"}}\n{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"},\"metadata\":{\"trace_id\":\"two\",\"timestamp\":\"2026-01-02\"}}\n",
+        );
+        let outputs = "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\",\"latency_ms\":10}\n{\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\",\"latency_ms\":900}\n";
+        write(&root.path().join("baseline.jsonl"), outputs);
+        write(&root.path().join("candidate.jsonl"), outputs);
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 1
+project: {name: metadata-audit}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: label, kind: json_pointer_exact, pointer: /label, expected_pointer: /label}
+outcomes: {correct: {all_of: [label]}}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+"#,
+        );
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        assert_eq!(run.summary.evidence.total_rows, 2);
+        assert_eq!(run.summary.evidence.unique_semantic_cases, 1);
+        assert_eq!(run.summary.evidence.conflicting_repeated_groups, 0);
+        assert_eq!(run.summary.paired.total, 1);
+        assert_eq!(run.summary.descriptive_baseline.total, 2);
+        assert_eq!(run.summary.baseline.total, 1);
     }
 }

@@ -5,8 +5,18 @@ here.
 
 ## Unreleased
 
-- Advance the artifact format to version 5 for duplicate-aware evidence summaries, independent
-  paired inference, and a separately reported jointly scored semantic effect.
+- Advance the artifact format to version 6 with explicit evidence units, row-order-invariant
+  conflict handling, one denominator for primary report blocks, and separate descriptive totals.
+- Replace dataset IDs at live adapter boundaries with opaque execution tokens and remove IDs from
+  Python callable and OpenAI prompt contexts; make strict doctor fail expected-leaf and ID leakage.
+- Cap bootstrap samples and total resampling work; split normalized research evidence into three
+  non-pooled runs; reject ambiguous DMY/MDY policies and empty keyed-array field specifications.
+- Support async Python callables, per-case serialization/protocol errors, sanitized exceptions,
+  custom-evaluator field facts, strict output envelopes, and normalized array hotspot paths.
+- Stream file hashing, reuse configured replay limits, complete SQLite case provenance, reject
+  unbound report assets, add report CSP, and make browser-open failure non-fatal.
+- Add explicit implementation source/digest bindings and exact versus aggressive text-redaction
+  policies with custom literal patterns.
 - Remove the pseudo-replicated 120-row invoice demo; the twelve unique fixtures now remain an
   explicitly insufficient-evidence workflow demonstration.
 - Reject overlapping dataset pointers, unsafe per-case external evaluators, symlinked artifacts,

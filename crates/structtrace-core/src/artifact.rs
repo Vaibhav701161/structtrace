@@ -262,11 +262,15 @@ pub struct RunSummary {
     pub run_id: String,
     /// Primary outcome name.
     pub primary_outcome: String,
-    /// Baseline aggregate.
+    /// Baseline aggregate over independent, non-conflicting evidence units.
     pub baseline: VariantSummary,
-    /// Candidate aggregate.
+    /// Candidate aggregate over independent, non-conflicting evidence units.
     pub candidate: VariantSummary,
-    /// Cases with an explicit binary primary outcome for both variants.
+    /// Baseline aggregate over every captured row, with no independence claim.
+    pub descriptive_baseline: VariantSummary,
+    /// Candidate aggregate over every captured row, with no independence claim.
+    pub descriptive_candidate: VariantSummary,
+    /// Evidence units with an explicit binary primary outcome for both variants.
     #[serde(default)]
     pub primary_jointly_scored: usize,
     /// Dataset independence audit used by inferential statistics and gates.
@@ -280,6 +284,8 @@ pub struct RunSummary {
     /// Pair-matched operational measurements used by operational gates.
     #[serde(default)]
     pub matched_operational: MatchedOperationalSummary,
+    /// Operational measurements over every captured row, for description only.
+    pub descriptive_matched_operational: MatchedOperationalSummary,
     /// Paired primary transition matrix and effect.
     pub paired: PairedMetrics,
     /// Seeded paired bootstrap interval.
@@ -301,12 +307,16 @@ pub struct EvidenceSummary {
     pub unique_semantic_cases: usize,
     /// Number of fingerprints represented by more than one row.
     pub exact_duplicate_groups: usize,
-    /// Largest number of rows sharing one semantic fingerprint.
+    /// Largest number of rows sharing one configured evidence unit.
     pub largest_duplicate_group: usize,
     /// Fraction of rows beyond the first member of each fingerprint group.
     pub duplicate_case_rate: f64,
     /// Denominator used by independent paired inference and evidence gates.
     pub effective_gate_denominator: usize,
+    /// Repeated evidence groups whose retained observations disagree.
+    pub conflicting_repeated_groups: usize,
+    /// Human-readable configured inference-unit definition.
+    pub inference_unit: String,
 }
 
 /// Semantic-only paired analysis, separate from complete-denominator deployment success.

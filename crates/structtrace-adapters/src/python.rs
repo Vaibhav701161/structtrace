@@ -126,7 +126,14 @@ mod tests {
             run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
             Some("python_exception")
         );
-        assert!(String::from_utf8_lossy(&run.stderr).contains("RuntimeError"));
+        assert!(run.stderr.is_empty());
+        assert_eq!(
+            run.rows[0]
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("RuntimeError")
+        );
     }
 
     #[tokio::test]
@@ -151,9 +158,52 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(run.rows[0].raw_output.as_deref().unwrap()).unwrap();
         assert_eq!(parsed.pointer("/has_expected"), Some(&json!(false)));
+        assert_eq!(parsed.pointer("/keys"), Some(&json!(["input", "metadata"])));
+    }
+
+    #[tokio::test]
+    async fn async_and_nonserializable_results_are_isolated_per_case() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("bridge.py"), BRIDGE_SOURCE).unwrap();
+        fs::write(
+            root.path().join("app.py"),
+            "async def async_ok(case):\n    return {'label': case['input']['text']}\n\ndef mixed(case):\n    return {1, 2} if case['input']['text'] == 'hello' else {'label': 'ok'}\n",
+        )
+        .unwrap();
+        let async_run = run_python(
+            python_program(),
+            "app:async_ok",
+            1_000,
+            &[case()],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert_eq!(async_run.rows[0].status, OutputStatus::Ok);
+
+        let mut second = case();
+        second.id = "two".to_owned();
+        second.input = json!({"text": "later"});
+        let mixed = run_python(
+            python_program(),
+            "app:mixed",
+            1_000,
+            &[case(), second],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert_eq!(mixed.rows[0].status, OutputStatus::Error);
         assert_eq!(
-            parsed.pointer("/keys"),
-            Some(&json!(["id", "input", "metadata"]))
+            mixed.rows[0]
+                .error
+                .as_ref()
+                .map(|error| error.kind.as_str()),
+            Some("non_serializable_output")
         );
+        assert_eq!(mixed.rows[1].status, OutputStatus::Ok);
+        assert!(mixed.stderr.is_empty());
     }
 }

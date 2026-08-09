@@ -454,7 +454,6 @@ fn render_prompt(template: &str, case: &VariantCase) -> anyhow::Result<String> {
     Ok(environment.render_str(
         template,
         context! {
-            id => case.id,
             input => case.input,
             metadata => case.metadata,
         },
@@ -652,6 +651,7 @@ mod tests {
     #[test]
     fn openai_template_cannot_access_expected() {
         assert!(render_prompt("{{ expected }}", &case()).is_err());
+        assert!(render_prompt("{{ id }}", &case()).is_err());
     }
 
     #[tokio::test]

@@ -62,6 +62,7 @@ pub struct EvaluatorResult {
 
 /// One resolved field comparison used for truthful hotspot attribution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FieldEvaluationFact {
     /// Output JSON Pointer.
     pub pointer: String,
@@ -1499,27 +1500,43 @@ fn compose_outcome(
         .iter()
         .filter_map(|id| results.get(id))
         .collect::<Vec<_>>();
-    if selected.len() != ids.len()
-        || selected
-            .iter()
-            .any(|result| result.status == EvaluationStatus::Error)
-    {
+    if selected.len() != ids.len() {
         return OutcomeStatus::Error;
     }
-    if selected
+    if !config.all_of.is_empty() {
+        if selected
+            .iter()
+            .any(|result| result.status == EvaluationStatus::Failed)
+        {
+            OutcomeStatus::False
+        } else if selected
+            .iter()
+            .any(|result| result.status == EvaluationStatus::Error)
+        {
+            OutcomeStatus::Error
+        } else if selected
+            .iter()
+            .any(|result| result.status == EvaluationStatus::NotApplicable)
+        {
+            OutcomeStatus::NotApplicable
+        } else {
+            OutcomeStatus::True
+        }
+    } else if selected
+        .iter()
+        .any(|result| result.status == EvaluationStatus::Passed)
+    {
+        OutcomeStatus::True
+    } else if selected
+        .iter()
+        .any(|result| result.status == EvaluationStatus::Error)
+    {
+        OutcomeStatus::Error
+    } else if selected
         .iter()
         .all(|result| result.status == EvaluationStatus::NotApplicable)
     {
-        return OutcomeStatus::NotApplicable;
-    }
-    if !config.all_of.is_empty() {
-        if selected.iter().all(|result| result.passed) {
-            OutcomeStatus::True
-        } else {
-            OutcomeStatus::False
-        }
-    } else if selected.iter().any(|result| result.passed) {
-        OutcomeStatus::True
+        OutcomeStatus::NotApplicable
     } else {
         OutcomeStatus::False
     }
@@ -1539,6 +1556,51 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn any_of_true_dominates_error_and_truth_table_is_explicit() {
+        let config = OutcomeConfig {
+            all_of: Vec::new(),
+            any_of: vec!["a".to_owned(), "b".to_owned()],
+        };
+        let result = |id: &str, status| EvaluatorResult {
+            evaluator_id: id.to_owned(),
+            status,
+            passed: status == EvaluationStatus::Passed,
+            score: None,
+            message: String::new(),
+            details: Value::Null,
+            fields: Vec::new(),
+        };
+        for (left, right, expected) in [
+            (
+                EvaluationStatus::Passed,
+                EvaluationStatus::Error,
+                OutcomeStatus::True,
+            ),
+            (
+                EvaluationStatus::Failed,
+                EvaluationStatus::Error,
+                OutcomeStatus::Error,
+            ),
+            (
+                EvaluationStatus::Failed,
+                EvaluationStatus::NotApplicable,
+                OutcomeStatus::False,
+            ),
+            (
+                EvaluationStatus::NotApplicable,
+                EvaluationStatus::NotApplicable,
+                OutcomeStatus::NotApplicable,
+            ),
+        ] {
+            let results = BTreeMap::from([
+                ("a".to_owned(), result("a", left)),
+                ("b".to_owned(), result("b", right)),
+            ]);
+            assert_eq!(compose_outcome(&config, &results), expected);
+        }
+    }
 
     fn output(raw: &str) -> VariantOutput {
         serde_json::from_value(json!({

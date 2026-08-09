@@ -38,7 +38,7 @@ pub struct Case {
 /// adapter cannot leak them accidentally through serialization or templates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VariantCase {
-    /// Matched case ID.
+    /// Opaque transport token. This is never the dataset case ID.
     pub id: String,
     /// Model or application input.
     pub input: Value,
@@ -50,7 +50,7 @@ pub struct VariantCase {
 impl From<&Case> for VariantCase {
     fn from(case: &Case) -> Self {
         Self {
-            id: case.id.clone(),
+            id: format!("stx-{}", &hash_bytes(case.id.as_bytes())[..24]),
             input: case.input.clone(),
             metadata: case.model_visible_metadata.clone(),
         }

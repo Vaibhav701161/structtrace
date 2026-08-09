@@ -243,19 +243,47 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
     }
     for (variant_id, variant) in &config.variants {
         match variant {
-            VariantConfig::Command { command, .. } => {
-                let path = resolve(project_root, Path::new(&command.program));
-                if path.is_file() {
+            VariantConfig::Command {
+                command,
+                implementation,
+                ..
+            } => {
+                if let Some(path) = resolve_executable(project_root, &command.program) {
                     sources.insert(format!("variant:{variant_id}:program"), hash_file(&path)?);
                 }
+                for (index, argument) in command.args.iter().enumerate() {
+                    let path = resolve(project_root, Path::new(argument));
+                    if path.is_file() {
+                        sources.insert(
+                            format!("variant:{variant_id}:argument:{index}"),
+                            hash_file(&path)?,
+                        );
+                    }
+                }
+                bind_declared_implementation(
+                    project_root,
+                    &format!("variant:{variant_id}"),
+                    implementation,
+                    &mut sources,
+                )?;
             }
-            VariantConfig::Python { callable, .. } => {
+            VariantConfig::Python {
+                callable,
+                implementation,
+                ..
+            } => {
                 if let Some((module, _)) = callable.split_once(':') {
                     let path = project_root.join(format!("{}.py", module.replace('.', "/")));
                     if path.is_file() {
                         sources.insert(format!("variant:{variant_id}:python"), hash_file(&path)?);
                     }
                 }
+                bind_declared_implementation(
+                    project_root,
+                    &format!("variant:{variant_id}"),
+                    implementation,
+                    &mut sources,
+                )?;
             }
             VariantConfig::Recorded { .. } | VariantConfig::OpenaiCompatible(_) => {}
         }
@@ -350,6 +378,48 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
         "binary": env!("CARGO_PKG_VERSION"),
     }))
     .map_err(Into::into)
+}
+
+fn resolve_executable(project_root: &Path, program: &str) -> Option<PathBuf> {
+    let configured = resolve(project_root, Path::new(program));
+    if configured.is_file() {
+        return Some(configured);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(program))
+            .find(|path| path.is_file())
+    })
+}
+
+fn bind_declared_implementation(
+    project_root: &Path,
+    label: &str,
+    implementation: &structtrace_core::config::ImplementationConfig,
+    output: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    if let Some(digest) = &implementation.digest {
+        output.insert(format!("{label}:declared-digest"), digest.clone());
+    }
+    for (index, source) in implementation.sources.iter().enumerate() {
+        let path = resolve(project_root, source);
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "declared implementation source is missing: {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "declared implementation source must be a regular non-symlink file: {}",
+            path.display()
+        );
+        output.insert(
+            format!("{label}:declared-source:{index}"),
+            hash_file(&path)?,
+        );
+    }
+    Ok(())
 }
 
 fn collect_project_python_sources(
@@ -526,6 +596,7 @@ async fn prepare_variant(
             command,
             process_mode,
             timeout_ms,
+            ..
         } => {
             let run = run_command(
                 command,
@@ -539,12 +610,16 @@ async fn prepare_variant(
                 },
             )
             .await;
-            from_adapter(format!("command:{name}:{}", command.program), run)
+            from_adapter(
+                format!("command:{name}:{}", command.program),
+                remap_adapter_outputs(run, dataset)?,
+            )
         }
         VariantConfig::Python {
             interpreter,
             callable,
             timeout_ms,
+            ..
         } => {
             let run = run_python(
                 interpreter,
@@ -559,7 +634,10 @@ async fn prepare_variant(
                 },
             )
             .await;
-            from_adapter(format!("python:{name}:{callable}"), run)
+            from_adapter(
+                format!("python:{name}:{callable}"),
+                remap_adapter_outputs(run, dataset)?,
+            )
         }
         VariantConfig::OpenaiCompatible(adapter) => {
             let output_schema = match adapter
@@ -592,9 +670,31 @@ async fn prepare_variant(
                 limits.max_output_bytes_per_case,
             )
             .await;
-            from_adapter(format!("openai_compatible:{name}:{}", adapter.model), run)
+            from_adapter(
+                format!("openai_compatible:{name}:{}", adapter.model),
+                remap_adapter_outputs(run, dataset)?,
+            )
         }
     }
+}
+
+fn remap_adapter_outputs(mut run: AdapterRun, dataset: &Dataset) -> anyhow::Result<AdapterRun> {
+    anyhow::ensure!(
+        run.rows.len() == dataset.cases.len(),
+        "adapter returned {} rows for {} dataset cases",
+        run.rows.len(),
+        dataset.cases.len()
+    );
+    for (ordinal, (row, case)) in run.rows.iter_mut().zip(&dataset.cases).enumerate() {
+        let expected_token = VariantCase::from(case).id;
+        anyhow::ensure!(
+            row.case_id == expected_token,
+            "adapter row {} returned an unexpected opaque execution token",
+            ordinal + 1
+        );
+        row.case_id.clone_from(&case.id);
+    }
+    Ok(run)
 }
 
 fn from_adapter(source_label: String, run: AdapterRun) -> anyhow::Result<PreparedVariant> {
@@ -772,6 +872,44 @@ mod tests {
         assert!(error.to_string().contains("implementation fingerprint"));
     }
 
+    #[test]
+    fn opaque_adapter_token_maps_back_without_exposing_dataset_id() {
+        let case = Case {
+            id: "gold-positive-001".to_owned(),
+            input: json!({"text": "hello"}),
+            expected: Some(json!({"label": "positive"})),
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let dataset = Dataset {
+            cases: vec![case.clone()],
+            source_hash: String::new(),
+            source_bytes: Vec::new(),
+        };
+        let token = VariantCase::from(&case).id;
+        assert_ne!(token, case.id);
+        assert!(!token.contains("positive"));
+        let run = AdapterRun {
+            rows: vec![structtrace_core::output::VariantOutput {
+                case_id: token,
+                status: structtrace_core::output::OutputStatus::Ok,
+                raw_output: Some("{}".to_owned()),
+                parsed_output: None,
+                error: None,
+                latency_ms: None,
+                usage: None,
+                cost: None,
+                metadata: Value::Null,
+                retries: Vec::new(),
+            }],
+            stderr: Vec::new(),
+            protocol_errors: Vec::new(),
+        };
+        let remapped = remap_adapter_outputs(run, &dataset).unwrap();
+        assert_eq!(remapped.rows[0].case_id, case.id);
+    }
+
     #[tokio::test]
     async fn allocated_run_is_marked_failed_when_preparation_returns_an_error() {
         let root = tempdir().unwrap();
@@ -907,6 +1045,7 @@ analysis: {{primary_outcome: correct}}
             },
             process_mode: ProcessMode::Persistent,
             timeout_ms: 10,
+            implementation: Default::default(),
         };
         let restored = prepare_or_restore(
             root.path(),

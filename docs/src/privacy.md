@@ -16,9 +16,11 @@ Disable portable raw-output retention and configure shareable-report redaction:
 storage:
   retain_raw_outputs: false
   redaction:
+    text_mode: exact_structured
     json_pointers:
       - /input/customer_email
       - /input/phone
+    custom_patterns: [tenant-secret-prefix]
 ```
 
 Raw retention is enforced before output JSONL and paired case artifacts are finalized. Full
@@ -29,6 +31,12 @@ evaluation-only metadata. Selected values and their echoes in output, evaluator 
 response bodies, retry records, search indexes, and filters are replaced with `[REDACTED]`.
 Provider HTTP error bodies are never copied into user-facing error messages when response retention
 is disabled. Disabling raw retention reduces case-level debugging.
+
+`exact_structured` redacts typed values exactly and replaces distinctive text echoes while avoiding
+destructive replacement of every `0`, `1`, `true`, or short number. Select `aggressive_textual` to
+replace short scalar substrings too, and use `custom_patterns` for known tenant-specific secret
+forms. The aggressive mode can remove innocent text; the exact mode cannot guarantee removal of a
+short secret embedded inside a longer sentence. This tradeoff is explicit rather than implied.
 
 `limits.max_report_raw_bytes_per_case` separately bounds how much retained raw output can be embedded for each variant in the HTML report. Truncation is display-only and is marked explicitly in the case view.
 

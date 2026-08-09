@@ -276,10 +276,28 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             Ok(0)
         }
         Commands::Demo { demo, open } => {
+            if matches!(demo, DemoKind::Research) {
+                let research = bundled_demo::run_research(&cli.project_root)?;
+                for run in &research.runs {
+                    print_completed(cli, run)?;
+                }
+                if !cli.quiet {
+                    println!(
+                        "Research index (no pooled effect): {}",
+                        research.index_path.display()
+                    );
+                    if *open {
+                        println!(
+                            "Open one study report by its run ID; StructTrace deliberately does not serve a pooled research report."
+                        );
+                    }
+                }
+                return Ok(0);
+            }
             let run = match demo {
                 DemoKind::Invoice => bundled_demo::run_invoice(&cli.project_root)?,
                 DemoKind::SupportTicket => bundled_demo::run_support_ticket(&cli.project_root)?,
-                DemoKind::Research => bundled_demo::run_research(&cli.project_root)?,
+                DemoKind::Research => unreachable!("handled above"),
             };
             print_completed(cli, &run)?;
             if *open {
@@ -393,11 +411,23 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             run,
             research_fixture,
         } => {
-            let run_dir = if *research_fixture {
-                bundled_demo::run_research(&cli.project_root)?.run_dir
-            } else {
-                resolve_run(cli, run)?
-            };
+            if *research_fixture {
+                let research = bundled_demo::run_research(&cli.project_root)?;
+                let reports = research
+                    .runs
+                    .iter()
+                    .map(|run| structtrace_engine::replay_run(&run.run_dir))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    reports.iter().all(|report| report.verified),
+                    "one or more separate research fixtures failed replay"
+                );
+                if !cli.quiet {
+                    println!("{}", serde_json::to_string_pretty(&reports)?);
+                }
+                return Ok(0);
+            }
+            let run_dir = resolve_run(cli, run)?;
             ensure_complete(&run_dir)?;
             let report = structtrace_engine::replay_run(&run_dir)?;
             if !cli.quiet {
@@ -810,24 +840,30 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                         }));
                         let mut fingerprints = std::collections::BTreeMap::<String, usize>::new();
                         let mut visible_gold_matches = 0usize;
+                        let mut suspicious_case_ids = 0usize;
                         for case in &dataset.cases {
-                            let semantic = serde_json::json!({
-                                "input": case.input,
-                                "expected": case.expected,
-                                "model_visible_metadata": case.model_visible_metadata,
-                                "evaluation_metadata": case.metadata,
-                            });
+                            let semantic =
+                                evidence_unit_value(case, &config.dataset.evidence_unit)?;
                             let fingerprint =
                                 structtrace_core::hashing::hash_canonical_json(&semantic)?;
                             *fingerprints.entry(fingerprint).or_default() += 1;
-                            if case.expected.as_ref().is_some_and(|expected| {
-                                json_contains(&case.input, expected)
-                                    || case
-                                        .model_visible_metadata
-                                        .as_ref()
-                                        .is_some_and(|metadata| json_contains(metadata, expected))
-                            }) {
-                                visible_gold_matches += 1;
+                            if let Some(expected) = &case.expected {
+                                let leaves = scalar_leaves(expected);
+                                if leaves.iter().any(|leaf| {
+                                    json_contains(&case.input, leaf)
+                                        || case
+                                            .model_visible_metadata
+                                            .as_ref()
+                                            .is_some_and(|metadata| json_contains(metadata, leaf))
+                                }) {
+                                    visible_gold_matches += 1;
+                                }
+                                if leaves
+                                    .iter()
+                                    .any(|leaf| case_id_contains_label(&case.id, leaf))
+                                {
+                                    suspicious_case_ids += 1;
+                                }
                             }
                         }
                         let duplicate_rows = dataset.cases.len().saturating_sub(fingerprints.len());
@@ -840,11 +876,36 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                             "detail": {"total_rows": dataset.cases.len(), "unique_semantic_cases": fingerprints.len(), "duplicate_rows": duplicate_rows}
                         }));
                         let leakage_passed = visible_gold_matches == 0;
+                        passed &= !strict || (leakage_passed && suspicious_case_ids == 0);
                         checks.push(serde_json::json!({
                             "check": "golden_value_isolation",
-                            "passed": leakage_passed,
-                            "required": false,
-                            "detail": {"model_visible_exact_gold_matches": visible_gold_matches}
+                            "passed": leakage_passed && suspicious_case_ids == 0,
+                            "required": strict,
+                            "detail": {
+                                "model_visible_expected_leaf_matches": visible_gold_matches,
+                                "suspicious_label_bearing_case_ids": suspicious_case_ids
+                            }
+                        }));
+                        let bootstrap_work = config
+                            .analysis
+                            .bootstrap
+                            .samples
+                            .checked_mul(fingerprints.len());
+                        let bootstrap_safe = bootstrap_work.is_some_and(|work| {
+                            work <= structtrace_core::config::HARD_MAX_BOOTSTRAP_WORK_UNITS
+                        });
+                        passed &= !strict || bootstrap_safe;
+                        checks.push(serde_json::json!({
+                            "check": "bootstrap_resource_budget",
+                            "passed": bootstrap_safe,
+                            "required": strict,
+                            "detail": {
+                                "samples": config.analysis.bootstrap.samples,
+                                "evidence_units": fingerprints.len(),
+                                "estimated_resampling_operations": bootstrap_work,
+                                "hard_work_limit": structtrace_core::config::HARD_MAX_BOOTSTRAP_WORK_UNITS,
+                                "estimated_result_bytes": config.analysis.bootstrap.samples.saturating_mul(std::mem::size_of::<f64>())
+                            }
                         }));
                     }
                     Err(error) => {
@@ -977,9 +1038,17 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                 }
                 checks.push(serde_json::json!({
                     "check": "report_browser",
-                    "passed": true,
+                    "passed": null,
                     "required": false,
+                    "status": "not_checked",
                     "detail": "Browser launch is optional; reports can always be opened or exported by path."
+                }));
+                checks.push(serde_json::json!({
+                    "check": "one_case_adapter_handshake",
+                    "passed": null,
+                    "required": false,
+                    "status": "not_checked",
+                    "detail": "Doctor does not invoke user applications or network providers without an explicit run command."
                 }));
             }
             Err(error) => {
@@ -1031,7 +1100,9 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                 );
                 println!();
                 for check in &checks {
-                    let state = if check["passed"].as_bool() == Some(true) {
+                    let state = if check["status"].as_str() == Some("not_checked") {
+                        "NOT CHECKED"
+                    } else if check["passed"].as_bool() == Some(true) {
                         "PASS"
                     } else if check["required"].as_bool() == Some(false) {
                         "WARNING"
@@ -1076,6 +1147,70 @@ fn json_contains(haystack: &serde_json::Value, needle: &serde_json::Value) -> bo
             }
             _ => false,
         }
+}
+
+fn scalar_leaves(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => values.iter().flat_map(scalar_leaves).collect(),
+        serde_json::Value::Object(values) => values.values().flat_map(scalar_leaves).collect(),
+        serde_json::Value::Null => Vec::new(),
+        scalar => vec![scalar.clone()],
+    }
+}
+
+fn case_id_contains_label(case_id: &str, value: &serde_json::Value) -> bool {
+    let label = match value {
+        serde_json::Value::String(value) => value.trim().to_lowercase(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => return false,
+    };
+    if label.is_empty() {
+        return false;
+    }
+    let normalized_id = case_id.to_lowercase();
+    normalized_id == label
+        || normalized_id
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|token| token == label)
+}
+
+fn evidence_unit_value(
+    case: &structtrace_core::dataset::Case,
+    config: &structtrace_core::config::EvidenceUnitConfig,
+) -> anyhow::Result<serde_json::Value> {
+    let envelope = serde_json::json!({
+        "input": case.input,
+        "expected": case.expected,
+        "model_visible_metadata": case.model_visible_metadata,
+        "metadata": case.metadata,
+    });
+    if let Some(pointer) = &config.pointer {
+        return envelope.pointer(pointer).cloned().with_context(|| {
+            format!(
+                "evidence-unit pointer `{pointer}` did not resolve for `{}`",
+                case.id
+            )
+        });
+    }
+    let include = config.include.clone().unwrap_or_else(|| {
+        vec![
+            "/input".to_owned(),
+            "/expected".to_owned(),
+            "/model_visible_metadata".to_owned(),
+        ]
+    });
+    let mut selected = serde_json::Map::new();
+    for pointer in include {
+        let value = envelope.pointer(&pointer).cloned().with_context(|| {
+            format!(
+                "evidence-unit pointer `{pointer}` did not resolve for `{}`",
+                case.id
+            )
+        })?;
+        selected.insert(pointer, value);
+    }
+    Ok(serde_json::Value::Object(selected))
 }
 
 fn writable_directory(path: &Path) -> anyhow::Result<()> {

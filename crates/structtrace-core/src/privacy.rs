@@ -32,6 +32,16 @@ pub fn selected_values(value: &Value, pointers: &[String]) -> Vec<Value> {
 
 /// Recursively replace values equal to any selected secret, including evaluator echoes.
 pub fn redact_matching_values(value: &mut Value, secrets: &[Value]) {
+    redact_matching_values_with_policy(value, secrets, false, &[]);
+}
+
+/// Recursively redact values with an explicit free-form text policy.
+pub fn redact_matching_values_with_policy(
+    value: &mut Value,
+    secrets: &[Value],
+    aggressive: bool,
+    custom_patterns: &[String],
+) {
     if secrets.iter().any(|secret| secret == value) {
         *value = Value::String(REDACTION_MARKER.to_owned());
         return;
@@ -39,16 +49,16 @@ pub fn redact_matching_values(value: &mut Value, secrets: &[Value]) {
     match value {
         Value::Array(items) => {
             for item in items {
-                redact_matching_values(item, secrets);
+                redact_matching_values_with_policy(item, secrets, aggressive, custom_patterns);
             }
         }
         Value::Object(map) => {
             for item in map.values_mut() {
-                redact_matching_values(item, secrets);
+                redact_matching_values_with_policy(item, secrets, aggressive, custom_patterns);
             }
         }
         Value::String(text) => {
-            redact_text(text, secrets);
+            redact_text_with_policy(text, secrets, aggressive, custom_patterns);
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
@@ -57,15 +67,25 @@ pub fn redact_matching_values(value: &mut Value, secrets: &[Value]) {
 /// Remove configured values echoed into free-form text without replacing every
 /// occurrence of tiny, common scalar tokens such as `0`, `1`, `true`, or `false`.
 pub fn redact_text(text: &mut String, secrets: &[Value]) {
+    redact_text_with_policy(text, secrets, false, &[]);
+}
+
+/// Redact free-form text according to an explicit strength and literal pattern list.
+pub fn redact_text_with_policy(
+    text: &mut String,
+    secrets: &[Value],
+    aggressive: bool,
+    custom_patterns: &[String],
+) {
     for secret in secrets {
         let (needle, may_replace_substring) = match secret {
             Value::String(value) => (value.clone(), !value.is_empty()),
             Value::Number(value) => {
                 let value = value.to_string();
-                let replace = value.len() >= 4;
+                let replace = aggressive || value.len() >= 4;
                 (value, replace)
             }
-            Value::Bool(value) => (value.to_string(), false),
+            Value::Bool(value) => (value.to_string(), aggressive),
             Value::Array(_) | Value::Object(_) => {
                 let value = serde_json::to_string(secret).unwrap_or_default();
                 let replace = value.len() >= 8;
@@ -82,6 +102,11 @@ pub fn redact_text(text: &mut String, secrets: &[Value]) {
         }
         if may_replace_substring {
             *text = text.replace(&needle, REDACTION_MARKER);
+        }
+    }
+    for pattern in custom_patterns {
+        if !pattern.is_empty() {
+            *text = text.replace(pattern, REDACTION_MARKER);
         }
     }
 }
@@ -158,6 +183,14 @@ mod tests {
         assert_eq!(value["one"], REDACTION_MARKER);
         assert_eq!(value["flag"], REDACTION_MARKER);
         assert_eq!(value["sentence"], "version 10 is true enough");
+    }
+
+    #[test]
+    fn aggressive_and_custom_text_policies_are_explicit() {
+        let mut text = "PIN is 123 and tenant ACME".to_owned();
+        redact_text_with_policy(&mut text, &[json!(123)], true, &["ACME".to_owned()]);
+        assert!(!text.contains("123"));
+        assert!(!text.contains("ACME"));
     }
 
     proptest! {

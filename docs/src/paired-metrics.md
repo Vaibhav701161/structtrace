@@ -10,10 +10,16 @@ Because baseline and candidate run on the same IDs, the important unit is the ca
 | fail | fail | both fail |
 
 The deployment-success effect is candidate pass rate minus baseline pass rate in percentage points.
-Before inference, StructTrace fingerprints each case from input, expected output, model-visible
-metadata, and evaluation-only metadata. Exact duplicate rows remain descriptive, but one
-representative per fingerprint forms the independent matrix, McNemar test, bootstrap, and gate
-denominator. The four matrix cells therefore sum to the unique semantic-case denominator.
+Before inference, StructTrace groups rows using `dataset.evidence_unit`. The default fingerprint
+contains input, expected output, and model-visible metadata, but excludes arbitrary evaluation
+metadata such as timestamps and trace IDs. Users can instead declare one grouping pointer or an
+explicit pointer include-list.
+
+Repeated rows remain visible in descriptive execution totals. When repeated observations in one
+evidence unit disagree in status or scored evidence, the group becomes conflicting repeated
+evidence, is not arbitrarily collapsed, and forces an `INSUFFICIENT EVIDENCE` gate. Non-conflicting
+groups contribute once. The primary cards, transition matrix, bootstrap, evaluator table, hotspots,
+and release gate therefore share the same named evidence-unit population.
 
 The report also computes a jointly scored semantic effect. It includes only independent pairs where
 both primary outcomes explicitly resolve to true or false and lists operational/error exclusions by

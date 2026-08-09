@@ -72,6 +72,12 @@ pub const HARD_MAX_SCHEMA_BYTES: usize = 64 * 1024 * 1024;
 pub const HARD_MAX_CASES: usize = 10_000_000;
 /// Hard ceiling for one JSONL record.
 pub const HARD_MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Hard ceiling for one derived artifact consumed during replay.
+pub const HARD_MAX_REPLAY_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Hard ceiling for bootstrap replicates, independent of configuration schema validation.
+pub const HARD_MAX_BOOTSTRAP_SAMPLES: usize = 1_000_000;
+/// Hard ceiling for the product of bootstrap replicates and evidence units.
+pub const HARD_MAX_BOOTSTRAP_WORK_UNITS: usize = 100_000_000;
 
 /// Configurable resource limits with conservative defaults and enforced hard ceilings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +95,8 @@ pub struct LimitsConfig {
     pub max_cases: usize,
     /// Maximum bytes accepted for one JSONL line.
     pub max_jsonl_line_bytes: usize,
+    /// Maximum bytes accepted for one derived replay artifact.
+    pub max_replay_artifact_bytes: usize,
     /// Maximum model or adapter output bytes retained for one case.
     pub max_output_bytes_per_case: usize,
     /// Maximum standard-error bytes retained from one process.
@@ -110,6 +118,7 @@ impl Default for LimitsConfig {
             max_schema_bytes: 16 * 1024 * 1024,
             max_cases: 1_000_000,
             max_jsonl_line_bytes: 16 * 1024 * 1024,
+            max_replay_artifact_bytes: 512 * 1024 * 1024,
             max_output_bytes_per_case: 4 * 1024 * 1024,
             max_stderr_bytes_per_process: 1024 * 1024,
             max_report_raw_bytes_per_case: 256 * 1024,
@@ -161,6 +170,23 @@ impl Default for StorageConfig {
 pub struct RedactionConfig {
     /// JSON Pointers replaced with a fixed redaction marker.
     pub json_pointers: Vec<String>,
+    /// Text policy: exact structured echoes or aggressive substring removal.
+    #[serde(default)]
+    pub text_mode: TextRedactionMode,
+    /// Additional literal secret patterns removed from report text.
+    #[serde(default)]
+    pub custom_patterns: Vec<String>,
+}
+
+/// Free-form text redaction strength.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRedactionMode {
+    /// Redact exact typed values and sufficiently distinctive substrings.
+    #[default]
+    ExactStructured,
+    /// Also replace short numeric and Boolean values inside arbitrary text.
+    AggressiveTextual,
 }
 
 /// JSONL dataset and field mapping.
@@ -175,6 +201,24 @@ pub struct DatasetConfig {
     /// JSON Pointer mapping for case envelope fields.
     #[serde(default)]
     pub fields: DatasetFields,
+    /// Explicit definition of the independent statistical evidence unit.
+    #[serde(default)]
+    pub evidence_unit: EvidenceUnitConfig,
+}
+
+/// How rows are grouped into independent evidence units.
+///
+/// With neither field configured, StructTrace fingerprints only input,
+/// expected output, and explicitly model-visible metadata. Arbitrary
+/// evaluation metadata is deliberately excluded because trace IDs and
+/// timestamps do not create independent semantic evidence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EvidenceUnitConfig {
+    /// One normalized-case pointer whose value identifies the evidence unit.
+    pub pointer: Option<String>,
+    /// Normalized-case pointers included in a canonical fingerprint.
+    pub include: Option<Vec<String>>,
 }
 
 fn default_jsonl() -> String {
@@ -236,6 +280,9 @@ pub enum VariantConfig {
         /// Per-case timeout.
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
+        /// Explicit immutable digest and/or source files bound into resume identity.
+        #[serde(default)]
+        implementation: ImplementationConfig,
     },
     /// Python callable invoked through the bundled bridge.
     Python {
@@ -247,9 +294,22 @@ pub enum VariantConfig {
         /// Per-case timeout.
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
+        /// Explicit immutable digest and/or source files bound into resume identity.
+        #[serde(default)]
+        implementation: ImplementationConfig,
     },
     /// OpenAI-compatible chat-completions endpoint.
     OpenaiCompatible(Box<OpenAiCompatibleConfig>),
+}
+
+/// User-declared implementation identity for command and Python applications.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImplementationConfig {
+    /// Immutable implementation digest supplied by the application owner.
+    pub digest: Option<String>,
+    /// Source or data files whose exact bytes define the implementation.
+    pub sources: Vec<PathBuf>,
 }
 
 /// Executable and argument array. No shell is involved.
@@ -808,12 +868,12 @@ impl Config {
             }
         }
         if config.analysis.bootstrap.samples == 0
+            || config.analysis.bootstrap.samples > HARD_MAX_BOOTSTRAP_SAMPLES
             || !(0.0..1.0).contains(&config.analysis.bootstrap.confidence)
         {
-            return Err(CoreError::Configuration(
-                "bootstrap samples must be positive and confidence must be between 0 and 1"
-                    .to_owned(),
-            ));
+            return Err(CoreError::Configuration(format!(
+                "bootstrap samples must be between 1 and {HARD_MAX_BOOTSTRAP_SAMPLES}; confidence must be between 0 and 1"
+            )));
         }
         for (name, value, maximum) in [
             (
@@ -841,6 +901,11 @@ impl Config {
                 "limits.max_jsonl_line_bytes",
                 config.limits.max_jsonl_line_bytes,
                 HARD_MAX_JSONL_LINE_BYTES,
+            ),
+            (
+                "limits.max_replay_artifact_bytes",
+                config.limits.max_replay_artifact_bytes,
+                HARD_MAX_REPLAY_ARTIFACT_BYTES,
             ),
             (
                 "limits.max_output_bytes_per_case",
@@ -875,6 +940,17 @@ impl Config {
             }
         }
         validate_nonempty_path("storage.root", &config.storage.root)?;
+        if config
+            .storage
+            .redaction
+            .custom_patterns
+            .iter()
+            .any(|pattern| pattern.is_empty())
+        {
+            return Err(CoreError::Configuration(
+                "storage.redaction.custom_patterns must not contain empty strings".to_owned(),
+            ));
+        }
         validate_nonempty_path("dataset.path", &config.dataset.path)?;
         validate_nonempty_path("schema.path", &config.schema.path)?;
         for (name, pointer) in [
@@ -890,6 +966,7 @@ impl Config {
             validate_json_pointer(name, pointer)?;
         }
         validate_dataset_field_isolation(&config.dataset.fields)?;
+        validate_evidence_unit(&config.dataset.evidence_unit)?;
         for (name, variant) in &config.variants {
             validate_variant(&format!("variants.{name}"), variant)?;
         }
@@ -945,18 +1022,22 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
         VariantConfig::Command {
             command,
             timeout_ms,
+            implementation,
             ..
         } => {
             validate_command(&format!("{name}.command"), command)?;
-            validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
+            validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)?;
+            validate_implementation(name, implementation)
         }
         VariantConfig::Python {
             interpreter,
             callable,
             timeout_ms,
+            implementation,
         } => {
             validate_python(&format!("{name}.python"), interpreter, callable)?;
-            validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
+            validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)?;
+            validate_implementation(name, implementation)
         }
         VariantConfig::OpenaiCompatible(adapter) => {
             for (field, value) in [
@@ -1042,6 +1123,22 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
     }
 }
 
+fn validate_implementation(name: &str, implementation: &ImplementationConfig) -> Result<()> {
+    if implementation
+        .digest
+        .as_deref()
+        .is_some_and(|digest| digest.trim().is_empty())
+    {
+        return Err(CoreError::Configuration(format!(
+            "{name}.implementation.digest must be omitted or non-empty"
+        )));
+    }
+    for source in &implementation.sources {
+        validate_nonempty_path(&format!("{name}.implementation.sources"), source)?;
+    }
+    Ok(())
+}
+
 fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
     let name = format!("evaluator `{id}`");
     match evaluator {
@@ -1082,6 +1179,13 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
                     "{name}.formats must contain only iso, dmy_slash, or mdy_slash"
                 )));
             }
+            if formats.iter().any(|format| format == "dmy_slash")
+                && formats.iter().any(|format| format == "mdy_slash")
+            {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.formats cannot combine dmy_slash and mdy_slash without an explicit ambiguity policy"
+                )));
+            }
             Ok(())
         }
         EvaluatorKind::JsonPointersExact { pointers }
@@ -1097,6 +1201,11 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             if keys.is_empty() {
                 return Err(CoreError::Configuration(format!(
                     "{name}.keys must not be empty"
+                )));
+            }
+            if fields.is_empty() {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.fields must not be empty; configure field semantics explicitly"
                 )));
             }
             for key in keys {
@@ -1133,6 +1242,18 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
                             "{name}.fields absolute must be non-negative"
                         )));
                     }
+                }
+                if field.evaluator == "canonical_date"
+                    && (field.formats.is_empty()
+                        || field.formats.iter().any(|format| {
+                            !matches!(format.as_str(), "iso" | "dmy_slash" | "mdy_slash")
+                        })
+                        || (field.formats.iter().any(|format| format == "dmy_slash")
+                            && field.formats.iter().any(|format| format == "mdy_slash")))
+                {
+                    return Err(CoreError::Configuration(format!(
+                        "{name}.fields canonical_date formats must be non-ambiguous and supported"
+                    )));
                 }
             }
             Ok(())
@@ -1391,6 +1512,7 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
 
 fn validate_dataset_field_isolation(fields: &DatasetFields) -> Result<()> {
     let protected = [
+        ("id", fields.id.as_str()),
         ("input", fields.input.as_str()),
         ("expected", fields.expected.as_str()),
         (
@@ -1408,6 +1530,28 @@ fn validate_dataset_field_isolation(fields: &DatasetFields) -> Result<()> {
                     "dataset.fields.{left_name} `{left_pointer}` overlaps dataset.fields.{right_name} `{right_pointer}`; model-visible and evaluation-only fields must be disjoint"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_unit(config: &EvidenceUnitConfig) -> Result<()> {
+    if config.pointer.is_some() && config.include.is_some() {
+        return Err(CoreError::Configuration(
+            "dataset.evidence_unit must define either pointer or include, not both".to_owned(),
+        ));
+    }
+    if let Some(pointer) = &config.pointer {
+        validate_json_pointer("dataset.evidence_unit.pointer", pointer)?;
+    }
+    if let Some(include) = &config.include {
+        if include.is_empty() {
+            return Err(CoreError::Configuration(
+                "dataset.evidence_unit.include must not be empty".to_owned(),
+            ));
+        }
+        for pointer in include {
+            validate_json_pointer("dataset.evidence_unit.include", pointer)?;
         }
     }
     Ok(())
@@ -1442,6 +1586,7 @@ mod tests {
                 path: "data.jsonl".into(),
                 format: "jsonl".to_owned(),
                 fields: DatasetFields::default(),
+                evidence_unit: EvidenceUnitConfig::default(),
             },
             schema: SchemaConfig {
                 path: "schema.json".into(),
@@ -1487,6 +1632,57 @@ mod tests {
     }
 
     #[test]
+    fn shipped_configurations_match_schema_and_runtime_validation() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/structtrace.schema.json")).unwrap();
+        let validator = jsonschema::options().build(&schema).unwrap();
+        for (name, source) in [
+            (
+                "recorded",
+                include_str!("../../../examples/recorded-output-comparison/structtrace.yaml"),
+            ),
+            (
+                "python",
+                include_str!("../../../examples/python-callable/structtrace.yaml"),
+            ),
+            (
+                "command",
+                include_str!("../../../examples/command/structtrace.yaml"),
+            ),
+            (
+                "document-extraction",
+                include_str!("../../../examples/document-extraction/structtrace.yaml"),
+            ),
+            (
+                "tool-calling",
+                include_str!("../../../examples/tool-calling/structtrace.yaml"),
+            ),
+            (
+                "openai-compatible",
+                include_str!("../../../examples/openai-compatible/structtrace.yaml"),
+            ),
+            (
+                "support-demo",
+                include_str!("../../../demo/support-ticket/structtrace.yaml"),
+            ),
+            (
+                "research-demo",
+                include_str!("../../../demo/accepted-research/structtrace.yaml"),
+            ),
+        ] {
+            Config::from_bytes(std::path::Path::new("structtrace.yaml"), source.as_bytes())
+                .unwrap_or_else(|error| panic!("{name} failed runtime validation: {error}"));
+            let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).unwrap();
+            let value = serde_json::to_value(yaml).unwrap();
+            let errors = validator
+                .iter_errors(&value)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            assert!(errors.is_empty(), "{name} failed JSON Schema: {errors:?}");
+        }
+    }
+
+    #[test]
     fn expected_pointer_cannot_equal_input_pointer() {
         let mut config = minimal();
         config.dataset.fields.input = "/expected".to_owned();
@@ -1496,6 +1692,66 @@ mod tests {
                 .to_string()
                 .contains("overlaps")
         );
+    }
+
+    #[test]
+    fn id_pointer_cannot_overlap_any_model_or_evaluation_field() {
+        for pointer in [
+            "/input",
+            "/expected",
+            "/model_visible_metadata",
+            "/metadata",
+            "",
+        ] {
+            let mut config = minimal();
+            config.dataset.fields.id = pointer.to_owned();
+            assert!(
+                Config::validate(config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overlaps"),
+                "pointer {pointer:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_unit_configuration_is_explicit_and_unambiguous() {
+        let mut both = minimal();
+        both.dataset.evidence_unit.pointer = Some("/metadata/document_id".to_owned());
+        both.dataset.evidence_unit.include = Some(vec!["/input".to_owned()]);
+        assert!(Config::validate(both).is_err());
+
+        let mut empty = minimal();
+        empty.dataset.evidence_unit.include = Some(Vec::new());
+        assert!(Config::validate(empty).is_err());
+    }
+
+    #[test]
+    fn huge_bootstrap_configuration_is_rejected() {
+        let mut config = minimal();
+        config.analysis.bootstrap.samples = HARD_MAX_BOOTSTRAP_SAMPLES + 1;
+        assert!(Config::validate(config).is_err());
+    }
+
+    #[test]
+    fn ambiguous_date_formats_and_empty_keyed_fields_are_rejected() {
+        let mut date = minimal();
+        date.evaluators[0].kind = EvaluatorKind::CanonicalDate {
+            pointer: "/date".to_owned(),
+            expected_pointer: "/date".to_owned(),
+            formats: vec!["dmy_slash".to_owned(), "mdy_slash".to_owned()],
+        };
+        assert!(Config::validate(date).is_err());
+
+        let mut keyed = minimal();
+        keyed.evaluators[0].kind = EvaluatorKind::KeyedArray {
+            pointer: "/items".to_owned(),
+            expected_pointer: "/items".to_owned(),
+            keys: vec!["/id".to_owned()],
+            fields: Vec::new(),
+        };
+        assert!(Config::validate(keyed).is_err());
     }
 
     #[test]
@@ -1624,6 +1880,7 @@ mod tests {
                 },
                 process_mode: ProcessMode::Persistent,
                 timeout_ms: 0,
+                implementation: ImplementationConfig::default(),
             },
         );
         assert!(Config::validate(zero_timeout).is_err());

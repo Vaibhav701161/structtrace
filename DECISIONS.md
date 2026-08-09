@@ -107,3 +107,18 @@ exit codes.
 StructTrace measures a baseline and candidate against one unchanged caller-facing schema. It does
 not claim to migrate schemas or execute model-proposed tools. Recorded output is stable; local
 command and Python process integrations are beta; direct provider execution is experimental.
+
+## Evidence units are explicit and conflicts fail closed
+
+Captured rows are descriptive execution observations, not automatically independent evidence.
+The default evidence-unit fingerprint includes input, expected output, and model-visible metadata
+while excluding arbitrary operational metadata. Users may declare a grouping pointer or explicit
+include-list. Repeated groups with disagreeing retained status or evidence are not collapsed to the
+first row: they are excluded from inference and force `INSUFFICIENT_EVIDENCE`. Primary report cards,
+paired statistics, evaluator counts, hotspots, and the gate share the same evidence-unit population.
+
+## Dataset identity never crosses the live application boundary
+
+Dataset IDs remain evaluator and report identifiers. Live command and Python protocols receive a
+deterministic opaque execution token that StructTrace maps back after validation. Python callables
+receive no identifier, and OpenAI templates expose neither dataset IDs nor transport tokens.

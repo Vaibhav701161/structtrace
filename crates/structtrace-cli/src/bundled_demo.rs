@@ -36,6 +36,12 @@ struct ResearchStudy {
     both_fail: usize,
 }
 
+/// Separate, non-pooled normalized research runs plus their index.
+pub struct ResearchDemo {
+    pub runs: Vec<structtrace_engine::CompletedRun>,
+    pub index_path: std::path::PathBuf,
+}
+
 /// Materialize and run the invoice extraction fixture below local state.
 pub fn run_invoice(project_root: &Path) -> anyhow::Result<structtrace_engine::CompletedRun> {
     let root = project_root
@@ -117,37 +123,65 @@ pub fn run_support_ticket(project_root: &Path) -> anyhow::Result<structtrace_eng
 }
 
 /// Materialize and verify normalized accepted research outcome matrices.
-pub fn run_research(project_root: &Path) -> anyhow::Result<structtrace_engine::CompletedRun> {
+pub fn run_research(project_root: &Path) -> anyhow::Result<ResearchDemo> {
     let root = project_root
         .canonicalize()
         .with_context(|| format!("project root {} does not exist", project_root.display()))?;
     let fixture_root = root.join(".structtrace/demo-inputs/accepted-research");
     let studies: Vec<ResearchStudy> = serde_json::from_str(RESEARCH_COUNTS)?;
-    let (dataset, baseline, candidate) = research_jsonl(&studies)?;
-    write_fixture(&fixture_root.join("structtrace.yaml"), RESEARCH_CONFIG)?;
-    write_fixture(&fixture_root.join("schema.json"), RESEARCH_SCHEMA)?;
-    write_fixture(&fixture_root.join("generated/dataset.jsonl"), &dataset)?;
-    write_fixture(&fixture_root.join("generated/baseline.jsonl"), &baseline)?;
-    write_fixture(&fixture_root.join("generated/candidate.jsonl"), &candidate)?;
     write_fixture(&fixture_root.join("expected-counts.json"), RESEARCH_COUNTS)?;
-    let config_path = fixture_root.join("structtrace.yaml");
-    let mut config = Config::load(&config_path)?;
-    config.storage.root = root.join(".structtrace");
-    config.dataset.path = fixture_root.join("generated/dataset.jsonl");
-    config.schema.path = fixture_root.join("schema.json");
-    config.variants.insert(
-        "baseline".to_owned(),
-        VariantConfig::Recorded {
-            path: fixture_root.join("generated/baseline.jsonl"),
-        },
+    let mut runs = Vec::new();
+    for study in &studies {
+        let study_root = fixture_root.join(&study.id);
+        let (dataset, baseline, candidate) = research_jsonl(std::slice::from_ref(study))?;
+        write_fixture(&study_root.join("structtrace.yaml"), RESEARCH_CONFIG)?;
+        write_fixture(&study_root.join("schema.json"), RESEARCH_SCHEMA)?;
+        write_fixture(&study_root.join("generated/dataset.jsonl"), &dataset)?;
+        write_fixture(&study_root.join("generated/baseline.jsonl"), &baseline)?;
+        write_fixture(&study_root.join("generated/candidate.jsonl"), &candidate)?;
+        let config_path = study_root.join("structtrace.yaml");
+        let mut config = Config::load(&config_path)?;
+        config.project.name = format!("accepted-research-{}", study.id);
+        config.project.description = Some(format!(
+            "Normalized replay of the {} study only; no cross-study pooling",
+            study.label
+        ));
+        config.storage.root = root.join(".structtrace");
+        config.dataset.path = study_root.join("generated/dataset.jsonl");
+        config.dataset.evidence_unit.pointer = Some("/metadata/accepted_case_ordinal".to_owned());
+        config.gate = Default::default();
+        config.schema.path = study_root.join("schema.json");
+        config.variants.insert(
+            "baseline".to_owned(),
+            VariantConfig::Recorded {
+                path: study_root.join("generated/baseline.jsonl"),
+            },
+        );
+        config.variants.insert(
+            "candidate".to_owned(),
+            VariantConfig::Recorded {
+                path: study_root.join("generated/candidate.jsonl"),
+            },
+        );
+        runs.push(structtrace_engine::run_recorded_with_config(
+            &root,
+            &config_path,
+            config,
+        )?);
+    }
+    let index_path = fixture_root.join("INDEX.md");
+    let mut index = String::from(
+        "# Accepted research fixtures\n\nThese are separate studies. No pooled effect or release gate is calculated.\n\n",
     );
-    config.variants.insert(
-        "candidate".to_owned(),
-        VariantConfig::Recorded {
-            path: fixture_root.join("generated/candidate.jsonl"),
-        },
-    );
-    structtrace_engine::run_recorded_with_config(&root, &config_path, config)
+    for (study, run) in studies.iter().zip(&runs) {
+        index.push_str(&format!(
+            "- {}: `{}`\n",
+            study.label,
+            run.run_dir.join("report/index.html").display()
+        ));
+    }
+    write_fixture(&index_path, &index)?;
+    Ok(ResearchDemo { runs, index_path })
 }
 
 fn research_jsonl(studies: &[ResearchStudy]) -> anyhow::Result<(String, String, String)> {
@@ -181,7 +215,8 @@ fn research_jsonl(studies: &[ResearchStudy]) -> anyhow::Result<(String, String, 
                             "study": study.id,
                             "study_label": study.label,
                             "accepted_transition": transition,
-                            "fixture": "normalized paired outcome"
+                            "fixture": "normalized paired outcome",
+                            "accepted_case_ordinal": ordinal
                         }
                     }),
                 )?;
@@ -274,23 +309,36 @@ mod tests {
     #[test]
     fn research_demo_reproduces_all_accepted_paired_counts() {
         let root = tempdir().unwrap();
-        let run = run_research(root.path()).unwrap();
-        let text = std::fs::read_to_string(run.run_dir.join("cases.jsonl")).unwrap();
         let mut groups: BTreeMap<String, Vec<(bool, bool)>> = BTreeMap::new();
-        for line in text.lines() {
-            let record: PairedCaseRecord = serde_json::from_str(line).unwrap();
-            let study = record
-                .case
-                .metadata
-                .as_ref()
-                .and_then(|value| value.pointer("/study"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap()
-                .to_owned();
-            groups.entry(study).or_default().push((
-                record.baseline_evaluation.primary_pass,
-                record.candidate_evaluation.primary_pass,
-            ));
+        let research = run_research(root.path()).unwrap();
+        assert_eq!(research.runs.len(), 3);
+        assert!(research.index_path.is_file());
+        for run in &research.runs {
+            assert_eq!(
+                run.summary.gate.status,
+                structtrace_core::gate::GateStatus::NotConfigured
+            );
+            let text = std::fs::read_to_string(run.run_dir.join("cases.jsonl")).unwrap();
+            for line in text.lines() {
+                let record: PairedCaseRecord = serde_json::from_str(line).unwrap();
+                let study = record
+                    .case
+                    .metadata
+                    .as_ref()
+                    .and_then(|value| value.pointer("/study"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .to_owned();
+                groups.entry(study).or_default().push((
+                    record.baseline_evaluation.primary_pass,
+                    record.candidate_evaluation.primary_pass,
+                ));
+            }
+            assert!(
+                structtrace_engine::replay_run(&run.run_dir)
+                    .unwrap()
+                    .verified
+            );
         }
         let actual = groups
             .into_iter()
@@ -299,8 +347,6 @@ mod tests {
         assert_counts(&actual["corrected_qwen"], 49, 18, 24, 9, 3);
         assert_counts(&actual["canonical_llama"], 150, 92, 82, 6, 16);
         assert_counts(&actual["tool_call_pilot"], 30, 26, 24, 1, 3);
-        let replay = structtrace_engine::replay_run(&run.run_dir).unwrap();
-        assert!(replay.verified);
     }
 
     fn assert_counts(

@@ -63,7 +63,11 @@ pub struct ReplayReport {
 
 /// Verify hashes and recompute all scores, metrics, intervals, and gate rules.
 pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
-    let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    let manifest: RunManifest = read_json_bounded(
+        &run_dir.join("manifest.json"),
+        64 * 1024 * 1024,
+        "run manifest",
+    )?;
     anyhow::ensure!(
         manifest.artifact_format_version == ARTIFACT_FORMAT_VERSION,
         "artifact format {} is incompatible with supported version {}",
@@ -94,7 +98,11 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
         }
     }
 
-    let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
+    let config: Config = read_json_bounded(
+        &run_dir.join("inputs/configuration.json"),
+        structtrace_core::config::HARD_MAX_CONFIG_BYTES,
+        "retained configuration",
+    )?;
     let config = Config::validate(config)?;
     let normalized_hash = hash_canonical_json(&config)?;
     if normalized_hash != manifest.normalized_configuration_hash {
@@ -110,9 +118,10 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
             manifest.configuration_file_hash, source_config_hash
         ));
     }
-    let dataset = Dataset::read(
+    let dataset = Dataset::read_bounded(
         &run_dir.join("inputs/dataset.jsonl"),
         &config.dataset.fields,
+        &config.limits,
     )?;
     if dataset.source_hash != manifest.dataset_hash {
         artifact_hash_mismatches.push(format!(
@@ -120,7 +129,12 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
             manifest.dataset_hash, dataset.source_hash
         ));
     }
-    let schema_value: Value = read_json(&run_dir.join("inputs/schema.json"))?;
+    let schema_bytes = structtrace_core::hashing::read_bounded(
+        &run_dir.join("inputs/schema.json"),
+        config.limits.max_schema_bytes,
+        "retained schema",
+    )?;
+    let schema_value: Value = serde_json::from_slice(&schema_bytes)?;
     let schema_hash = hash_file(&run_dir.join("inputs/schema.json"))?;
     if schema_hash != manifest.schema_hash {
         artifact_hash_mismatches.push(format!(
@@ -129,11 +143,27 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
         ));
     }
     let schema = compile_schema(&schema_value)?;
-    let stored_summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
-    let stored_records: Vec<PairedCaseRecord> = read_jsonl(&run_dir.join("cases.jsonl"))?;
-    let baseline_outputs = RecordedOutputs::read(&run_dir.join("inputs/baseline.jsonl"), &dataset)?;
-    let candidate_outputs =
-        RecordedOutputs::read(&run_dir.join("inputs/candidate.jsonl"), &dataset)?;
+    let stored_summary: RunSummary = read_json_bounded(
+        &run_dir.join("summary.json"),
+        config.limits.max_replay_artifact_bytes,
+        "retained summary",
+    )?;
+    let stored_records: Vec<PairedCaseRecord> = read_jsonl_bounded(
+        &run_dir.join("cases.jsonl"),
+        config.limits.max_replay_artifact_bytes,
+        config.limits.max_jsonl_line_bytes,
+        config.limits.max_cases,
+    )?;
+    let baseline_outputs = RecordedOutputs::read_bounded(
+        &run_dir.join("inputs/baseline.jsonl"),
+        &dataset,
+        &config.limits,
+    )?;
+    let candidate_outputs = RecordedOutputs::read_bounded(
+        &run_dir.join("inputs/candidate.jsonl"),
+        &dataset,
+        &config.limits,
+    )?;
     let external_count = config
         .evaluators
         .iter()
@@ -141,8 +171,17 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
         .count();
     let mut receipts = BTreeMap::new();
     if external_count > 0 {
-        let stored_receipts: Vec<ExternalEvaluatorReceipt> =
-            read_jsonl(&run_dir.join("external-evaluator-receipts.jsonl"))?;
+        let max_receipts = config
+            .limits
+            .max_cases
+            .saturating_mul(external_count)
+            .saturating_mul(2);
+        let stored_receipts: Vec<ExternalEvaluatorReceipt> = read_jsonl_bounded(
+            &run_dir.join("external-evaluator-receipts.jsonl"),
+            config.limits.max_replay_artifact_bytes,
+            config.limits.max_jsonl_line_bytes,
+            max_receipts,
+        )?;
         for receipt in stored_receipts {
             let key = (
                 receipt.case_id.clone(),
@@ -477,18 +516,45 @@ fn transition_name(baseline: bool, candidate: bool) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes =
         std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
-fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Vec<T>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
+fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<T> {
+    let bytes = structtrace_core::hashing::read_bounded(path, max_bytes, label)?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_jsonl_bounded<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_bytes: usize,
+    max_line_bytes: usize,
+    max_records: usize,
+) -> anyhow::Result<Vec<T>> {
+    let bytes = structtrace_core::hashing::read_bounded(path, max_bytes, "replay artifact")?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
     text.lines()
         .enumerate()
         .map(|(index, line)| {
+            anyhow::ensure!(
+                index < max_records,
+                "{} exceeds the retained {max_records}-record replay limit",
+                path.display()
+            );
+            anyhow::ensure!(
+                line.len() <= max_line_bytes,
+                "{}:{} exceeds the retained {max_line_bytes}-byte line limit",
+                path.display(),
+                index + 1
+            );
             serde_json::from_str(line)
                 .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))
         })

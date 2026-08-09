@@ -13,6 +13,8 @@ pub struct GateInputs<'a> {
     pub unique_cases: usize,
     /// Fraction of rows beyond the first member of each semantic group.
     pub duplicate_case_rate: f64,
+    /// Repeated evidence groups with contradictory retained observations.
+    pub conflicting_repeated_groups: usize,
     /// Minimum explicit pass-or-fail scoring rate across both variants.
     pub primary_scored_rate: f64,
     /// Maximum primary evaluator-error rate across both variants.
@@ -144,6 +146,7 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         };
     }
     let mut rules = vec![
+        conflict_free_rule(inputs.conflicting_repeated_groups),
         required_minimum_rule(
             "min_cases",
             config.min_cases.map(|value| value as f64),
@@ -262,18 +265,38 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         GateStatus::Error
     } else if rules
         .iter()
-        .any(|rule| rule.status == GateRuleStatus::Failed)
-    {
-        GateStatus::Failed
-    } else if rules
-        .iter()
         .any(|rule| rule.status == GateRuleStatus::InsufficientEvidence)
     {
         GateStatus::InsufficientEvidence
+    } else if rules
+        .iter()
+        .any(|rule| rule.status == GateRuleStatus::Failed)
+    {
+        GateStatus::Failed
     } else {
         GateStatus::Passed
     };
     GateDecision { status, rules }
+}
+
+fn conflict_free_rule(conflicts: usize) -> GateRuleResult {
+    GateRuleResult {
+        rule: "conflicting_repeated_evidence".to_owned(),
+        status: if conflicts == 0 {
+            GateRuleStatus::Passed
+        } else {
+            GateRuleStatus::InsufficientEvidence
+        },
+        observed: Some(conflicts as f64),
+        threshold: Some(0.0),
+        message: if conflicts == 0 {
+            "No repeated evidence unit had conflicting retained outcomes.".to_owned()
+        } else {
+            format!(
+                "{conflicts} repeated evidence unit(s) contain conflicting observations; no row was selected arbitrarily."
+            )
+        },
+    }
 }
 
 fn maximum_rule(name: &str, threshold: Option<f64>, observed: f64, label: &str) -> GateRuleResult {
@@ -441,6 +464,7 @@ mod tests {
             total_cases: primary.total,
             unique_cases: primary.total,
             duplicate_case_rate: 0.0,
+            conflicting_repeated_groups: 0,
             primary_scored_rate: 1.0,
             primary_evaluator_error_rate: 0.0,
             primary_not_applicable_rate: 0.0,
@@ -526,12 +550,12 @@ mod tests {
     }
 
     #[test]
-    fn observed_quality_failure_takes_precedence_over_insufficient_evidence() {
+    fn insufficient_evidence_prevents_a_quality_verdict() {
         let primary = paired_metrics(&[(true, false), (true, true)]);
         let mut config = release_config();
         config.min_cases = Some(100);
         let decision = evaluate_gate(&config, &inputs(&primary));
-        assert_eq!(decision.status, GateStatus::Failed);
+        assert_eq!(decision.status, GateStatus::InsufficientEvidence);
         assert!(decision.rules.iter().any(|rule| {
             rule.rule == "min_cases" && rule.status == GateRuleStatus::InsufficientEvidence
         }));
