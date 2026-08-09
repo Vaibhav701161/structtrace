@@ -38,7 +38,9 @@
       "properties": {
         "max_output_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 4194304},
         "max_stderr_bytes_per_process": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 1048576},
-        "max_report_raw_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 4194304, "default": 262144}
+        "max_report_raw_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 4194304, "default": 262144},
+        "max_report_total_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824, "default": 268435456},
+        "max_single_file_report_bytes": {"type": "integer", "minimum": 1, "maximum": 104857600, "default": 10485760}
       }
     },
     "dataset": {
@@ -103,6 +105,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "min_cases": {"type": ["integer", "null"], "minimum": 1},
+        "min_primary_scored_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "max_primary_evaluator_error_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "max_primary_not_applicable_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "max_primary_unscored_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_primary_regression_pp": {"type": ["number", "null"], "minimum": 0},
         "max_valid_but_wrong_increase_pp": {"type": ["number", "null"], "minimum": 0},
         "min_candidate_schema_validity": {"type": ["number", "null"], "minimum": 0, "maximum": 1},

@@ -12,14 +12,9 @@ evaluators:
     pointers:
       - {pointer: /arguments/sku, expected_pointer: /arguments/sku}
       - {pointer: /arguments/quantity_delta, expected_pointer: /arguments/quantity_delta}
-  - id: receipt
-    kind: json_pointers_exact
-    pointers:
-      - {pointer: /receipt/executed, expected_pointer: /receipt/executed}
-      - {pointer: /receipt/after, expected_pointer: /receipt/after}
 outcomes:
-  executable_correct: {all_of: [tool, arguments, receipt]}
+  tool_call_correct: {all_of: [tool, arguments]}
 analysis:
-  primary_outcome: executable_correct
+  primary_outcome: tool_call_correct
   bootstrap: {samples: 10000, confidence: 0.95, seed: 17}
-gate: {max_primary_regression_pp: 0, max_valid_but_wrong_increase_pp: 0}
+gate: {min_cases: 100, min_primary_scored_rate: 0.99, max_primary_evaluator_error_rate: 0.01, max_primary_not_applicable_rate: 0, max_primary_unscored_rate: 0, max_primary_regression_pp: 0, max_valid_but_wrong_increase_pp: 0}

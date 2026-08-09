@@ -17,4 +17,8 @@ Recorded comparison is the smallest integration surface. Each JSONL row uses the
 
 `raw_output` is the strict parsing source. A supplied `parsed_output` is a convenience and never hides invalid retained raw text. Duplicate IDs and unknown IDs fail validation. Missing known IDs are materialized as failures so the denominator cannot shrink.
 
-Use `structtrace compare` for a one-off comparison or configure `kind: recorded` for repeatable runs.
+`structtrace compare --dataset ... --baseline ... --candidate ... --schema ...` overrides those four
+paths but intentionally still loads the current `structtrace.yaml` for project identity,
+evaluators, outcomes, gate, retention, redaction, and limits. It is not a four-file zero-config
+command. Run `structtrace init --template recorded` first, then review the generated evaluator and
+outcome definitions. Configure `kind: recorded` directly for a repeatable checked-in workflow.

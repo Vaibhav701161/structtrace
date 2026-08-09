@@ -7,7 +7,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-155eef.svg)](LICENSE)
 [![No telemetry](https://img.shields.io/badge/telemetry-none-087a55.svg)](SECURITY.md)
 
-StructTrace is a local-first regression harness for structured LLM outputs. It evaluates the same golden cases against a baseline and candidate, separates JSON and schema validity from semantic or executable correctness, preserves every failure in the denominator, and produces an offline report plus a CI release decision.
+StructTrace is paired regression testing for stable-contract structured extraction pipelines. It
+evaluates the same golden cases against a baseline and candidate while a caller-facing JSON Schema
+remains fixed. It separates structural validity from deterministic task correctness, preserves
+every failure in the denominator, and produces local evidence plus a multi-state CI release gate.
+
+**Release status:** private release candidate. Core local engineering checks are passing; public
+binary installation, clean-browser performance across the OS matrix, and independent-user
+validation are still open release gates. The repository does not claim public readiness.
 
 ```text
 matched cases        baseline + candidate       one evidence bundle
@@ -22,31 +29,33 @@ The execution boundary is deliberate: adapters can receive the case input and ex
 model-visible metadata, but never the golden `expected` value or evaluation-only metadata.
 Only the evaluation engine can access labels.
 
-## See the failure that schema metrics miss
+## Hero workflow: invoice extraction migration
 
-The bundled support-ticket migration is intentionally realistic: the candidate becomes more structurally reliable while routing more tickets incorrectly.
+The primary example compares a baseline and candidate invoice extractor under one unchanged output
+contract. The candidate repairs missing currency and vendor fields but introduces financially wrong
+tax, total, and line-item values that still satisfy the schema.
 
-| Metric | Baseline | Candidate | What changed |
-|---|---:|---:|---|
-| Strict JSON | 11/12 | 12/12 | candidate improved |
-| Schema valid | 11/12 | 12/12 | candidate improved |
-| Semantically correct | 10/12 | 8/12 | candidate regressed |
-| Valid but wrong | 1/12 | 4/12 | hidden risk increased |
-
-That run fails its release gate. The invalid baseline row, all semantic regressions, and every discordant case remain inspectable.
+| Evidence | What StructTrace checks |
+|---|---|
+| Structure | strict JSON and the unchanged invoice schema |
+| Identity | invoice number, vendor, and date |
+| Finance | currency, subtotal, tax, and total with exact decimals |
+| Detail | complete, exact line-item arrays |
+| Deployment | sample size, scored coverage, errors, regressions, and uncertainty |
 
 ```bash
-cargo run -p structtrace-cli -- demo support-ticket
-cargo run -p structtrace-cli -- demo research
+cargo run -p structtrace-cli -- --project-root examples/document-extraction run
+cargo run -p structtrace-cli -- --project-root examples/document-extraction report latest --open
 ```
 
-Neither demo needs Python, an API key, a model download, a network connection, or a GPU.
+The 12-case fixture is explicitly demonstration-only: `min_cases: 100` prevents it from producing
+a deployment PASS. The support-ticket and normalized research fixtures remain secondary examples.
 
 ## What the report gives you
 
 - strict whole-output JSON parsing, with surrounding prose treated as failure;
 - external JSON Schema validation with remote retrieval disabled;
-- deterministic semantic and tool-call evaluators;
+- deterministic extraction, classification, and tool-argument evaluators;
 - valid-but-wrong counts as a first-class result;
 - the complete paired 2x2 transition matrix;
 - candidate-minus-baseline percentage-point effect;
@@ -55,29 +64,20 @@ Neither demo needs Python, an API key, a model download, a network connection, o
 - mean, median, and p95 latency, retries, token use, and user-priced cost;
 - a filterable case explorer with JSON-aware diffs;
 - independent release-gate rules with stable exit codes;
-- SQLite storage, BLAKE3-bound portable artifacts, and full replay.
+- SQLite storage, BLAKE3-bound portable artifacts, and deterministic score replay.
 
-The report is one self-contained HTML file. It contains no CDN assets, analytics, telemetry, or remote runtime dependency.
+The offline report contains no CDN assets, analytics, telemetry, or remote runtime dependency.
+Large runs use a searchable case index, 50-case lazy-loaded chunks, and 25-case pagination rather
+than embedding every case into the summary page. A one-file export is produced only below its
+configured size ceiling. The checked-in [scale validation](docs/src/report-scale-validation.md)
+covers 1,000 paired nested invoice records and states the measured envelope and remaining browser
+validation gap.
 
 ## Install
 
-Release binaries are built for Linux x86-64, macOS Intel, macOS Apple Silicon, and Windows
-x86-64. The installers verify a release-published SHA-256 checksum before replacing the binary.
-
-macOS or Linux:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/Vaibhav701161/structtrace/main/install.ps1 | iex
-```
-
-Until the first binary release is published, contributors can install from source with stable
-Rust 1.87 or newer:
+StructTrace is currently a private release candidate. No public binary release exists yet, so the
+repository does not present the checked-in installers as a working public install path. Install
+from source with stable Rust 1.87 or newer:
 
 ```bash
 git clone https://github.com/Vaibhav701161/structtrace.git
@@ -87,9 +87,9 @@ structtrace --help
 structtrace doctor
 ```
 
-The shell installer places the binary in `~/.local/bin` by default. The PowerShell installer
-uses `%LOCALAPPDATA%\Programs\StructTrace`. Each installer prints its exact uninstall command.
-Release archives also receive GitHub build-provenance attestations.
+The release workflow and checksum-verifying installers are release-candidate assets. They become
+supported only after clean Linux, macOS, and Windows virtual-machine installation checks have been
+recorded and a versioned GitHub release is actually published.
 
 ## Five-minute workflow
 
@@ -117,12 +117,12 @@ Initialization refuses to overwrite existing StructTrace files.
 
 ## Execution sources
 
-| Adapter | Use it when | Execution behavior |
-|---|---|---|
-| Recorded JSONL | outputs already exist | no process, Python, or provider required |
-| Command | application is in any language | versioned JSONL over stdin/stdout; no shell |
-| Python callable | application exposes a Python function | bundled bridge; exceptions retained as failures |
-| OpenAI-compatible | comparing models or request settings | explicit endpoint, optional bearer auth, bounded concurrency, opt-in backoff |
+| Adapter | Status | Use it when | Execution behavior |
+|---|---|---|---|
+| Recorded JSONL | Stable | outputs already exist | no process, Python, or provider required |
+| Command | Beta | application is in any language | bounded versioned JSONL over stdin/stdout; no shell |
+| Python callable | Beta | application exposes a Python function | bounded bridge; exceptions retained as failures |
+| OpenAI-compatible | Experimental | comparing models or request settings | explicit endpoint, bounded total case deadline and opt-in backoff |
 
 All adapters receive a label-free case view and produce the same `VariantOutput` envelope before entering the same storage, evaluation, report, gate, and replay path. Adapter errors, timeouts, malformed responses, nonzero exits, and missing outputs never shrink the denominator.
 
@@ -137,7 +137,7 @@ Built-in deterministic evaluators cover:
 - required fields;
 - tool selection;
 - selected tool arguments;
-- versioned custom command and Python evaluators for deterministic execution receipts.
+- versioned custom command and Python evaluators for user-defined deterministic checks.
 
 Evaluators are composed into named `all_of` or `any_of` outcomes. The user must choose one primary semantic or executable outcome; StructTrace refuses to infer correctness from schema validity.
 
@@ -168,6 +168,11 @@ Rules are evaluated independently. A schema improvement cannot hide a semantic r
 
 ```yaml
 gate:
+  min_cases: 100
+  min_primary_scored_rate: 0.99
+  max_primary_evaluator_error_rate: 0.01
+  max_primary_not_applicable_rate: 0.0
+  max_primary_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
   max_valid_but_wrong_increase_pp: 0.5
   min_candidate_schema_validity: 1.0
@@ -191,8 +196,9 @@ structtrace gate latest --verify replay # high-assurance CI
 The default gate verifies the manifest-bound `summary.json` hash before applying the stored
 decision. `--verify replay` additionally reconstructs the run from retained source artifacts.
 Operational rules compare matched case observations and enforce their configured measurement
-coverage. A completed quality regression returns exit code `10`; malformed input, execution
-failure, artifact corruption, and protocol failure use distinct codes.
+coverage. Gate exits distinguish a quality failure (`10`), no configured decision (`11`),
+insufficient evidence (`12`), and gate evaluation error (`13`). Malformed input, execution
+failure, artifact corruption, and protocol failure use separate codes.
 
 ## Durable and replayable by design
 
@@ -208,13 +214,16 @@ discordances.jsonl         regression and valid-but-wrong slice
 summary.json / summary.md  machine and human summaries
 logs/                      separated adapter diagnostics
 report/index.html          offline report
+report/case-index.json     redacted search and filter index
+report/cases/              lazy 50-case display chunks
 ```
 
-`structtrace replay` independently reconstructs cases from the retained dataset and baseline and
-candidate output JSONL, verifies cross-artifact consistency, and recomputes parsing, schema
-validation, built-in evaluators, outcomes, valid-but-wrong classification, transitions, McNemar,
-bootstrap intervals, and every gate rule. Side-effecting external evaluator programs are not
-re-executed: their definition-, request-, and response-bound receipts are verified instead. Local
+`structtrace replay` reconstructs scores from the retained dataset and baseline and candidate
+output JSONL, verifies cross-artifact consistency, and recomputes parsing, schema validation,
+built-in evaluators, outcomes, valid-but-wrong classification, transitions, McNemar, bootstrap
+intervals, and every gate rule. It does not rerun a model or reproduce provider generation.
+Side-effecting external evaluator programs are not re-executed: their definition-, request-, and
+response-bound receipts are verified instead. Local
 hashes establish integrity and consistency, not cryptographic authorship. Resume is allowed only
 when all bound experimental inputs still match.
 
@@ -232,10 +241,12 @@ storage:
 ```
 
 Raw retention is enforced before portable output artifacts are written. Full provider-response
-retention defaults to off. Report redaction is fail-closed and also removes matching echoes from
-parsed output, evaluator evidence, provider response bodies, and retry records. The report server
-binds to a random loopback-only address. Opening or exporting a completed report serves or copies
-the immutable finalized HTML rather than regenerating it.
+retention defaults to off. Report redaction is fail-closed, includes model-visible metadata in its
+source, and removes matching echoes from parsed output, evaluator evidence, provider response
+bodies, retry records, and search indexes. The report server binds to a random loopback-only
+address. Opening a completed report serves its immutable finalized bundle; the optional one-file
+export copies a finalized size-limited derivative. `--export-share` creates a new aggregate-only
+directory with every case-level value omitted.
 
 Output, subprocess diagnostics, and report embedding are bounded independently. Defaults are conservative and every setting has a compiled hard ceiling:
 
@@ -244,6 +255,8 @@ limits:
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144
+  max_report_total_bytes: 268435456
+  max_single_file_report_bytes: 10485760
 ```
 
 Oversized command, Python, or provider output fails closed and remains in the denominator. Report truncation changes only the HTML view, never the scored artifact.
@@ -274,7 +287,7 @@ structtrace-cli
       │          │
       │          ├── structtrace-adapters ── recorded / command / Python / OpenAI
       │          ├── structtrace-core ────── config, schema, evaluators, statistics
-      │          └── structtrace-report ──── self-contained HTML and loopback serving
+      │          └── structtrace-report ──── bounded offline bundle and loopback serving
       │
       └── stable exit codes and human / JSON / GitHub output
 ```
@@ -300,7 +313,11 @@ External usability evidence is deliberately tracked separately from automated co
 
 ## Product boundaries
 
-StructTrace does not automatically rewrite schemas, optimize prompts, choose a winning representation, or guarantee model quality. It does not require an LLM judge for its central workflow. It is a measurement and release-evidence system: it makes structural, semantic, executable, and operational changes visible before deployment. Version 1 uses fixed baseline-then-candidate execution and variant-level resume; interleaved live-provider scheduling, case-level paid-call resume, and chunked very-large reports remain explicit post-alpha work.
+StructTrace does not migrate or rewrite schemas, optimize prompts, execute tool calls, choose a
+winning representation, or guarantee model quality. Its stable scope is paired regression testing
+while the caller-facing output contract stays fixed. It does not require an LLM judge for that
+workflow. Version 1 uses fixed baseline-then-candidate execution and variant-level resume;
+interleaved live-provider scheduling and case-level paid-call resume remain explicit future work.
 
 ## Contributing and security
 

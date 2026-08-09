@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(run.summary.candidate.primary_pass, 8);
         assert_eq!(run.summary.paired.baseline_only_pass, 4);
         assert_eq!(run.summary.paired.candidate_only_pass, 2);
-        assert!(!run.summary.gate.passed);
+        assert!(!run.summary.gate.status.is_passed());
     }
 
     #[test]

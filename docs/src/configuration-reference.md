@@ -29,6 +29,8 @@ limits:
   max_output_bytes_per_case: 4194304
   max_stderr_bytes_per_process: 1048576
   max_report_raw_bytes_per_case: 262144
+  max_report_total_bytes: 268435456
+  max_single_file_report_bytes: 10485760
 ```
 
 The output limit applies to command, Python, and OpenAI-compatible adapter content. Standard error beyond its retained limit is drained but not stored. The report limit truncates only the shareable HTML view; scored artifacts remain unchanged according to the storage-retention policy. Zero values and values above the compiled hard ceilings fail configuration validation before execution.

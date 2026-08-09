@@ -17,13 +17,19 @@ StructTrace does not sandbox user executables.
 
 JSON Schema remote retrieval is disabled. The local report server binds to a
 random `127.0.0.1` port and does not expose a public listener. Generated reports
-contain no external scripts, CDN assets, analytics, or telemetry.
+contain no external scripts, CDN assets, analytics, or telemetry. Case bodies are
+lazy-loaded from bounded local chunks, and an aggregate-only share export omits all case data.
 
 Variant output, provider response envelopes, subprocess standard error, and
 report-embedded raw values are bounded. User-configurable limits cannot exceed
 compiled hard ceilings. Oversized values fail closed or are explicitly
 truncated in the display-only report view; they are never silently scored from
 partial text.
+
+Command and Python subprocesses run in bounded process trees where the operating system supports
+it. Case timeouts and persistent shutdown deadlines terminate descendants and bound reader joins.
+Provider retries and backoff are contained by one total per-case deadline. HTTP error bodies are
+not copied into user-facing errors when provider-response retention is disabled.
 
 ## Credentials
 
@@ -38,9 +44,10 @@ the local run bundle.
 ## Sensitive output
 
 Use `storage.retain_raw_outputs: false` when original output text must not enter
-portable artifacts. Configure `storage.redaction.json_pointers` before exporting
-or sharing reports. Redaction is a defensive control, not a substitute for
-reviewing a report generated from sensitive data.
+portable artifacts. Configure `storage.redaction.json_pointers` before opening a case-level report.
+For sharing, prefer `structtrace report latest --export-share <directory>`, which contains
+aggregates and provenance but no case-level values. Redaction is a defensive control, not a
+substitute for reviewing an artifact generated from sensitive data.
 
 Run directories are local files and inherit filesystem permissions from the
 user and host. Encrypt or delete them according to the organization’s data

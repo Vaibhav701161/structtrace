@@ -48,6 +48,10 @@ pub const HARD_MAX_OUTPUT_BYTES_PER_CASE: usize = 64 * 1024 * 1024;
 pub const HARD_MAX_STDERR_BYTES_PER_PROCESS: usize = 16 * 1024 * 1024;
 /// Hard ceiling for one raw-output value embedded in a report.
 pub const HARD_MAX_REPORT_RAW_BYTES_PER_CASE: usize = 4 * 1024 * 1024;
+/// Hard ceiling for all generated report assets combined.
+pub const HARD_MAX_REPORT_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+/// Hard ceiling for the optional self-contained report export.
+pub const HARD_MAX_SINGLE_FILE_REPORT_BYTES: usize = 100 * 1024 * 1024;
 /// Hard ceiling for one configured adapter or evaluator timeout.
 pub const HARD_MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// Hard ceiling for simultaneous provider requests.
@@ -67,6 +71,10 @@ pub struct LimitsConfig {
     pub max_stderr_bytes_per_process: usize,
     /// Maximum raw-output bytes embedded per variant in the HTML report.
     pub max_report_raw_bytes_per_case: usize,
+    /// Maximum bytes across the generated report directory.
+    pub max_report_total_bytes: usize,
+    /// Maximum bytes allowed for an optional self-contained HTML export.
+    pub max_single_file_report_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -75,6 +83,8 @@ impl Default for LimitsConfig {
             max_output_bytes_per_case: 4 * 1024 * 1024,
             max_stderr_bytes_per_process: 1024 * 1024,
             max_report_raw_bytes_per_case: 256 * 1024,
+            max_report_total_bytes: 256 * 1024 * 1024,
+            max_single_file_report_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -483,6 +493,16 @@ impl Default for BootstrapConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GateConfig {
+    /// Minimum paired case count required for a release decision.
+    pub min_cases: Option<usize>,
+    /// Minimum fraction explicitly scored pass or fail on both variants.
+    pub min_primary_scored_rate: Option<f64>,
+    /// Maximum evaluator-error fraction on either variant.
+    pub max_primary_evaluator_error_rate: Option<f64>,
+    /// Maximum not-applicable fraction on either variant.
+    pub max_primary_not_applicable_rate: Option<f64>,
+    /// Maximum unscored fraction on either variant.
+    pub max_primary_unscored_rate: Option<f64>,
     /// Maximum allowed primary-outcome decline in percentage points.
     pub max_primary_regression_pp: Option<f64>,
     /// Maximum allowed increase in valid-but-wrong rate.
@@ -670,6 +690,16 @@ impl Config {
                 "limits.max_report_raw_bytes_per_case",
                 config.limits.max_report_raw_bytes_per_case,
                 HARD_MAX_REPORT_RAW_BYTES_PER_CASE,
+            ),
+            (
+                "limits.max_report_total_bytes",
+                config.limits.max_report_total_bytes,
+                HARD_MAX_REPORT_TOTAL_BYTES,
+            ),
+            (
+                "limits.max_single_file_report_bytes",
+                config.limits.max_single_file_report_bytes,
+                HARD_MAX_SINGLE_FILE_REPORT_BYTES,
             ),
         ] {
             if value == 0 || value > maximum {
@@ -978,6 +1008,11 @@ fn validate_json_pointer(name: &str, pointer: &str) -> Result<()> {
 }
 
 fn validate_gate(gate: &GateConfig) -> Result<()> {
+    if gate.min_cases == Some(0) {
+        return Err(CoreError::Configuration(
+            "gate.min_cases must be at least 1".to_owned(),
+        ));
+    }
     for (name, value) in [
         ("max_primary_regression_pp", gate.max_primary_regression_pp),
         (
@@ -992,6 +1027,16 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
         }
     }
     for (name, value) in [
+        ("min_primary_scored_rate", gate.min_primary_scored_rate),
+        (
+            "max_primary_evaluator_error_rate",
+            gate.max_primary_evaluator_error_rate,
+        ),
+        (
+            "max_primary_not_applicable_rate",
+            gate.max_primary_not_applicable_rate,
+        ),
+        ("max_primary_unscored_rate", gate.max_primary_unscored_rate),
         (
             "min_candidate_schema_validity",
             gate.min_candidate_schema_validity,

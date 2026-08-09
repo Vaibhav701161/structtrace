@@ -5,8 +5,12 @@ use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
+    task::JoinHandle,
     time::{Instant, timeout},
 };
+
+const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const READER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 use serde_json::Value;
 use structtrace_core::{
@@ -78,10 +82,13 @@ async fn run_persistent(
             return all_failed(cases, "process_spawn", &error.to_string());
         }
     };
+    let process_id = child.id();
     let Some(mut stdin) = child.stdin.take() else {
+        terminate_process_tree(&mut child, process_id).await;
         return all_failed(cases, "process_spawn", "could not open child stdin");
     };
     let Some(stdout) = child.stdout.take() else {
+        terminate_process_tree(&mut child, process_id).await;
         return all_failed(cases, "process_spawn", "could not open child stdout");
     };
     let stderr_task = child
@@ -102,12 +109,10 @@ async fn run_persistent(
         let serialized = match serde_json::to_vec(&request) {
             Ok(value) => value,
             Err(error) => {
-                rows.push(error_output(
-                    &case.id,
-                    "protocol_encode",
-                    &error.to_string(),
-                    None,
-                ));
+                let message = error.to_string();
+                terminate_process_tree(&mut child, process_id).await;
+                rows.push(error_output(&case.id, "protocol_encode", &message, None));
+                terminal_failure = Some(("process_terminated".to_owned(), message));
                 continue;
             }
         };
@@ -160,7 +165,7 @@ async fn run_persistent(
                     Some(elapsed_ms(started)),
                 ));
                 terminal_failure = Some(("process_terminated_after_timeout".to_owned(), message));
-                let _ = child.kill().await;
+                terminate_process_tree(&mut child, process_id).await;
             }
             Ok(Err(LimitedLineError::Io(message))) => {
                 let message = format!("could not read response: {message}");
@@ -181,7 +186,7 @@ async fn run_persistent(
                     Some(elapsed_ms(started)),
                 ));
                 terminal_failure = Some(("protocol_aborted".to_owned(), message));
-                let _ = child.kill().await;
+                terminate_process_tree(&mut child, process_id).await;
             }
             Ok(Err(LimitedLineError::Limit)) => {
                 let message = format!(
@@ -195,7 +200,7 @@ async fn run_persistent(
                     Some(elapsed_ms(started)),
                 ));
                 terminal_failure = Some(("protocol_aborted".to_owned(), message));
-                let _ = child.kill().await;
+                terminate_process_tree(&mut child, process_id).await;
             }
             Ok(Ok(None)) => {
                 let message = "process closed stdout before returning a response".to_owned();
@@ -221,7 +226,7 @@ async fn run_persistent(
                             Some(latency),
                         ));
                         terminal_failure = Some(("protocol_aborted".to_owned(), message));
-                        let _ = child.kill().await;
+                        terminate_process_tree(&mut child, process_id).await;
                     }
                 }
             }
@@ -241,7 +246,7 @@ async fn run_persistent(
             _ => {}
         }
     }
-    match timeout(Duration::from_secs(2), child.wait()).await {
+    match timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await {
         Ok(Ok(status)) if !status.success() && terminal_failure.is_none() => {
             let message = format!("persistent process exited unsuccessfully with {status}");
             protocol_errors.push(message.clone());
@@ -252,10 +257,28 @@ async fn run_persistent(
         Ok(Err(error)) if terminal_failure.is_none() => {
             protocol_errors.push(format!("could not wait for persistent process: {error}"));
         }
+        Err(_) if terminal_failure.is_none() => {
+            let message = format!(
+                "persistent process ignored EOF and exceeded the {} ms shutdown grace period",
+                PROCESS_SHUTDOWN_GRACE.as_millis()
+            );
+            protocol_errors.push(message.clone());
+            terminate_process_tree(&mut child, process_id).await;
+            for (case, row) in cases.iter().zip(&mut rows) {
+                *row = error_output(
+                    &case.id,
+                    "process_shutdown_timeout",
+                    &message,
+                    row.latency_ms,
+                );
+            }
+        }
+        Err(_) => terminate_process_tree(&mut child, process_id).await,
         _ => {}
     }
+    terminate_remaining_process_tree(process_id).await;
     let stderr = match stderr_task {
-        Some(task) => task.await.unwrap_or_default(),
+        Some(task) => bounded_stderr_task(task, &mut protocol_errors).await,
         None => Vec::new(),
     };
     AdapterRun {
@@ -338,6 +361,7 @@ async fn run_per_case(
                 continue;
             }
         };
+        let process_id = child.id();
         let request = VariantRequest::from(case);
         let encoded = match serde_json::to_vec(&request) {
             Ok(mut encoded) => {
@@ -345,6 +369,7 @@ async fn run_per_case(
                 encoded
             }
             Err(error) => {
+                terminate_process_tree(&mut child, process_id).await;
                 rows.push(error_output(
                     &case.id,
                     "protocol_encode",
@@ -355,6 +380,7 @@ async fn run_per_case(
             }
         };
         let Some(mut child_stdin) = child.stdin.take() else {
+            terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
                 "process_spawn",
@@ -364,6 +390,7 @@ async fn run_per_case(
             continue;
         };
         if let Err(error) = child_stdin.write_all(&encoded).await {
+            terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
                 "protocol_io",
@@ -374,6 +401,7 @@ async fn run_per_case(
         }
         drop(child_stdin);
         let Some(child_stdout) = child.stdout.take() else {
+            terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
                 "process_spawn",
@@ -383,6 +411,7 @@ async fn run_per_case(
             continue;
         };
         let Some(child_stderr) = child.stderr.take() else {
+            terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
                 "process_spawn",
@@ -398,19 +427,11 @@ async fn run_per_case(
         let wait = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
         let timed_out = wait.is_err();
         if timed_out {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_process_tree(&mut child, process_id).await;
         }
-        let stdout_result = stdout_task.await.unwrap_or_else(|error| {
-            Err(std::io::Error::other(format!(
-                "stdout reader task failed: {error}"
-            )))
-        });
-        let stderr_result = stderr_task.await.unwrap_or_else(|error| {
-            Err(std::io::Error::other(format!(
-                "stderr reader task failed: {error}"
-            )))
-        });
+        terminate_remaining_process_tree(process_id).await;
+        let stdout_result = bounded_reader_task(stdout_task, "stdout", &mut protocol_errors).await;
+        let stderr_result = bounded_reader_task(stderr_task, "stderr", &mut protocol_errors).await;
         if let Ok((diagnostics, _)) = stderr_result {
             retain_bytes(&mut stderr, &diagnostics, limits.max_stderr_bytes);
         }
@@ -525,7 +546,112 @@ fn spawn(spec: &CommandSpec, working_directory: &Path) -> std::io::Result<Child>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     command.spawn()
+}
+
+async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
+    terminate_tree_signal(process_id, false).await;
+    if timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await.is_ok() {
+        return;
+    }
+    terminate_tree_signal(process_id, true).await;
+    let _ = child.start_kill();
+    let _ = timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await;
+}
+
+#[cfg(unix)]
+async fn terminate_remaining_process_tree(process_id: Option<u32>) {
+    terminate_tree_signal(process_id, true).await;
+}
+
+#[cfg(windows)]
+async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
+
+#[cfg(unix)]
+async fn terminate_tree_signal(process_id: Option<u32>, force: bool) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let signal = if force { "-KILL" } else { "-TERM" };
+    let _ = Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{process_id}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+#[cfg(windows)]
+async fn terminate_tree_signal(process_id: Option<u32>, force: bool) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let process_id = process_id.to_string();
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", process_id.as_str(), "/T"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if force {
+        command.arg("/F");
+    }
+    let _ = command.status().await;
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_tree_signal(_process_id: Option<u32>, _force: bool) {}
+
+async fn bounded_stderr_task(
+    mut task: JoinHandle<Vec<u8>>,
+    protocol_errors: &mut Vec<String>,
+) -> Vec<u8> {
+    match timeout(READER_SHUTDOWN_GRACE, &mut task).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            protocol_errors.push(format!("stderr reader task failed: {error}"));
+            Vec::new()
+        }
+        Err(_) => {
+            task.abort();
+            protocol_errors.push("stderr reader task exceeded its shutdown deadline".to_owned());
+            Vec::new()
+        }
+    }
+}
+
+async fn bounded_reader_task(
+    mut task: JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+    stream_name: &str,
+    protocol_errors: &mut Vec<String>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    match timeout(READER_SHUTDOWN_GRACE, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(std::io::Error::other(format!(
+            "{stream_name} reader task failed: {error}"
+        ))),
+        Err(_) => {
+            task.abort();
+            protocol_errors.push(format!(
+                "{stream_name} reader task exceeded its shutdown deadline"
+            ));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{stream_name} reader task exceeded its shutdown deadline"),
+            ))
+        }
+    }
 }
 
 fn parse_response(line: &str, case_id: &str, latency_ms: u64) -> anyhow::Result<VariantOutput> {
@@ -643,12 +769,19 @@ mod tests {
 
     const HELPER: &str = r#"import argparse
 import json
+import os
+import subprocess
 import sys
 import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", default="success")
 args = parser.parse_args()
+
+if args.mode == "grandchild-stderr":
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+if args.mode == "timeout-tree":
+    subprocess.Popen([sys.executable, "-c", "import pathlib,time; time.sleep(1); pathlib.Path('grandchild-survived').write_text('alive')"])
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -657,6 +790,8 @@ for line in sys.stdin:
         sys.exit(17)
     if args.mode == "timeout":
         time.sleep(1)
+    if args.mode == "timeout-tree":
+        time.sleep(60)
     if args.mode == "stderr":
         print("diagnostic for " + case_id, file=sys.stderr, flush=True)
     if args.mode == "malformed":
@@ -680,6 +815,8 @@ for line in sys.stdin:
         print(json.dumps(response), flush=True)
     if args.mode == "nonzero":
         sys.exit(9)
+if args.mode == "ignore-eof":
+    time.sleep(60)
 "#;
 
     fn cases() -> Vec<VariantCase> {
@@ -905,6 +1042,64 @@ for line in sys.stdin:
                 Some("process_exit")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn persistent_process_that_ignores_eof_is_killed() {
+        let (directory, spec) = fixture("ignore-eof");
+        let started = Instant::now();
+        let run = run_command(
+            &spec,
+            ProcessMode::Persistent,
+            FIXTURE_TIMEOUT_MS,
+            &cases()[..1],
+            directory.path(),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
+            Some("process_shutdown_timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn grandchild_inheriting_stderr_does_not_hang_reader_tasks() {
+        let (directory, spec) = fixture("grandchild-stderr");
+        let started = Instant::now();
+        let run = run_command(
+            &spec,
+            ProcessMode::Persistent,
+            FIXTURE_TIMEOUT_MS,
+            &cases()[..1],
+            directory.path(),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(run.rows[0].status, OutputStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_process_tree() {
+        let (directory, spec) = fixture("timeout-tree");
+        let run = run_command(
+            &spec,
+            ProcessMode::Persistent,
+            25,
+            &cases()[..1],
+            directory.path(),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert_eq!(
+            run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
+            Some("timeout")
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!directory.path().join("grandchild-survived").exists());
     }
 
     #[test]

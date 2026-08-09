@@ -7,8 +7,8 @@ Target length: 6 minutes.
 3. Create `structtrace init first-check --template recorded`.
 4. Walk through the generated dataset, schema, recorded outputs, evaluator, outcome, and gate.
 5. Run `structtrace run`.
-6. Explain why the command succeeds even though the quality gate fails.
-7. Run `structtrace gate latest`; show exit code 10.
+6. Explain why analysis succeeds even though two cases are insufficient release evidence.
+7. Run `structtrace gate latest`; show `INSUFFICIENT_EVIDENCE` and exit code 12.
 8. Run `structtrace replay latest` and show zero mismatches.
 
 Keep the demo offline. No credentials or external services should appear on screen.

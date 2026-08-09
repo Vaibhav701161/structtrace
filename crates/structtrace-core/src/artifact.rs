@@ -105,6 +105,9 @@ pub struct RunManifest {
     pub gate: GateConfig,
     /// Bootstrap settings.
     pub bootstrap: BootstrapConfig,
+    /// Fixed variant execution order used by this artifact format.
+    #[serde(default = "default_execution_schedule")]
+    pub execution_schedule: String,
     /// Compilation target architecture and OS.
     pub binary_target: String,
     /// Environment variable names and presence only.
@@ -139,6 +142,7 @@ impl RunManifest {
             evaluation_definition: Value::Null,
             gate: GateConfig::default(),
             bootstrap: BootstrapConfig::default(),
+            execution_schedule: default_execution_schedule(),
             binary_target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             environment: BTreeMap::new(),
             artifacts: BTreeMap::new(),
@@ -148,6 +152,10 @@ impl RunManifest {
             status: RunStatus::Created,
         }
     }
+}
+
+fn default_execution_schedule() -> String {
+    "blocked_baseline_then_candidate".to_owned()
 }
 
 fn unix_millis() -> u128 {

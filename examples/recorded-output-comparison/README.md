@@ -7,4 +7,5 @@ cd examples/recorded-output-comparison
 cargo run --manifest-path ../../Cargo.toml -p structtrace-cli -- --project-root . run
 ```
 
-The candidate is schema-valid on both cases but misclassifies one. The report therefore exposes one candidate valid-but-wrong row and the gate fails.
+The candidate is schema-valid on both cases but misclassifies one. The report exposes one candidate
+valid-but-wrong row; the two-case fixture is `INSUFFICIENT EVIDENCE`, not a deployment decision.

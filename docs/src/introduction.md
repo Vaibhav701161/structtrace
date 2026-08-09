@@ -1,6 +1,9 @@
 # Introduction
 
-StructTrace is a local-first paired regression harness for structured LLM outputs. It answers one deployment question: when a model, prompt, schema, decoder, or provider setting changes, did the candidate become more or less correct on the same cases?
+StructTrace is a local-first paired regression harness for structured extraction outputs. It
+answers one deployment question: while the caller-facing schema stays fixed, did a change to the
+model, prompt, decoder, provider setting, or implementation make the candidate more or less
+correct on the same cases?
 
 The central distinction is deliberate. JSON parsing and JSON Schema validation tell you whether an output satisfies a structural contract. They do not tell you whether a classification, extracted amount, tool argument, or workflow result is correct. StructTrace records both classes of evidence and makes outputs that are structurally valid but semantically wrong directly inspectable.
 

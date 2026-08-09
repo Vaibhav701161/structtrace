@@ -440,14 +440,21 @@ pub fn finalize_prepared_for_run(
     manifest.completed_at_unix_ms = Some(unix_millis());
     manifest.status = RunStatus::Analyzing;
     atomic_write_json(&run_dir.join("manifest.json"), &manifest)?;
-    let report = structtrace_report::generate(&run_dir)?;
-    let report_relative = "report/index.html";
-    let report_digest = hash_file(&report.index_path)?;
-    let report_length = std::fs::metadata(&report.index_path)?.len();
-    manifest
-        .artifacts
-        .insert(report_relative.to_owned(), report_digest.clone());
-    store.record_artifact(report_relative, &report_digest, report_length)?;
+    structtrace_report::generate(&run_dir)?;
+    let mut report_files = Vec::new();
+    collect_files(&run_dir.join("report"), &mut report_files)?;
+    report_files.sort();
+    for path in report_files {
+        let relative = path
+            .strip_prefix(&run_dir)
+            .context("report artifact escaped the run directory")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let digest = hash_file(&path)?;
+        let length = std::fs::metadata(&path)?.len();
+        manifest.artifacts.insert(relative.clone(), digest.clone());
+        store.record_artifact(&relative, &digest, length)?;
+    }
     store.set_status(&run_id, RunStatus::Complete)?;
     store.checkpoint()?;
     manifest.artifacts.insert(
@@ -465,6 +472,18 @@ pub fn finalize_prepared_for_run(
         summary,
         manifest,
     })
+}
+
+fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            collect_files(&entry.path(), output)?;
+        } else {
+            output.push(entry.path());
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,6 +609,13 @@ pub fn apply_storage_retention(
             row.raw_output = None;
         }
         if !retain_provider_responses {
+            if let Some(error) = row
+                .error
+                .as_mut()
+                .filter(|error| error.kind == "provider_error")
+            {
+                error.message = "Provider rejected the request.".to_owned();
+            }
             if let Some(metadata) = row.metadata.as_object_mut() {
                 metadata.remove("provider_response");
             }
@@ -670,6 +696,26 @@ pub(crate) fn build_summary(
     let gate = evaluate_gate(
         &config.gate,
         &GateInputs {
+            total_cases: records.len(),
+            primary_scored_rate: rate(
+                (baseline.primary_pass + baseline.primary_failed)
+                    .min(candidate.primary_pass + candidate.primary_failed),
+                records.len(),
+            ),
+            primary_evaluator_error_rate: rate(
+                baseline.primary_error.max(candidate.primary_error),
+                records.len(),
+            ),
+            primary_not_applicable_rate: rate(
+                baseline
+                    .primary_not_applicable
+                    .max(candidate.primary_not_applicable),
+                records.len(),
+            ),
+            primary_unscored_rate: rate(
+                baseline.primary_unscored.max(candidate.primary_unscored),
+                records.len(),
+            ),
             primary: &paired,
             baseline_valid_but_wrong_rate: rate(baseline.valid_but_wrong, baseline.total),
             candidate_valid_but_wrong_rate: rate(candidate.valid_but_wrong, candidate.total),
@@ -960,11 +1006,7 @@ fn transition_name(baseline: bool, candidate: bool) -> &'static str {
 }
 
 fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
-    let gate = if summary.gate.passed {
-        "PASSED"
-    } else {
-        "FAILED"
-    };
+    let gate = summary.gate.status.label();
     format!(
         "# StructTrace run: {project_name}\n\n\
          **Release gate: {gate}**\n\n\
@@ -1106,7 +1148,7 @@ gate:
         assert_eq!(run.summary.candidate.primary_pass, 0);
         assert_eq!(run.summary.candidate.total, 2);
         assert_eq!(run.summary.candidate.errors, 1);
-        assert!(!run.summary.gate.passed);
+        assert!(!run.summary.gate.status.is_passed());
         assert!(run.run_dir.join("manifest.json").is_file());
         assert!(run.run_dir.join("run.sqlite3").is_file());
     }
@@ -1170,10 +1212,13 @@ analysis:
             source_bytes: source,
             rows: vec![structtrace_core::output::VariantOutput {
                 case_id: "one".to_owned(),
-                status: OutputStatus::Ok,
+                status: OutputStatus::Error,
                 raw_output: Some("{\"label\":\"yes\"}".to_owned()),
                 parsed_output: None,
-                error: None,
+                error: Some(structtrace_core::output::OutputError {
+                    kind: "provider_error".to_owned(),
+                    message: "provider echoed SECRET_DOCUMENT_91f2".to_owned(),
+                }),
                 latency_ms: None,
                 usage: None,
                 cost: None,
@@ -1192,14 +1237,71 @@ analysis:
             prepared.rows[0].parsed_output,
             Some(serde_json::json!({"label": "yes"}))
         );
-        assert!(
-            !String::from_utf8(prepared.source_bytes)
-                .unwrap()
-                .contains("raw_output")
-        );
+        assert!(!String::from_utf8_lossy(&prepared.source_bytes).contains("raw_output"));
         assert!(prepared.rows[0].metadata.get("provider_response").is_none());
         assert!(prepared.rows[0].metadata.get("rendered_prompt").is_none());
         assert!(prepared.rows[0].retries[0].get("response").is_none());
+        assert!(
+            !prepared.rows[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("SECRET")
+        );
+        assert!(!String::from_utf8_lossy(&prepared.source_bytes).contains("SECRET"));
+    }
+
+    #[test]
+    fn provider_error_secret_is_absent_from_entire_finalized_run() {
+        let root = tempdir().unwrap();
+        let secret = "SECRET_DOCUMENT_91f2";
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"a\",\"input\":{},\"expected\":{\"label\":\"yes\"}}\n",
+        );
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        let output = format!(
+            "{{\"case_id\":\"a\",\"status\":\"error\",\"error\":{{\"kind\":\"provider_error\",\"message\":\"provider echoed {secret}\"}},\"metadata\":{{\"provider_response\":{{\"document\":\"{secret}\"}}}},\"retries\":[{{\"response\":{{\"document\":\"{secret}\"}}}}]}}\n"
+        );
+        write(&root.path().join("baseline.jsonl"), &output);
+        write(&root.path().join("candidate.jsonl"), &output);
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 1
+project: {name: provider-privacy}
+storage: {retain_raw_outputs: false, retain_provider_responses: false}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: exact, kind: exact_json}
+outcomes:
+  correct: {all_of: [exact]}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+"#,
+        );
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        let mut pending = vec![run.run_dir];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    assert!(
+                        !bytes
+                            .windows(secret.len())
+                            .any(|window| window == secret.as_bytes()),
+                        "secret leaked to {}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

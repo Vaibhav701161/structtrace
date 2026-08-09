@@ -10,17 +10,21 @@ use std::{
 
 use anyhow::Context;
 use minijinja::{AutoEscape, Environment};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use structtrace_core::{
     artifact::{PairedCaseRecord, RunManifest, RunStatus, RunSummary},
     config::Config,
+    gate::{GateRuleStatus, GateStatus},
+    hashing::hash_file,
     privacy::{REDACTION_MARKER, redact_matching_values, selected_values},
 };
 use tempfile::NamedTempFile;
 
 /// The report asset format is versioned independently from stored scores.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
+
+const CASE_CHUNK_SIZE: usize = 50;
 
 /// Generated report location.
 #[derive(Debug, Clone)]
@@ -48,6 +52,8 @@ struct ReportView {
     operational_rows: Vec<OperationalRow>,
     hotspots: Vec<HotspotView>,
     cases: Vec<CaseView>,
+    embedded_cases_json: Option<String>,
+    share_derivative: bool,
     manifest_rows: Vec<(String, String)>,
 }
 
@@ -113,6 +119,7 @@ struct CaseView {
     input: String,
     expected: String,
     metadata: String,
+    model_visible_metadata: String,
     baseline_raw: String,
     candidate_raw: String,
     baseline_parsed: String,
@@ -128,6 +135,16 @@ struct CaseView {
     candidate_execution: String,
     baseline_latency: String,
     candidate_latency: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CaseIndexEntry {
+    id: String,
+    transition: String,
+    filters: String,
+    search: String,
+    chunk: usize,
+    offset: usize,
 }
 
 /// Structured JSON difference.
@@ -153,7 +170,8 @@ pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
     );
     let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
     let cases: Vec<PairedCaseRecord> = read_jsonl(&run_dir.join("cases.jsonl"))?;
-    let view = build_view(&summary, &manifest, &cases, &config)?;
+    let mut view = build_view(&summary, &manifest, &cases, &config)?;
+    let case_views = std::mem::take(&mut view.cases);
     let mut environment = Environment::new();
     environment.set_auto_escape_callback(|_| AutoEscape::Html);
     environment.add_template("report.html", TEMPLATE)?;
@@ -162,14 +180,89 @@ pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
     std::fs::create_dir_all(&report_dir)?;
     let index_path = report_dir.join("index.html");
     atomic_write(&index_path, html.as_bytes())?;
+
+    let cases_dir = report_dir.join("cases");
+    std::fs::create_dir_all(&cases_dir)?;
+    let mut case_index = Vec::with_capacity(case_views.len());
+    for (chunk_index, chunk) in case_views.chunks(CASE_CHUNK_SIZE).enumerate() {
+        let chunk_path = cases_dir.join(format!("{chunk_index:05}.json"));
+        atomic_write(&chunk_path, &serde_json::to_vec(chunk)?)?;
+        for (offset, case) in chunk.iter().enumerate() {
+            case_index.push(CaseIndexEntry {
+                id: case.id.clone(),
+                transition: case.transition.clone(),
+                filters: case.filters.clone(),
+                search: format!(
+                    "{} {} {} {}",
+                    case.id, case.metadata, case.model_visible_metadata, case.filters
+                )
+                .to_lowercase(),
+                chunk: chunk_index,
+                offset,
+            });
+        }
+    }
+    atomic_write(
+        &report_dir.join("case-index.json"),
+        &serde_json::to_vec(&case_index)?,
+    )?;
+
+    let mut single_view = build_view(&summary, &manifest, &cases, &config)?;
+    single_view.cases.clear();
+    single_view.embedded_cases_json = Some(serde_json::to_string(&case_views)?);
+    let single_html = environment
+        .get_template("report.html")?
+        .render(single_view)?;
+    if single_html.len() <= config.limits.max_single_file_report_bytes {
+        atomic_write(&report_dir.join("single.html"), single_html.as_bytes())?;
+    }
+
+    let report_bytes = directory_size(&report_dir)?;
+    anyhow::ensure!(
+        report_bytes <= config.limits.max_report_total_bytes as u64,
+        "generated report is {report_bytes} bytes, above limits.max_report_total_bytes ({})",
+        config.limits.max_report_total_bytes
+    );
     Ok(GeneratedReport { index_path })
 }
 
 /// Export the generated report as one self-contained HTML file.
 pub fn export_single_file(run_dir: &Path, destination: &Path) -> anyhow::Result<()> {
     let generated = finalized_report(run_dir)?;
-    let bytes = std::fs::read(&generated.index_path)?;
+    let single_path = generated
+        .index_path
+        .parent()
+        .context("generated report has no directory")?
+        .join("single.html");
+    anyhow::ensure!(
+        single_path.is_file(),
+        "this report exceeds limits.max_single_file_report_bytes; use the chunked report directory"
+    );
+    let bytes = std::fs::read(single_path)?;
     atomic_write(destination, &bytes)
+}
+
+/// Export an aggregate-only report derivative with no case bodies, prompts, outputs, or metadata.
+pub fn export_share_directory(run_dir: &Path, destination: &Path) -> anyhow::Result<()> {
+    finalized_report(run_dir)?;
+    anyhow::ensure!(
+        !destination.exists(),
+        "share destination already exists: {}",
+        destination.display()
+    );
+    let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
+    let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    verify_bound_artifact(run_dir, &manifest, "summary.json")?;
+    let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
+    let mut view = build_view(&summary, &manifest, &[], &config)?;
+    view.share_derivative = true;
+    let mut environment = Environment::new();
+    environment.set_auto_escape_callback(|_| AutoEscape::Html);
+    environment.add_template("report.html", TEMPLATE)?;
+    let html = environment.get_template("report.html")?.render(view)?;
+    std::fs::create_dir_all(destination)?;
+    atomic_write(&destination.join("index.html"), html.as_bytes())?;
+    atomic_write(&destination.join("case-index.json"), b"[]")
 }
 
 /// Serve a report on a random loopback-only port until interrupted.
@@ -212,7 +305,41 @@ pub fn finalized_report(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
         "finalized report is missing at {}",
         index_path.display()
     );
+    for relative in manifest
+        .artifacts
+        .keys()
+        .filter(|relative| relative.starts_with("report/"))
+    {
+        verify_bound_artifact(run_dir, &manifest, relative)?;
+    }
     Ok(GeneratedReport { index_path })
+}
+
+fn verify_bound_artifact(
+    run_dir: &Path,
+    manifest: &RunManifest,
+    relative: &str,
+) -> anyhow::Result<()> {
+    let relative_path = Path::new(relative);
+    anyhow::ensure!(
+        !relative_path.is_absolute()
+            && relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "manifest contains unsafe artifact path `{relative}`"
+    );
+    let expected = manifest
+        .artifacts
+        .get(relative)
+        .with_context(|| format!("manifest does not bind `{relative}`"))?;
+    let path = run_dir.join(relative_path);
+    anyhow::ensure!(path.is_file(), "bound artifact is missing: {relative}");
+    let observed = hash_file(&path)?;
+    anyhow::ensure!(
+        &observed == expected,
+        "bound artifact hash mismatch for `{relative}`"
+    );
+    Ok(())
 }
 
 /// Compute a JSON-aware recursive diff.
@@ -324,9 +451,33 @@ fn build_view(
             summary.baseline.total,
         ),
         comparison(
-            "Semantic or executable outcome",
+            "Primary outcome pass",
             summary.baseline.primary_pass,
             summary.candidate.primary_pass,
+            summary.baseline.total,
+        ),
+        comparison(
+            "Explicit primary failure",
+            summary.baseline.primary_failed,
+            summary.candidate.primary_failed,
+            summary.baseline.total,
+        ),
+        comparison(
+            "Primary evaluator error",
+            summary.baseline.primary_error,
+            summary.candidate.primary_error,
+            summary.baseline.total,
+        ),
+        comparison(
+            "Primary not applicable",
+            summary.baseline.primary_not_applicable,
+            summary.candidate.primary_not_applicable,
+            summary.baseline.total,
+        ),
+        comparison(
+            "Primary unscored",
+            summary.baseline.primary_unscored,
+            summary.candidate.primary_unscored,
             summary.baseline.total,
         ),
         comparison(
@@ -365,13 +516,13 @@ fn build_view(
             .clone()
             .unwrap_or_else(|| manifest.project_name.clone()),
         run_id: summary.run_id.clone(),
-        gate_label: if summary.gate.passed {
-            "PASSED"
-        } else {
-            "FAILED"
+        gate_label: summary.gate.status.label().to_owned(),
+        gate_class: match summary.gate.status {
+            GateStatus::Passed => "pass",
+            GateStatus::Failed | GateStatus::Error => "fail",
+            GateStatus::NotConfigured | GateStatus::InsufficientEvidence => "warn",
         }
         .to_owned(),
-        gate_class: if summary.gate.passed { "pass" } else { "fail" }.to_owned(),
         default_filter: match config.report.default_case_filter.as_str() {
             "baseline_only_pass"
             | "candidate_only_pass"
@@ -403,10 +554,12 @@ fn build_view(
             .rules
             .iter()
             .map(|rule| {
-                let (state, class) = match rule.passed {
-                    Some(true) => ("passed", "pass"),
-                    Some(false) => ("failed", "fail"),
-                    None => ("not evaluated", "neutral"),
+                let (state, class) = match rule.status {
+                    GateRuleStatus::Passed => ("passed", "pass"),
+                    GateRuleStatus::Failed => ("failed", "fail"),
+                    GateRuleStatus::NotConfigured => ("not configured", "neutral"),
+                    GateRuleStatus::InsufficientEvidence => ("insufficient evidence", "warn"),
+                    GateRuleStatus::Error => ("error", "fail"),
                 };
                 GateRuleView {
                     name: rule.rule.clone(),
@@ -429,6 +582,8 @@ fn build_view(
             })
             .collect(),
         cases,
+        embedded_cases_json: None,
+        share_derivative: false,
         manifest_rows: vec![
             ("Run ID".to_owned(), manifest.run_id.clone()),
             (
@@ -436,8 +591,60 @@ fn build_view(
                 manifest.structtrace_version.clone(),
             ),
             (
+                "Primary outcome".to_owned(),
+                summary.primary_outcome.clone(),
+            ),
+            (
+                "Evaluation definition".to_owned(),
+                compact_json(&manifest.evaluation_definition),
+            ),
+            (
+                "Total paired cases".to_owned(),
+                summary.paired.total.to_string(),
+            ),
+            (
+                "Primary scored cases".to_owned(),
+                format!(
+                    "baseline {} / {}, candidate {} / {}",
+                    summary.baseline.primary_pass + summary.baseline.primary_failed,
+                    summary.baseline.total,
+                    summary.candidate.primary_pass + summary.candidate.primary_failed,
+                    summary.candidate.total
+                ),
+            ),
+            (
+                "Discordant cases".to_owned(),
+                (summary.paired.baseline_only_pass + summary.paired.candidate_only_pass)
+                    .to_string(),
+            ),
+            (
+                "Exact McNemar p-value".to_owned(),
+                format!("{:.6}", summary.paired.mcnemar_exact_p),
+            ),
+            (
+                "Bootstrap".to_owned(),
+                format!(
+                    "{} samples, {:.1}% interval, seed {}",
+                    summary.bootstrap.samples,
+                    summary.bootstrap.confidence * 100.0,
+                    summary.bootstrap.seed
+                ),
+            ),
+            (
+                "Execution schedule".to_owned(),
+                manifest.execution_schedule.clone(),
+            ),
+            (
+                "Variant definitions".to_owned(),
+                compact_json(&manifest.variants),
+            ),
+            (
                 "Artifact format".to_owned(),
                 manifest.artifact_format_version.to_string(),
+            ),
+            (
+                "Report format".to_owned(),
+                REPORT_FORMAT_VERSION.to_string(),
             ),
             ("Dataset hash".to_owned(), manifest.dataset_hash.clone()),
             ("Schema hash".to_owned(), manifest.schema_hash.clone()),
@@ -448,6 +655,20 @@ fn build_view(
             ("Binary target".to_owned(), manifest.binary_target.clone()),
         ],
     })
+}
+
+fn directory_size(path: &Path) -> anyhow::Result<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        total = total.saturating_add(if metadata.is_dir() {
+            directory_size(&entry.path())?
+        } else {
+            metadata.len()
+        });
+    }
+    Ok(total)
 }
 
 fn operational_rows(summary: &RunSummary) -> Vec<OperationalRow> {
@@ -612,6 +833,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         "id": record.case.id,
         "input": record.case.input,
         "expected": record.case.expected,
+        "model_visible_metadata": record.case.model_visible_metadata,
         "metadata": record.case.metadata,
     });
     let secrets = selected_values(&source, &config.storage.redaction.json_pointers);
@@ -663,6 +885,22 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
     {
         filters.push("adapter_error".to_owned());
     }
+    let primary = &config.analysis.primary_outcome;
+    let primary_statuses = [
+        record.baseline_evaluation.outcomes.get(primary),
+        record.candidate_evaluation.outcomes.get(primary),
+    ];
+    if primary_statuses.contains(&Some(&structtrace_core::evaluation::OutcomeStatus::Error)) {
+        filters.push("evaluator_error".to_owned());
+    }
+    if primary_statuses.contains(&Some(
+        &structtrace_core::evaluation::OutcomeStatus::NotApplicable,
+    )) {
+        filters.push("not_applicable".to_owned());
+    }
+    if primary_statuses.contains(&None) {
+        filters.push("unscored".to_owned());
+    }
     let baseline_parsed = redacted_value
         .pointer("/baseline_evaluation/parsed_output")
         .cloned()
@@ -688,6 +926,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         input: pretty_json(pointer_or_null(&redacted_value, "/case/input")),
         expected: optional_pretty(&redacted_value, "/case/expected"),
         metadata: optional_pretty(&redacted_value, "/case/metadata"),
+        model_visible_metadata: optional_pretty(&redacted_value, "/case/model_visible_metadata"),
         baseline_raw: raw_for_report(
             &redacted_value,
             "/baseline_output/raw_output",
@@ -908,12 +1147,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif} a{color:var(--blue)}
     header{background:#0b2138;color:#fff;border-bottom:1px solid #29425e} .bar{max-width:1180px;margin:auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{font-weight:800;letter-spacing:.01em}.tagline{color:#c5d5e8;font-size:13px}
     main{max-width:1180px;margin:auto;padding:28px 24px 80px} h1{font-size:clamp(30px,5vw,48px);line-height:1.05;margin:.15em 0} h2{margin-top:48px;font-size:24px} h3{font-size:17px}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-weight:800;font-size:11px;color:var(--blue)} .muted{color:var(--muted)}
-    .hero{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:end}.gate{padding:14px 18px;border-radius:12px;font-weight:900;letter-spacing:.08em}.gate.pass{background:#d8f5e8;color:#075b40}.gate.fail{background:#fee4e2;color:#8f1710}
+    .hero{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:end}.gate{padding:14px 18px;border-radius:12px;font-weight:900;letter-spacing:.08em}.gate.pass{background:#d8f5e8;color:#075b40}.gate.fail{background:#fee4e2;color:#8f1710}.gate.warn{background:#fff0c7;color:#714100}
     .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:26px 0}.metric,.panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 4px 18px rgba(20,34,56,.04)}.metric strong{font-size:26px;display:block}.metric span{color:var(--muted);font-size:12px}
     table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line)}th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line)}th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}td.num{text-align:right;font-variant-numeric:tabular-nums}
     .matrix{display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));max-width:520px;border:1px solid var(--line);border-radius:12px;overflow:hidden}.cell{padding:24px;border:1px solid var(--line);background:var(--surface)}.cell strong{display:block;font-size:30px}.cell.win{background:color-mix(in srgb,var(--green) 13%,var(--surface))}.cell.loss{background:color-mix(in srgb,var(--red) 13%,var(--surface))}
-    .rule{display:grid;grid-template-columns:110px 1fr;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}.pill{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.pill.pass{color:var(--green)}.pill.fail{color:var(--red)}.pill.neutral{color:var(--muted)}
-    .filters{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}.filters button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;padding:7px 12px;cursor:pointer}.filters button[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}
+    .rule{display:grid;grid-template-columns:150px 1fr;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}.pill{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.pill.pass{color:var(--green)}.pill.fail{color:var(--red)}.pill.warn{color:var(--amber)}.pill.neutral{color:var(--muted)}
+    .filters{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}.filters button,.pager button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;padding:7px 12px;cursor:pointer}.filters button[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}.case-tools{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:12px;align-items:center}.case-tools input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--ink)}.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0}.pager-controls{display:flex;gap:8px}
     .case{background:var(--surface);border:1px solid var(--line);border-radius:12px;margin:10px 0;overflow:hidden}.case>summary{cursor:pointer;padding:14px 16px;font-weight:700}.case-body{padding:0 16px 18px}.case-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.code{background:var(--code);color:#e7eef8;border-radius:9px;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.diff{display:grid;grid-template-columns:minmax(90px,.7fr) .6fr 1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line)}.diff>*{background:var(--surface);padding:8px;overflow-wrap:anywhere}.diff .head{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted)}
     .repro{display:grid;grid-template-columns:minmax(160px,.4fr) 1fr;gap:1px;background:var(--line);border:1px solid var(--line)}.repro>*{padding:9px;background:var(--surface);overflow-wrap:anywhere}.empty{color:var(--muted);font-style:italic}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
     footer{margin-top:60px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}@media(max-width:760px){.hero{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.case-grid{grid-template-columns:1fr}.diff{grid-template-columns:1fr}.diff .head{display:none}.repro{grid-template-columns:1fr}.bar{align-items:flex-start;flex-direction:column}}@media(max-width:420px){main{padding-left:14px;padding-right:14px}.metrics{grid-template-columns:1fr}}
@@ -924,6 +1163,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 <header><div class="bar"><div><div class="brand">StructTrace</div><div class="tagline">Your schema passed. Did the answer?</div></div><div>Local paired regression report</div></div></header>
 <main>
   <section class="hero"><div><div class="eyebrow">Structured-output release evidence</div><h1>{{ project_name }}</h1><p class="muted">Run {{ run_id }}</p></div><div class="gate {{ gate_class }}">{{ gate_label }}</div></section>
+  {% if share_derivative %}<div class="panel"><strong>Aggregate-only share derivative</strong><p class="muted">Case inputs, expected values, outputs, prompts, adapter metadata, and evaluation metadata were deliberately omitted. Use the hash-bound local run for case-level audit.</p></div>{% endif %}
   <section class="metrics" aria-label="Executive summary">
     <div class="metric"><span>Baseline primary outcome</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
     <div class="metric"><span>Candidate primary outcome</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
@@ -940,7 +1180,7 @@ const TEMPLATE: &str = r##"<!doctype html>
   <h2>Paired transition matrix</h2>
   <div class="matrix" aria-label="Paired transition matrix"><div class="cell"><span>Both pass</span><strong>{{ transition.both_pass }}</strong></div><div class="cell loss"><span>Baseline-only pass</span><strong>{{ transition.baseline_only }}</strong></div><div class="cell win"><span>Candidate-only pass</span><strong>{{ transition.candidate_only }}</strong></div><div class="cell"><span>Both fail</span><strong>{{ transition.both_fail }}</strong></div></div>
 
-  <h2>Release gate</h2><div class="panel">{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}</div>
+  <h2>Release gate</h2><div class="panel">{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
 
   <h2>Evaluator results</h2><table><thead><tr><th>Evaluator</th><th>Baseline passes</th><th>Candidate passes</th></tr></thead><tbody>{% for row in evaluator_rows %}<tr><td><code>{{ row.label }}</code></td><td class="num">{{ row.baseline.count }}/{{ row.baseline.total }}</td><td class="num">{{ row.candidate.count }}/{{ row.candidate.total }}</td></tr>{% endfor %}</tbody></table>
 
@@ -948,29 +1188,32 @@ const TEMPLATE: &str = r##"<!doctype html>
 
   <h2>Field-level hotspots</h2>{% if hotspots %}<table><thead><tr><th>JSON Pointer</th><th>Candidate regressions</th><th>Candidate improvements</th><th>Candidate failures</th></tr></thead><tbody>{% for item in hotspots %}<tr><td><code>{{ item.pointer }}</code></td><td class="num">{{ item.regressions }}</td><td class="num">{{ item.improvements }}</td><td class="num">{{ item.failures }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No field-level evaluators were configured.</p>{% endif %}
 
-  <h2>Discordant case explorer</h2>
-  <div class="filters" role="group" aria-label="Case filters"><button data-filter="all" aria-pressed="false">All</button><button data-filter="discordant" aria-pressed="false">Discordant</button><button data-filter="baseline_only_pass" aria-pressed="false">Baseline-only</button><button data-filter="candidate_only_pass" aria-pressed="false">Candidate-only</button><button data-filter="both_fail" aria-pressed="false">Both fail</button><button data-filter="valid_but_wrong" aria-pressed="false">Valid but wrong</button><button data-filter="parse_failure" aria-pressed="false">Parse failures</button><button data-filter="schema_failure" aria-pressed="false">Schema failures</button><button data-filter="adapter_error" aria-pressed="false">Adapter errors</button></div>
-  <div id="cases">{% for case in cases %}<details class="case" data-filters="{{ case.filters }}"><summary>{{ case.id }} · {{ case.transition }}</summary><div class="case-body">
-    <div class="case-grid"><section><h3>Input</h3><pre class="code">{{ case.input }}</pre></section><section><h3>Expected</h3><pre class="code">{{ case.expected }}</pre></section></div>
-    <div class="case-grid"><section><h3>Baseline raw · {{ case.baseline_latency }}</h3><pre class="code">{{ case.baseline_raw }}</pre></section><section><h3>Candidate raw · {{ case.candidate_latency }}</h3><pre class="code">{{ case.candidate_raw }}</pre></section></div>
-    <div class="case-grid"><section><h3>Baseline parsed</h3><pre class="code">{{ case.baseline_parsed }}</pre></section><section><h3>Candidate parsed</h3><pre class="code">{{ case.candidate_parsed }}</pre></section></div>
-    <h3>Structured diff</h3>{% if case.diffs %}<div class="diff"><div class="head">Path</div><div class="head">Change</div><div class="head">Baseline</div><div class="head">Candidate</div>{% for diff in case.diffs %}<code>{{ diff.path }}</code><span>{{ diff.kind }}</span><code>{{ diff.baseline }}</code><code>{{ diff.candidate }}</code>{% endfor %}</div>{% else %}<p class="empty">Parsed outputs are identical.</p>{% endif %}
-    <div class="case-grid"><section><h3>Baseline schema errors</h3><pre class="code">{{ case.baseline_schema_errors }}</pre></section><section><h3>Candidate schema errors</h3><pre class="code">{{ case.candidate_schema_errors }}</pre></section></div>
-    <div class="case-grid"><section><h3>Baseline evaluators</h3><pre class="code">{{ case.baseline_evaluators }}</pre></section><section><h3>Candidate evaluators</h3><pre class="code">{{ case.candidate_evaluators }}</pre></section></div>
-    <div class="case-grid"><section><h3>Baseline execution evidence</h3><pre class="code">{{ case.baseline_execution }}</pre></section><section><h3>Candidate execution evidence</h3><pre class="code">{{ case.candidate_execution }}</pre></section></div>
-    <div class="case-grid"><section><h3>Baseline adapter metadata</h3><pre class="code">{{ case.baseline_metadata }}</pre></section><section><h3>Candidate adapter metadata</h3><pre class="code">{{ case.candidate_metadata }}</pre></section></div>
-    <h3>Case metadata</h3><pre class="code">{{ case.metadata }}</pre>
-  </div></details>{% endfor %}</div>
+  {% if not share_derivative %}<h2>Case explorer</h2>
+  <p class="muted">Case details are loaded in bounded chunks. Search covers case IDs and redacted metadata; filters include outcome, validity, adapter, and evaluator states.</p>
+  <div class="case-tools"><label><span class="sr-only">Search cases</span><input id="case-search" type="search" placeholder="Search case ID or metadata"></label><span id="case-count" class="muted">Loading case index…</span></div>
+  <div class="filters" role="group" aria-label="Case filters"><button data-filter="all" aria-pressed="false">All</button><button data-filter="discordant" aria-pressed="false">Discordant</button><button data-filter="baseline_only_pass" aria-pressed="false">Baseline-only</button><button data-filter="candidate_only_pass" aria-pressed="false">Candidate-only</button><button data-filter="both_fail" aria-pressed="false">Both fail</button><button data-filter="valid_but_wrong" aria-pressed="false">Valid but wrong</button><button data-filter="parse_failure" aria-pressed="false">Parse failures</button><button data-filter="schema_failure" aria-pressed="false">Schema failures</button><button data-filter="adapter_error" aria-pressed="false">Adapter errors</button><button data-filter="evaluator_error" aria-pressed="false">Evaluator errors</button><button data-filter="not_applicable" aria-pressed="false">Not applicable</button><button data-filter="unscored" aria-pressed="false">Unscored</button></div>
+  <div id="cases" aria-live="polite"></div>
+  <div class="pager"><span id="page-status" class="muted"></span><div class="pager-controls"><button id="previous-page" type="button">Previous</button><button id="next-page" type="button">Next</button></div></div>{% endif %}
 
   <h2>Reproducibility</h2><div class="repro">{% for row in manifest_rows %}<strong>{{ row.0 }}</strong><code>{{ row.1 }}</code>{% endfor %}</div><p><code>structtrace replay {{ run_id }}</code></p>
   <footer>Generated locally by StructTrace. No telemetry, external assets, or analytics.</footer>
 </main>
-<script>
-  const buttons=[...document.querySelectorAll('[data-filter]')], cases=[...document.querySelectorAll('.case')];
-  function applyFilter(button){const filter=button.dataset.filter;for(const item of buttons)item.setAttribute('aria-pressed',String(item===button));for(const item of cases)item.hidden=filter!=='all'&&!item.dataset.filters.split(' ').includes(filter);}
-  for(const button of buttons)button.addEventListener('click',()=>applyFilter(button));
-  applyFilter(buttons.find(button=>button.dataset.filter==='{{ default_filter }}')||buttons[0]);
-</script>
+{% if not share_derivative %}<script>
+  const embeddedCases={% if embedded_cases_json %}JSON.parse({{ embedded_cases_json|tojson }}){% else %}null{% endif %};
+  const buttons=[...document.querySelectorAll('[data-filter]')], container=document.getElementById('cases'), search=document.getElementById('case-search'), count=document.getElementById('case-count'), pageStatus=document.getElementById('page-status');
+  const cache=new Map(), pageSize=25;let index=[],filtered=[],activeFilter='{{ default_filter }}',page=0;
+  const element=(name,className,text)=>{const node=document.createElement(name);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node};
+  const section=(title,value)=>{const node=element('section');node.append(element('h3','',title),element('pre','code',value));return node};
+  const grid=(...children)=>{const node=element('div','case-grid');node.append(...children);return node};
+  function renderCase(item){const root=element('details','case'),head=element('summary','',`${item.id} · ${item.transition}`),body=element('div','case-body');root.append(head,body);body.append(grid(section('Input',item.input),section('Expected',item.expected)),grid(section(`Baseline raw · ${item.baseline_latency}`,item.baseline_raw),section(`Candidate raw · ${item.candidate_latency}`,item.candidate_raw)),grid(section('Baseline parsed',item.baseline_parsed),section('Candidate parsed',item.candidate_parsed)),element('h3','','Structured diff'));
+    if(item.diffs.length){const diff=element('div','diff');for(const label of ['Path','Change','Baseline','Candidate'])diff.append(element('div','head',label));for(const row of item.diffs)diff.append(element('code','',row.path),element('span','',row.kind),element('code','',row.baseline),element('code','',row.candidate));body.append(diff)}else body.append(element('p','empty','Parsed outputs are identical.'));
+    body.append(grid(section('Baseline schema errors',item.baseline_schema_errors),section('Candidate schema errors',item.candidate_schema_errors)),grid(section('Baseline evaluators',item.baseline_evaluators),section('Candidate evaluators',item.candidate_evaluators)),grid(section('Baseline execution evidence',item.baseline_execution),section('Candidate execution evidence',item.candidate_execution)),grid(section('Baseline adapter metadata',item.baseline_metadata),section('Candidate adapter metadata',item.candidate_metadata)),grid(section('Model-visible metadata',item.model_visible_metadata),section('Evaluation-only metadata',item.metadata)));return root}
+  async function chunk(number){if(embeddedCases)return embeddedCases.slice(number*50,number*50+50);if(!cache.has(number))cache.set(number,fetch(`cases/${String(number).padStart(5,'0')}.json`).then(response=>{if(!response.ok)throw new Error(`case chunk ${number} could not be loaded`);return response.json()}));return cache.get(number)}
+  async function render(){const start=page*pageSize, rows=filtered.slice(start,start+pageSize), fragments=[];for(const entry of rows){const values=await chunk(entry.chunk);fragments.push(renderCase(values[entry.offset]))}container.replaceChildren(...fragments);count.textContent=`${filtered.length} of ${index.length} cases`;pageStatus.textContent=filtered.length?`Page ${page+1} of ${Math.ceil(filtered.length/pageSize)}`:'No matching cases';document.getElementById('previous-page').disabled=page===0;document.getElementById('next-page').disabled=start+pageSize>=filtered.length}
+  function apply(){const query=search.value.trim().toLowerCase();filtered=index.filter(item=>(activeFilter==='all'||item.filters.split(' ').includes(activeFilter))&&(!query||item.search.includes(query)));page=0;render().catch(error=>{container.textContent=error.message})}
+  for(const button of buttons)button.addEventListener('click',()=>{activeFilter=button.dataset.filter;for(const item of buttons)item.setAttribute('aria-pressed',String(item===button));apply()});search.addEventListener('input',apply);document.getElementById('previous-page').addEventListener('click',()=>{if(page>0){page--;render()}});document.getElementById('next-page').addEventListener('click',()=>{if((page+1)*pageSize<filtered.length){page++;render()}});
+  (async()=>{index=embeddedCases?embeddedCases.map((item,position)=>({id:item.id,transition:item.transition,filters:item.filters,search:`${item.id} ${item.metadata} ${item.model_visible_metadata} ${item.filters}`.toLowerCase(),chunk:Math.floor(position/50),offset:position%50})):await fetch('case-index.json').then(response=>response.json());const initial=buttons.find(button=>button.dataset.filter===activeFilter)||buttons[0];initial.click()})().catch(error=>{container.textContent=`Report data could not be loaded: ${error.message}`});
+</script>{% endif %}
 </body></html>"##;
 
 #[cfg(test)]
@@ -1007,13 +1250,21 @@ mod tests {
     }
 
     fn passing_record(id: String, input: Value) -> PairedCaseRecord {
-        let expected = json!({"answer": "ok"});
+        passing_record_with_expected(id, input, json!({"answer": "ok"}), None)
+    }
+
+    fn passing_record_with_expected(
+        id: String,
+        input: Value,
+        expected: Value,
+        metadata: Option<Value>,
+    ) -> PairedCaseRecord {
         let case = Case {
             id,
             input,
             expected: Some(expected.clone()),
             model_visible_metadata: None,
-            metadata: None,
+            metadata,
             source_line: 1,
         };
         let output = VariantOutput {
@@ -1050,6 +1301,22 @@ mod tests {
 
     fn render_records(config: &Config, records: &[PairedCaseRecord]) -> String {
         let total = records.len();
+        let summary = summary_for(total);
+        let manifest = RunManifest::new("report-run".to_owned(), "report-test".to_owned());
+        let mut view = build_view(&summary, &manifest, records, config).unwrap();
+        let cases = std::mem::take(&mut view.cases);
+        view.embedded_cases_json = Some(serde_json::to_string(&cases).unwrap());
+        let mut environment = Environment::new();
+        environment.set_auto_escape_callback(|_| AutoEscape::Html);
+        environment.add_template("report.html", TEMPLATE).unwrap();
+        environment
+            .get_template("report.html")
+            .unwrap()
+            .render(view)
+            .unwrap()
+    }
+
+    fn summary_for(total: usize) -> RunSummary {
         let paired = paired_metrics(&vec![(true, true); total]);
         let variant = VariantSummary {
             total,
@@ -1062,7 +1329,7 @@ mod tests {
             operational: OperationalSummary::default(),
             ..VariantSummary::default()
         };
-        let summary = RunSummary {
+        RunSummary {
             artifact_format_version: structtrace_core::ARTIFACT_FORMAT_VERSION,
             run_id: "report-run".to_owned(),
             primary_outcome: "correct".to_owned(),
@@ -1078,22 +1345,12 @@ mod tests {
                 seed: 17,
             },
             gate: GateDecision {
-                passed: true,
+                status: GateStatus::Passed,
                 rules: vec![],
             },
             evaluator_passes: BTreeMap::new(),
             field_hotspots: vec![],
-        };
-        let manifest = RunManifest::new("report-run".to_owned(), "report-test".to_owned());
-        let view = build_view(&summary, &manifest, records, config).unwrap();
-        let mut environment = Environment::new();
-        environment.set_auto_escape_callback(|_| AutoEscape::Html);
-        environment.add_template("report.html", TEMPLATE).unwrap();
-        environment
-            .get_template("report.html")
-            .unwrap()
-            .render(view)
-            .unwrap()
+        }
     }
 
     #[test]
@@ -1143,15 +1400,109 @@ mod tests {
     }
 
     #[test]
-    fn rendered_report_preserves_every_case_in_a_large_set() {
+    fn self_contained_report_preserves_every_case_in_a_large_set() {
         let config = report_config("large report");
-        let records = (0..500)
-            .map(|index| passing_record(format!("case-{index:04}"), json!({"index": index})))
+        let records = (0..1_000)
+            .map(|index| {
+                passing_record_with_expected(
+                    format!("invoice-{index:04}"),
+                    json!({"document_text": format!("Invoice INV-{index:04} from Example Supply with two line items, exact subtotal, tax, and total.")}),
+                    json!({
+                        "invoice_number": format!("INV-{index:04}"),
+                        "vendor_name": "Example Supply",
+                        "currency": "USD",
+                        "subtotal": "100.00",
+                        "tax": "18.00",
+                        "total": "118.00",
+                        "line_items": [
+                            {"description": "Paper", "quantity": 2, "unit_price": "40.00", "amount": "80.00"},
+                            {"description": "Ink", "quantity": 1, "unit_price": "20.00", "amount": "20.00"}
+                        ]
+                    }),
+                    Some(json!({"split": "scale-validation", "region": if index % 2 == 0 {"us"} else {"eu"}})),
+                )
+            })
             .collect::<Vec<_>>();
         let html = render_records(&config, &records);
-        assert_eq!(html.matches("<details class=\"case\"").count(), 500);
-        assert!(html.contains("case-0000"));
-        assert!(html.contains("case-0499"));
+        assert!(html.contains("invoice-0000"));
+        assert!(html.contains("invoice-0999"));
+        assert!(html.contains("pageSize=25"));
+        assert!(html.contains("Search case ID or metadata"));
+    }
+
+    #[test]
+    fn thousand_case_report_is_chunked_searchable_and_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let run_dir = temporary.path();
+        std::fs::create_dir_all(run_dir.join("inputs")).unwrap();
+        let mut config = report_config("large chunked report");
+        config.limits.max_single_file_report_bytes = 1;
+        let records = (0..1_000)
+            .map(|index| {
+                passing_record_with_expected(
+                    format!("invoice-{index:04}"),
+                    json!({"document_text": format!("Invoice INV-{index:04} from Example Supply with two line items, exact subtotal, tax, and total.")}),
+                    json!({
+                        "invoice_number": format!("INV-{index:04}"),
+                        "vendor_name": "Example Supply",
+                        "currency": "USD",
+                        "subtotal": "100.00",
+                        "tax": "18.00",
+                        "total": "118.00",
+                        "line_items": [
+                            {"description": "Paper", "quantity": 2, "unit_price": "40.00", "amount": "80.00"},
+                            {"description": "Ink", "quantity": 1, "unit_price": "20.00", "amount": "20.00"}
+                        ]
+                    }),
+                    Some(json!({"split": "scale-validation", "region": if index % 2 == 0 {"us"} else {"eu"}})),
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            run_dir.join("summary.json"),
+            serde_json::to_vec(&summary_for(records.len())).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_vec(&RunManifest::new(
+                "report-run".to_owned(),
+                "report-test".to_owned(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("inputs/configuration.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut cases, record).unwrap();
+            cases.push(b'\n');
+        }
+        std::fs::write(run_dir.join("cases.jsonl"), cases).unwrap();
+
+        let started = std::time::Instant::now();
+        let generated = generate(run_dir).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let index_html = std::fs::read_to_string(&generated.index_path).unwrap();
+        assert!(!index_html.contains("invoice-0999"));
+        assert!(index_html.contains("Search case ID or metadata"));
+        assert!(std::fs::metadata(&generated.index_path).unwrap().len() < 512 * 1024);
+        let index: Vec<CaseIndexEntry> =
+            serde_json::from_slice(&std::fs::read(run_dir.join("report/case-index.json")).unwrap())
+                .unwrap();
+        assert_eq!(index.len(), 1_000);
+        assert_eq!(
+            std::fs::read_dir(run_dir.join("report/cases"))
+                .unwrap()
+                .count(),
+            20
+        );
+        assert!(!run_dir.join("report/single.html").exists());
+        assert!(directory_size(&run_dir.join("report")).unwrap() < 16 * 1024 * 1024);
     }
 
     #[test]
@@ -1248,6 +1599,25 @@ mod tests {
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains(secret));
         assert!(serialized.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn model_visible_metadata_secret_echo_is_redacted() {
+        let mut config = report_config("metadata privacy");
+        config.storage.redaction.json_pointers =
+            vec!["/model_visible_metadata/account_name".to_owned()];
+        let secret = "PRIVATE_ACCOUNT_7d21";
+        let mut record = passing_record("metadata-case".to_owned(), json!({"text": "invoice"}));
+        record.case.model_visible_metadata = Some(json!({"account_name": secret}));
+        record.baseline_output.raw_output = Some(json!({"account": secret}).to_string());
+        record.candidate_output.raw_output = record.baseline_output.raw_output.clone();
+        record.baseline_output.metadata = json!({"echo": secret});
+        record.candidate_output.metadata = record.baseline_output.metadata.clone();
+        let view = case_view(&record, &config).unwrap();
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains(REDACTION_MARKER));
+        assert!(view.model_visible_metadata.contains(REDACTION_MARKER));
     }
 
     #[test]

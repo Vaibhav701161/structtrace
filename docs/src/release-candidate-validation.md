@@ -20,7 +20,7 @@ Each participant completes the offline track. At least one participant should al
 structtrace --help
 structtrace doctor
 structtrace demo support-ticket
-structtrace report latest --export structtrace-report.html
+structtrace report latest --export-share structtrace-share
 structtrace replay latest
 structtrace gate latest
 ```
@@ -43,7 +43,7 @@ structtrace init my-structured-change --template recorded
 cd my-structured-change
 structtrace doctor
 structtrace run
-structtrace report latest --export report.html
+structtrace report latest --export-share structtrace-share
 structtrace gate latest
 ```
 

@@ -1,2 +1,2 @@
-{"id":"inventory-001","input":{"sku":"ABC-14","before":30,"requested_delta":"-12"},"expected":{"name":"adjust_inventory","arguments":{"sku":"ABC-14","quantity_delta":"-12"},"receipt":{"executed":true,"after":18}}}
-{"id":"inventory-002","input":{"sku":"ZX-02","before":8,"requested_delta":"5"},"expected":{"name":"adjust_inventory","arguments":{"sku":"ZX-02","quantity_delta":"5"},"receipt":{"executed":true,"after":13}}}
+{"id":"inventory-001","input":{"sku":"ABC-14","before":30,"requested_delta":"-12"},"expected":{"name":"adjust_inventory","arguments":{"sku":"ABC-14","quantity_delta":"-12"}}}
+{"id":"inventory-002","input":{"sku":"ZX-02","before":8,"requested_delta":"5"},"expected":{"name":"adjust_inventory","arguments":{"sku":"ZX-02","quantity_delta":"5"}}}

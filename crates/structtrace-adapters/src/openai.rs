@@ -11,12 +11,13 @@ use structtrace_core::{
     dataset::VariantCase,
     output::{Cost, OutputError, OutputStatus, Usage, VariantOutput},
 };
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use url::Url;
 
 use crate::command::AdapterRun;
 
 const PROVIDER_ENVELOPE_OVERHEAD_BYTES: usize = 1024 * 1024;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Execute matched cases against an explicitly configured endpoint.
 pub async fn run_openai_compatible(
@@ -117,6 +118,43 @@ pub async fn run_openai_compatible(
 }
 
 async fn run_case(
+    client: reqwest::Client,
+    endpoint: Url,
+    api_key: Option<String>,
+    config: OpenAiCompatibleConfig,
+    output_schema: Option<Value>,
+    case: VariantCase,
+    max_output_bytes: usize,
+) -> VariantOutput {
+    let case_id = case.id.clone();
+    let total_deadline = Duration::from_millis(config.timeout_ms);
+    match timeout(
+        total_deadline,
+        run_case_with_retries(
+            client,
+            endpoint,
+            api_key,
+            config,
+            output_schema,
+            case,
+            max_output_bytes,
+        ),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(_) => error_output(
+            &case_id,
+            "timeout",
+            "provider case exceeded the configured total deadline",
+            Some(u64::try_from(total_deadline.as_millis()).unwrap_or(u64::MAX)),
+            Vec::new(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_case_with_retries(
     client: reqwest::Client,
     endpoint: Url,
     api_key: Option<String>,
@@ -268,10 +306,10 @@ async fn run_case(
                         sleep(retry_delay(attempt, retry_after)).await;
                         continue;
                     }
-                    return error_output(
+                    return provider_error_output(
                         &case.id,
-                        "provider_error",
-                        &format!("HTTP {status}: {}", compact(&value)),
+                        status.as_u16(),
+                        value,
                         Some(elapsed_ms(started)),
                         retries,
                     );
@@ -298,10 +336,12 @@ async fn run_case(
 }
 
 fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
-    retry_after.unwrap_or_else(|| {
-        let exponent = attempt.min(8);
-        Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent))
-    })
+    retry_after
+        .unwrap_or_else(|| {
+            let exponent = attempt.min(8);
+            Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent))
+        })
+        .min(MAX_RETRY_DELAY)
 }
 
 async fn read_limited_response(
@@ -450,12 +490,44 @@ fn error_output(
     }
 }
 
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn provider_error_output(
+    case_id: &str,
+    http_status: u16,
+    provider_response: Value,
+    latency_ms: Option<u64>,
+    retries: Vec<Value>,
+) -> VariantOutput {
+    let provider_code = provider_response
+        .pointer("/error/code")
+        .or_else(|| provider_response.pointer("/code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    VariantOutput {
+        case_id: case_id.to_owned(),
+        status: OutputStatus::Error,
+        raw_output: None,
+        parsed_output: None,
+        error: Some(OutputError {
+            kind: "provider_error".to_owned(),
+            message: format!("Provider rejected the request with HTTP status {http_status}."),
+        }),
+        latency_ms,
+        usage: None,
+        cost: None,
+        metadata: json!({
+            "provider_error": {
+                "http_status": http_status,
+                "provider_code": provider_code,
+                "message": "Provider rejected the request."
+            },
+            "provider_response": provider_response
+        }),
+        retries,
+    }
 }
 
-fn compact(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable response>".to_owned())
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -479,9 +551,12 @@ mod tests {
         State(state): State<MockState>,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
-        let mut attempts = state.attempts.lock().unwrap();
-        *attempts += 1;
-        if state.mode == "retry" && *attempts == 1 {
+        let attempt = {
+            let mut attempts = state.attempts.lock().unwrap();
+            *attempts += 1;
+            *attempts
+        };
+        if state.mode == "retry" && attempt == 1 {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "retry"})),
@@ -492,6 +567,20 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "bad request"})),
             );
+        }
+        if state.mode == "secret-error" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "echoed SECRET_DOCUMENT_91f2"
+                    }
+                })),
+            );
+        }
+        if state.mode == "slow" {
+            sleep(Duration::from_millis(100)).await;
         }
         if state.mode == "malformed" {
             return (StatusCode::OK, Json(json!({"choices": []})));
@@ -602,6 +691,47 @@ mod tests {
             let run = run_openai_compatible(&config(base_url, 0), &[case()], None, 1024).await;
             assert_eq!(run.rows[0].status, OutputStatus::Error);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_is_not_embedded_in_error_message() {
+        let (base_url, _) = server("secret-error").await;
+        let run = run_openai_compatible(&config(base_url, 0), &[case()], None, 1024).await;
+        let row = &run.rows[0];
+        assert_eq!(row.status, OutputStatus::Error);
+        assert!(
+            !row.error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("SECRET_DOCUMENT")
+        );
+        assert_eq!(
+            row.metadata.pointer("/provider_error/provider_code"),
+            Some(&json!("invalid_request_error"))
+        );
+    }
+
+    #[tokio::test]
+    async fn total_case_deadline_bounds_all_provider_work() {
+        let (base_url, _) = server("slow").await;
+        let mut deadline = config(base_url, 3);
+        deadline.timeout_ms = 20;
+        let started = Instant::now();
+        let run = run_openai_compatible(&deadline, &[case()], None, 1024).await;
+        assert_eq!(
+            run.rows[0].error.as_ref().map(|error| error.kind.as_str()),
+            Some("timeout")
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn retry_delay_is_capped() {
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(86_400))),
+            MAX_RETRY_DELAY
+        );
     }
 
     #[tokio::test]

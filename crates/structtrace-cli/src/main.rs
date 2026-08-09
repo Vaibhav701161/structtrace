@@ -15,6 +15,7 @@ use structtrace_core::{
     config::{Config, VariantConfig},
     dataset::Dataset,
     evaluation::compile_schema,
+    gate::{GateRuleStatus, GateStatus},
     hashing::hash_file,
 };
 
@@ -26,6 +27,9 @@ const EXIT_RUN_FAILED: u8 = 3;
 const EXIT_ARTIFACT_FAILURE: u8 = 4;
 const EXIT_PROTOCOL_FAILURE: u8 = 5;
 const EXIT_GATE_FAILED: u8 = 10;
+const EXIT_GATE_NOT_CONFIGURED: u8 = 11;
+const EXIT_GATE_INSUFFICIENT_EVIDENCE: u8 = 12;
+const EXIT_GATE_ERROR: u8 = 13;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,7 +98,7 @@ enum Commands {
         #[arg(long, value_name = "RUN_ID")]
         resume: Option<String>,
     },
-    /// Compare existing baseline and candidate JSONL outputs.
+    /// Compare recorded outputs using evaluators/outcomes from the project configuration.
     Compare {
         /// Matched golden dataset.
         #[arg(long)]
@@ -126,6 +130,9 @@ enum Commands {
         /// Export one self-contained HTML file.
         #[arg(long)]
         export: Option<PathBuf>,
+        /// Export an aggregate-only share directory with all case content omitted.
+        #[arg(long, value_name = "DIRECTORY")]
+        export_share: Option<PathBuf>,
     },
     /// Apply configured deployment thresholds to a completed run.
     Gate {
@@ -313,6 +320,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             open,
             serve,
             export,
+            export_share,
         } => {
             let run_dir = resolve_run(cli, run)?;
             ensure_complete(&run_dir)?;
@@ -322,9 +330,18 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                     println!("Exported {}", destination.display());
                 }
             }
+            if let Some(destination) = export_share {
+                structtrace_report::export_share_directory(&run_dir, destination)?;
+                if !cli.quiet {
+                    println!(
+                        "Exported share-safe aggregate report {}",
+                        destination.display()
+                    );
+                }
+            }
             if *open || *serve {
                 structtrace_report::serve(&run_dir, *open).await?;
-            } else if export.is_none() {
+            } else if export.is_none() && export_share.is_none() {
                 let report = structtrace_report::finalized_report(&run_dir)?;
                 if !cli.quiet {
                     match cli.format {
@@ -563,14 +580,7 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
                 "Transitions:  {} candidate-only, {} baseline-only",
                 run.summary.paired.candidate_only_pass, run.summary.paired.baseline_only_pass
             );
-            println!(
-                "Gate:         {}",
-                if run.summary.gate.passed {
-                    "PASSED"
-                } else {
-                    "FAILED"
-                }
-            );
+            println!("Gate:         {}", run.summary.gate.status.label());
             println!("Report:       {}/report/index.html", run.run_dir.display());
         }
     }
@@ -598,8 +608,9 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "run_id": summary.run_id,
-                    "passed": summary.gate.passed,
-                    "exit_code": if summary.gate.passed { 0 } else { EXIT_GATE_FAILED },
+                    "status": summary.gate.status,
+                    "deployment_authorized": summary.gate.status.is_passed(),
+                    "exit_code": gate_exit_code(summary.gate.status),
                     "primary": summary.paired,
                     "rules": summary.gate.rules,
                 }))?
@@ -608,22 +619,11 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
             OutputFormat::Human => print_human_gate(&summary, run_dir),
         }
     }
-    Ok(if summary.gate.passed {
-        0
-    } else {
-        EXIT_GATE_FAILED
-    })
+    Ok(gate_exit_code(summary.gate.status))
 }
 
 fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
-    println!(
-        "STRUCTTRACE RELEASE GATE: {}",
-        if summary.gate.passed {
-            "PASSED"
-        } else {
-            "FAILED"
-        }
-    );
+    println!("STRUCTTRACE RELEASE GATE: {}", summary.gate.status.label());
     println!();
     println!("Primary outcome");
     println!(
@@ -650,11 +650,17 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
     );
     println!();
     println!("Rules");
+    if summary.gate.rules.is_empty() {
+        println!("  No release criteria were configured.");
+        println!("  This run was analyzed, but StructTrace cannot make a deployment decision.");
+    }
     for rule in &summary.gate.rules {
-        let state = match rule.passed {
-            Some(true) => "PASS",
-            Some(false) => "FAIL",
-            None => "NOT EVALUATED",
+        let state = match rule.status {
+            GateRuleStatus::Passed => "PASS",
+            GateRuleStatus::Failed => "FAIL",
+            GateRuleStatus::NotConfigured => "NOT CONFIGURED",
+            GateRuleStatus::InsufficientEvidence => "INSUFFICIENT",
+            GateRuleStatus::Error => "ERROR",
         };
         println!("  {state:<13} {}", rule.message);
     }
@@ -666,11 +672,7 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
 fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
     let mut markdown = format!(
         "## StructTrace release gate: {}",
-        if summary.gate.passed {
-            "passed"
-        } else {
-            "failed"
-        }
+        summary.gate.status.label().to_ascii_lowercase()
     );
     markdown.push_str("\n\n| Metric | Baseline | Candidate |\n|---|---:|---:|\n");
     markdown.push_str(&format!(
@@ -702,20 +704,47 @@ fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
             })?;
         writeln!(file, "{markdown}")?;
     }
-    if !summary.gate.passed {
-        for rule in summary
-            .gate
-            .rules
-            .iter()
-            .filter(|rule| rule.passed == Some(false))
-        {
+    if !summary.gate.status.is_passed() {
+        let annotation = match summary.gate.status {
+            GateStatus::Failed => "StructTrace gate failed",
+            GateStatus::NotConfigured => "StructTrace gate not configured",
+            GateStatus::InsufficientEvidence => "StructTrace evidence insufficient",
+            GateStatus::Error => "StructTrace gate error",
+            GateStatus::Passed => "StructTrace gate passed",
+        };
+        for rule in summary.gate.rules.iter().filter(|rule| {
+            matches!(
+                rule.status,
+                GateRuleStatus::Failed
+                    | GateRuleStatus::InsufficientEvidence
+                    | GateRuleStatus::Error
+            )
+        }) {
             println!(
-                "::error title=StructTrace gate failed::{}",
+                "::error title={}::{}",
+                annotation,
                 github_escape(&rule.message)
+            );
+        }
+        if summary.gate.rules.is_empty() {
+            println!(
+                "::error title={}::{}",
+                annotation,
+                github_escape("no release criteria were configured")
             );
         }
     }
     Ok(())
+}
+
+const fn gate_exit_code(status: GateStatus) -> u8 {
+    match status {
+        GateStatus::Passed => 0,
+        GateStatus::Failed => EXIT_GATE_FAILED,
+        GateStatus::NotConfigured => EXIT_GATE_NOT_CONFIGURED,
+        GateStatus::InsufficientEvidence => EXIT_GATE_INSUFFICIENT_EVIDENCE,
+        GateStatus::Error => EXIT_GATE_ERROR,
+    }
 }
 
 fn doctor(cli: &Cli) -> anyhow::Result<u8> {

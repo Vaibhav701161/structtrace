@@ -30,7 +30,14 @@ try {
     Copy-Item (Join-Path $TemporaryDir "structtrace.exe") (Join-Path $InstallDir "structtrace.exe") -Force
     & (Join-Path $InstallDir "structtrace.exe") --version
     Write-Host "Installed StructTrace to $InstallDir\structtrace.exe"
-    Write-Host "Add $InstallDir to PATH if it is not already present."
+    $PathEntries = $env:PATH -split ';'
+    if ($PathEntries -notcontains $InstallDir) {
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        $NewUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
+        [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+        $env:PATH = "$env:PATH;$InstallDir"
+        Write-Host "Added $InstallDir to the current process and persistent user PATH."
+    }
     Write-Host "Uninstall by deleting $InstallDir\structtrace.exe"
 } finally {
     if (Test-Path $TemporaryDir) { Remove-Item -Recurse -Force $TemporaryDir }

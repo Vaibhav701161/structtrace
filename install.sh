@@ -6,7 +6,7 @@ version="${STRUCTTRACE_VERSION:-latest}"
 install_dir="${STRUCTTRACE_INSTALL_DIR:-${HOME}/.local/bin}"
 
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
+  Linux-x86_64) target="x86_64-unknown-linux-musl" ;;
   Darwin-x86_64) target="x86_64-apple-darwin" ;;
   Darwin-arm64|Darwin-aarch64) target="aarch64-apple-darwin" ;;
   *) echo "StructTrace has no prebuilt binary for $(uname -s) $(uname -m)." >&2; exit 1 ;;
@@ -39,4 +39,15 @@ mkdir -p "$install_dir"
 install -m 0755 "$temporary_dir/structtrace" "$install_dir/structtrace"
 "$install_dir/structtrace" --version
 echo "Installed StructTrace to $install_dir/structtrace"
+case ":${PATH}:" in
+  *":${install_dir}:"*) ;;
+  *)
+    profile_file="${HOME}/.profile"
+    path_line="export PATH=\"${install_dir}:\$PATH\""
+    if ! grep -F "$path_line" "$profile_file" >/dev/null 2>&1; then
+      printf '\n# StructTrace installer\n%s\n' "$path_line" >> "$profile_file"
+    fi
+    echo "Added $install_dir to PATH in $profile_file; open a new shell or run: $path_line"
+    ;;
+esac
 echo "Uninstall with: rm $install_dir/structtrace"

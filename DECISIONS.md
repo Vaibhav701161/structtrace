@@ -90,5 +90,20 @@ product exposes that tradeoff rather than retaining hidden raw copies.
 
 Configured case-envelope JSON Pointers identify sensitive values. Report
 generation redacts both the selected location and equal values echoed in model
-output or evaluator details. Reports are self-contained and served only on
-loopback by default.
+output or evaluator details. Bounded offline reports use a small summary, a redacted search index,
+and lazy case chunks; one-file derivatives exist only below a configured limit. Reports are served
+only on loopback by default. The dedicated share export omits all case-level content.
+
+## Release gates are multi-state evidence decisions
+
+No configured rules means `NOT_CONFIGURED`, not pass. Any deployment decision requires explicit
+minimum case count, scored coverage, and evaluator error/not-applicable/unscored ceilings. A run
+that lacks those safeguards is `INSUFFICIENT_EVIDENCE` even when its observed point estimate looks
+favorable. Quality failure, missing evidence, and gate execution error retain distinct states and
+exit codes.
+
+## Stable product scope keeps the external contract fixed
+
+StructTrace measures a baseline and candidate against one unchanged caller-facing schema. It does
+not claim to migrate schemas or execute model-proposed tools. Recorded output is stable; local
+command and Python process integrations are beta; direct provider execution is experimental.

@@ -204,6 +204,12 @@ analysis:
     seed: 17
 
 gate:
+  # The generated two-case fixture is a demonstration, not release evidence.
+  min_cases: 100
+  min_primary_scored_rate: 0.99
+  max_primary_evaluator_error_rate: 0.01
+  max_primary_not_applicable_rate: 0.0
+  max_primary_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
   max_valid_but_wrong_increase_pp: 0.5
   min_candidate_schema_validity: 1.0
@@ -304,7 +310,7 @@ mod tests {
             structtrace_engine::run_recorded(&project, Path::new("structtrace.yaml")).unwrap();
         assert_eq!(run.summary.baseline.primary_pass, 2);
         assert_eq!(run.summary.candidate.primary_pass, 1);
-        assert!(!run.summary.gate.passed);
+        assert!(!run.summary.gate.status.is_passed());
     }
 
     #[test]

@@ -1,8 +1,13 @@
 # Why StructTrace exists
 
-Structured-output migrations are often evaluated with a single metric: schema-valid output rate. That metric is necessary, but it is not sufficient. A candidate can emit cleaner JSON while choosing the wrong enum, changing a signed value, omitting a business-critical relationship, or calling the correct tool with the wrong argument.
+Structured extraction changes are often evaluated with a single metric: schema-valid output rate.
+That metric is necessary, but it is not sufficient. A candidate can emit cleaner JSON while
+choosing the wrong enum, changing an amount, omitting a business-critical relationship, or calling
+the correct tool with the wrong argument.
 
-StructTrace treats a migration as a matched experiment. Baseline and candidate receive the same immutable cases. Deterministic evaluators score the business meaning. The report separates:
+StructTrace treats a stable-contract system change as a matched experiment. Baseline and candidate
+receive the same immutable cases. Deterministic evaluators score the business meaning. The report
+separates:
 
 - adapter success;
 - strict JSON parsing;

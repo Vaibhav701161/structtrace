@@ -15,7 +15,7 @@ fn help_and_doctor_succeed() {
 }
 
 #[test]
-fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
+fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() {
     let root = tempdir().unwrap();
     let project = root.path().join("project");
     assert!(
@@ -79,6 +79,43 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
     );
     assert!(export.is_file());
     assert_eq!(std::fs::read(&report).unwrap(), finalized_report);
+    let share = root.path().join("share-report");
+    assert!(
+        binary()
+            .args([
+                "--project-root",
+                project.to_str().unwrap(),
+                "report",
+                "latest",
+                "--export-share",
+                share.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(std::fs::read(share.join("case-index.json")).unwrap(), b"[]");
+    let share_html = std::fs::read_to_string(share.join("index.html")).unwrap();
+    assert!(share_html.contains("Aggregate-only share derivative"));
+    assert!(!share_html.contains("case-001"));
+    assert!(!share_html.contains("case-search"));
+    let case_chunk = run_dir.join("report/cases/00000.json");
+    let original_chunk = std::fs::read(&case_chunk).unwrap();
+    let mut tampered_chunk = original_chunk.clone();
+    tampered_chunk.extend_from_slice(b" ");
+    std::fs::write(&case_chunk, tampered_chunk).unwrap();
+    let report_status = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "report",
+            "latest",
+        ])
+        .status()
+        .unwrap();
+    assert!(!report_status.success());
+    std::fs::write(&case_chunk, original_chunk).unwrap();
     assert!(
         binary()
             .args([
@@ -103,7 +140,7 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
         ])
         .status()
         .unwrap();
-    assert_eq!(replay_verified_gate.code(), Some(10));
+    assert_eq!(replay_verified_gate.code(), Some(12));
     let github_summary = root.path().join("github-step-summary.md");
     let status = binary()
         .args([
@@ -117,9 +154,9 @@ fn initialized_recorded_project_runs_reports_replays_and_fails_its_gate() {
         .env("GITHUB_STEP_SUMMARY", &github_summary)
         .status()
         .unwrap();
-    assert_eq!(status.code(), Some(10));
+    assert_eq!(status.code(), Some(12));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
-    assert!(github_summary.contains("## StructTrace release gate: failed"));
+    assert!(github_summary.contains("## StructTrace release gate: insufficient evidence"));
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
     assert!(github_summary.contains("| Primary outcome |"));
 

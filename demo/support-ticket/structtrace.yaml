@@ -53,6 +53,11 @@ analysis:
     seed: 17
 
 gate:
+  min_cases: 100
+  min_primary_scored_rate: 0.99
+  max_primary_evaluator_error_rate: 0.01
+  max_primary_not_applicable_rate: 0.0
+  max_primary_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
   max_valid_but_wrong_increase_pp: 0.5
   min_candidate_schema_validity: 1.0

@@ -6,7 +6,7 @@ here.
 ## Unreleased
 
 - Establish the independent StructTrace Rust workspace.
-- Define artifact format version 2 and variant protocol version 1.
+- Define artifact format version 3, report format version 2, and variant protocol version 1.
 - Add recorded, command, Python, and OpenAI-compatible paired execution.
 - Add strict parsing, external-schema validation, deterministic evaluators,
   composed outcomes, valid-but-wrong analysis, exact McNemar, and paired
@@ -15,7 +15,8 @@ here.
 - Add SQLite run storage, portable artifacts, BLAKE3 manifests, hash-locked
   resume, and full artifact replay.
 - Add independent semantic, structural, reliability, latency, and cost gates.
-- Add a self-contained offline report with structured diffs and case filters.
+- Add a bounded offline report with structured diffs, redacted search, evaluator filters,
+  pagination, lazy case chunks, and size-limited optional single-file export.
 - Add raw-output retention controls and report JSON Pointer redaction.
 - Add configurable output, stderr, provider-envelope, and report-embedding
   bounds with enforced hard ceilings.
@@ -41,3 +42,12 @@ here.
   backoff with numeric `Retry-After` handling.
 - Add checksum-verifying shell and PowerShell installers plus release build
   provenance attestations. No public binary release has been published yet.
+- Replace Boolean gates with `PASSED`, `FAILED`, `NOT_CONFIGURED`,
+  `INSUFFICIENT_EVIDENCE`, and `ERROR`, plus mandatory sample-size and scoring-coverage
+  safeguards for any configured deployment decision.
+- Sanitize provider error bodies, include model-visible metadata in redaction, bound total provider
+  deadlines and process-tree shutdown, and add whole-run adversarial secret scans.
+- Add an aggregate-only share export that omits every case-level input, label, output, prompt, and
+  metadata value.
+- Establish stable-contract invoice extraction as the primary workflow and explicitly label
+  recorded, command/Python, and provider adapters as stable, beta, and experimental.
