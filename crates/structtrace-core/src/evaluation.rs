@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, str::FromStr};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     config::{EvaluatorConfig, EvaluatorKind, OutcomeConfig, PointerPair},
@@ -17,7 +18,10 @@ pub type SchemaValidator = jsonschema::Validator;
 
 /// Compile once with network retrieval unavailable.
 pub fn compile_schema(schema: &Value) -> crate::Result<SchemaValidator> {
-    jsonschema::validator_for(schema).map_err(|error| crate::CoreError::Schema(error.to_string()))
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|error| crate::CoreError::Schema(error.to_string()))
 }
 
 /// Individual deterministic evaluator status.
@@ -287,7 +291,8 @@ fn evaluate_builtin(
 ) -> EvaluatorResult {
     let id = &config.id;
     let Some(output) = output else {
-        return EvaluatorResult::error(id, "strict JSON parsing did not produce a value");
+        return EvaluatorResult::error(id, "strict JSON parsing did not produce a value")
+            .with_fields(unparsed_field_facts(&config.kind));
     };
     match &config.kind {
         EvaluatorKind::ExactJson => match expected {
@@ -311,6 +316,23 @@ fn evaluate_builtin(
             pointer,
             expected_pointer,
         } => compare_pointer(id, output, expected, pointer, expected_pointer),
+        EvaluatorKind::NormalizedString {
+            pointer,
+            expected_pointer,
+            case_insensitive,
+        } => evaluate_normalized_string(
+            id,
+            output,
+            expected,
+            pointer,
+            expected_pointer,
+            *case_insensitive,
+        ),
+        EvaluatorKind::CanonicalDate {
+            pointer,
+            expected_pointer,
+            formats,
+        } => evaluate_canonical_date(id, output, expected, pointer, expected_pointer, formats),
         EvaluatorKind::JsonPointersExact { pointers }
         | EvaluatorKind::ToolArguments { pointers } => {
             compare_pointer_list(id, output, expected, pointers)
@@ -380,11 +402,103 @@ fn evaluate_builtin(
             pointer,
             expected_pointer,
         } => compare_pointer(id, output, expected, pointer, expected_pointer),
+        EvaluatorKind::KeyedArray {
+            pointer,
+            expected_pointer,
+            keys,
+        } => evaluate_keyed_array(id, output, expected, pointer, expected_pointer, keys),
+        EvaluatorKind::FinancialInvariants {
+            line_items_pointer,
+            subtotal_pointer,
+            tax_pointer,
+            total_pointer,
+            absolute,
+        } => evaluate_financial_invariants(
+            id,
+            output,
+            line_items_pointer,
+            subtotal_pointer,
+            tax_pointer,
+            total_pointer,
+            absolute,
+        ),
         EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. } => EvaluatorResult::error(
             id,
             "custom evaluator must be executed by structtrace-adapters",
         ),
     }
+}
+
+fn unparsed_field_facts(kind: &EvaluatorKind) -> Vec<FieldEvaluationFact> {
+    let pointers = match kind {
+        EvaluatorKind::JsonPointerExact {
+            pointer,
+            expected_pointer,
+        }
+        | EvaluatorKind::EnumAccuracy {
+            pointer,
+            expected_pointer,
+        }
+        | EvaluatorKind::NormalizedString {
+            pointer,
+            expected_pointer,
+            ..
+        }
+        | EvaluatorKind::CanonicalDate {
+            pointer,
+            expected_pointer,
+            ..
+        }
+        | EvaluatorKind::ToolSelection {
+            pointer,
+            expected_pointer,
+        }
+        | EvaluatorKind::NumericTolerance {
+            pointer,
+            expected_pointer,
+            ..
+        } => vec![(pointer.clone(), Some(expected_pointer.clone()))],
+        EvaluatorKind::JsonPointersExact { pointers }
+        | EvaluatorKind::ToolArguments { pointers } => pointers
+            .iter()
+            .map(|pair| (pair.pointer.clone(), Some(pair.expected_pointer.clone())))
+            .collect(),
+        EvaluatorKind::KeyedArray {
+            pointer,
+            expected_pointer,
+            ..
+        } => vec![(pointer.clone(), Some(expected_pointer.clone()))],
+        EvaluatorKind::FinancialInvariants {
+            line_items_pointer,
+            subtotal_pointer,
+            tax_pointer,
+            total_pointer,
+            ..
+        } => vec![
+            (line_items_pointer.clone(), None),
+            (subtotal_pointer.clone(), None),
+            (tax_pointer.clone(), None),
+            (total_pointer.clone(), None),
+        ],
+        EvaluatorKind::RequiredFields { pointers } => pointers
+            .iter()
+            .map(|pointer| (pointer.clone(), None))
+            .collect(),
+        EvaluatorKind::ExactJson | EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. } => {
+            Vec::new()
+        }
+    };
+    pointers
+        .into_iter()
+        .map(|(pointer, expected_pointer)| FieldEvaluationFact {
+            pointer,
+            expected_pointer,
+            status: EvaluationStatus::Error,
+            expected: None,
+            actual: None,
+            message: "Strict JSON parsing did not produce a value.".to_owned(),
+        })
+        .collect()
 }
 
 fn compare_pointer(
@@ -395,7 +509,16 @@ fn compare_pointer(
     expected_pointer: &str,
 ) -> EvaluatorResult {
     let Some(expected) = expected else {
-        return EvaluatorResult::error(id, "case has no expected value");
+        return EvaluatorResult::error(id, "case has no expected value").with_fields(vec![
+            FieldEvaluationFact {
+                pointer: pointer.to_owned(),
+                expected_pointer: Some(expected_pointer.to_owned()),
+                status: EvaluationStatus::Error,
+                expected: None,
+                actual: output.pointer(pointer).cloned(),
+                message: "Case has no expected value.".to_owned(),
+            },
+        ]);
     };
     let actual_value = output.pointer(pointer);
     let expected_value = expected.pointer(expected_pointer);
@@ -463,7 +586,19 @@ fn compare_pointer_list(
     pointers: &[PointerPair],
 ) -> EvaluatorResult {
     let Some(expected) = expected else {
-        return EvaluatorResult::error(id, "case has no expected value");
+        return EvaluatorResult::error(id, "case has no expected value").with_fields(
+            pointers
+                .iter()
+                .map(|pair| FieldEvaluationFact {
+                    pointer: pair.pointer.clone(),
+                    expected_pointer: Some(pair.expected_pointer.clone()),
+                    status: EvaluationStatus::Error,
+                    expected: None,
+                    actual: output.pointer(&pair.pointer).cloned(),
+                    message: "Case has no expected value.".to_owned(),
+                })
+                .collect(),
+        );
     };
     let mut fields = Vec::with_capacity(pointers.len());
     let mut missing_expected = false;
@@ -510,6 +645,469 @@ fn compare_pointer_list(
     }
 }
 
+fn evaluate_normalized_string(
+    id: &str,
+    output: &Value,
+    expected: Option<&Value>,
+    pointer: &str,
+    expected_pointer: &str,
+    case_insensitive: bool,
+) -> EvaluatorResult {
+    let Some(expected) = expected else {
+        return field_error(
+            id,
+            output,
+            pointer,
+            expected_pointer,
+            "case has no expected value",
+        );
+    };
+    let actual = output.pointer(pointer);
+    let reference = expected.pointer(expected_pointer);
+    let (Some(actual_text), Some(reference_text)) = (
+        actual.and_then(Value::as_str),
+        reference.and_then(Value::as_str),
+    ) else {
+        return field_result(
+            id,
+            EvaluationStatus::Error,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Normalized-string inputs must both be strings.",
+            Value::Null,
+        );
+    };
+    let actual_normalized = normalize_text(actual_text, case_insensitive);
+    let expected_normalized = normalize_text(reference_text, case_insensitive);
+    let status = if actual_normalized == expected_normalized {
+        EvaluationStatus::Passed
+    } else {
+        EvaluationStatus::Failed
+    };
+    field_result(
+        id,
+        status,
+        pointer,
+        expected_pointer,
+        actual,
+        reference,
+        if status == EvaluationStatus::Passed {
+            "Normalized strings matched."
+        } else {
+            "Normalized strings differed."
+        },
+        serde_json::json!({
+            "actual_normalized": actual_normalized,
+            "expected_normalized": expected_normalized,
+        }),
+    )
+}
+
+fn normalize_text(value: &str, case_insensitive: bool) -> String {
+    let normalized = value.nfkc().collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if case_insensitive {
+        collapsed.to_lowercase()
+    } else {
+        collapsed
+    }
+}
+
+fn evaluate_canonical_date(
+    id: &str,
+    output: &Value,
+    expected: Option<&Value>,
+    pointer: &str,
+    expected_pointer: &str,
+    formats: &[String],
+) -> EvaluatorResult {
+    let Some(expected) = expected else {
+        return field_error(
+            id,
+            output,
+            pointer,
+            expected_pointer,
+            "case has no expected value",
+        );
+    };
+    let actual = output.pointer(pointer);
+    let reference = expected.pointer(expected_pointer);
+    let (Some(actual_text), Some(reference_text)) = (
+        actual.and_then(Value::as_str),
+        reference.and_then(Value::as_str),
+    ) else {
+        return field_result(
+            id,
+            EvaluationStatus::Error,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Canonical-date inputs must both be strings.",
+            Value::Null,
+        );
+    };
+    let actual_date = canonical_date(actual_text, formats);
+    let expected_date = canonical_date(reference_text, formats);
+    let (Some(actual_date), Some(expected_date)) = (actual_date, expected_date) else {
+        return field_result(
+            id,
+            EvaluationStatus::Error,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "A date was invalid or did not match an accepted format.",
+            serde_json::json!({"accepted_formats": formats}),
+        );
+    };
+    let status = if actual_date == expected_date {
+        EvaluationStatus::Passed
+    } else {
+        EvaluationStatus::Failed
+    };
+    field_result(
+        id,
+        status,
+        pointer,
+        expected_pointer,
+        actual,
+        reference,
+        if status == EvaluationStatus::Passed {
+            "Canonical dates matched."
+        } else {
+            "Canonical dates differed."
+        },
+        serde_json::json!({"actual_iso": actual_date, "expected_iso": expected_date}),
+    )
+}
+
+fn canonical_date(value: &str, formats: &[String]) -> Option<String> {
+    for format in formats {
+        let parts = match format.as_str() {
+            "iso" => parse_date_parts(value, '-'),
+            "dmy_slash" => parse_date_parts(value, '/').map(|(d, m, y)| (y, m, d)),
+            "mdy_slash" => parse_date_parts(value, '/').map(|(m, d, y)| (y, m, d)),
+            _ => None,
+        };
+        if let Some((year, month, day)) = parts.filter(|parts| valid_date(*parts)) {
+            return Some(format!("{year:04}-{month:02}-{day:02}"));
+        }
+    }
+    None
+}
+
+fn parse_date_parts(value: &str, separator: char) -> Option<(u32, u32, u32)> {
+    let mut parts = value.split(separator);
+    let first = parts.next()?.parse().ok()?;
+    let second = parts.next()?.parse().ok()?;
+    let third = parts.next()?.parse().ok()?;
+    (parts.next().is_none()).then_some((first, second, third))
+}
+
+fn valid_date((year, month, day): (u32, u32, u32)) -> bool {
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let maximum = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year > 0 && (1..=maximum).contains(&day)
+}
+
+fn evaluate_keyed_array(
+    id: &str,
+    output: &Value,
+    expected: Option<&Value>,
+    pointer: &str,
+    expected_pointer: &str,
+    keys: &[String],
+) -> EvaluatorResult {
+    let Some(expected) = expected else {
+        return field_error(
+            id,
+            output,
+            pointer,
+            expected_pointer,
+            "case has no expected value",
+        );
+    };
+    let actual = output.pointer(pointer);
+    let reference = expected.pointer(expected_pointer);
+    let (Some(actual_items), Some(expected_items)) = (
+        actual.and_then(Value::as_array),
+        reference.and_then(Value::as_array),
+    ) else {
+        return field_result(
+            id,
+            EvaluationStatus::Error,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Keyed-array inputs must both be arrays.",
+            Value::Null,
+        );
+    };
+    let actual_map = keyed_items(actual_items, keys);
+    let expected_map = keyed_items(expected_items, keys);
+    let (Ok(actual_map), Ok(expected_map)) = (actual_map, expected_map) else {
+        return field_result(
+            id,
+            EvaluationStatus::Error,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Array items had missing or duplicate keys.",
+            serde_json::json!({"keys": keys}),
+        );
+    };
+    let missing = expected_map
+        .keys()
+        .filter(|key| !actual_map.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = actual_map
+        .keys()
+        .filter(|key| !expected_map.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed = expected_map
+        .iter()
+        .filter(|(key, value)| actual_map.get(*key).is_some_and(|actual| actual != *value))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let status = if missing.is_empty() && extra.is_empty() && changed.is_empty() {
+        EvaluationStatus::Passed
+    } else {
+        EvaluationStatus::Failed
+    };
+    field_result(
+        id,
+        status,
+        pointer,
+        expected_pointer,
+        actual,
+        reference,
+        if status == EvaluationStatus::Passed {
+            "Keyed array items matched independent of order."
+        } else {
+            "Keyed array had missing, extra, or changed items."
+        },
+        serde_json::json!({"missing": missing, "extra": extra, "changed": changed}),
+    )
+}
+
+fn keyed_items<'a>(items: &'a [Value], keys: &[String]) -> Result<BTreeMap<String, &'a Value>, ()> {
+    let mut indexed = BTreeMap::new();
+    for item in items {
+        let identity = keys
+            .iter()
+            .map(|key| item.pointer(key).ok_or(()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let identity = serde_json::to_string(&identity).map_err(|_| ())?;
+        if indexed.insert(identity, item).is_some() {
+            return Err(());
+        }
+    }
+    Ok(indexed)
+}
+
+fn evaluate_financial_invariants(
+    id: &str,
+    output: &Value,
+    line_items_pointer: &str,
+    subtotal_pointer: &str,
+    tax_pointer: &str,
+    total_pointer: &str,
+    absolute: &str,
+) -> EvaluatorResult {
+    let tolerance = match Decimal::from_str(absolute) {
+        Ok(value) => value,
+        Err(_) => return EvaluatorResult::error(id, "financial tolerance is invalid"),
+    };
+    let Some(items) = output.pointer(line_items_pointer).and_then(Value::as_array) else {
+        return EvaluatorResult::error(id, "line items were missing or not an array");
+    };
+    let mut fields = Vec::new();
+    let mut item_sum = Decimal::ZERO;
+    let mut had_error = false;
+    for (index, item) in items.iter().enumerate() {
+        let quantity = decimal_value(item.pointer("/quantity"));
+        let unit_price = decimal_value(item.pointer("/unit_price"));
+        let amount = decimal_value(item.pointer("/amount"));
+        let pointer = format!("{line_items_pointer}/{index}/amount");
+        match (quantity, unit_price, amount) {
+            (Some(quantity), Some(unit_price), Some(amount)) => {
+                item_sum += amount;
+                let passed = (quantity * unit_price - amount).abs() <= tolerance;
+                fields.push(FieldEvaluationFact {
+                    pointer,
+                    expected_pointer: None,
+                    status: if passed {
+                        EvaluationStatus::Passed
+                    } else {
+                        EvaluationStatus::Failed
+                    },
+                    expected: Some(Value::String(
+                        (quantity * unit_price).normalize().to_string(),
+                    )),
+                    actual: item.pointer("/amount").cloned(),
+                    message: "Line amount must equal quantity multiplied by unit price.".to_owned(),
+                });
+            }
+            _ => {
+                had_error = true;
+                fields.push(FieldEvaluationFact {
+                    pointer,
+                    expected_pointer: None,
+                    status: EvaluationStatus::Error,
+                    expected: None,
+                    actual: item.pointer("/amount").cloned(),
+                    message: "Line item financial values must be decimal-compatible.".to_owned(),
+                });
+            }
+        }
+    }
+    let subtotal = decimal_value(output.pointer(subtotal_pointer));
+    let tax = decimal_value(output.pointer(tax_pointer));
+    let total = decimal_value(output.pointer(total_pointer));
+    for (pointer, actual, expected_value, message) in [
+        (
+            line_items_pointer,
+            subtotal,
+            Some(item_sum),
+            "Subtotal must equal the sum of line amounts.",
+        ),
+        (
+            total_pointer,
+            total,
+            subtotal.zip(tax).map(|(subtotal, tax)| subtotal + tax),
+            "Total must equal subtotal plus tax.",
+        ),
+    ] {
+        match (actual, expected_value) {
+            (Some(actual), Some(expected)) => fields.push(FieldEvaluationFact {
+                pointer: pointer.to_owned(),
+                expected_pointer: None,
+                status: if (actual - expected).abs() <= tolerance {
+                    EvaluationStatus::Passed
+                } else {
+                    EvaluationStatus::Failed
+                },
+                expected: Some(Value::String(expected.normalize().to_string())),
+                actual: Some(Value::String(actual.normalize().to_string())),
+                message: message.to_owned(),
+            }),
+            _ => {
+                had_error = true;
+                fields.push(FieldEvaluationFact {
+                    pointer: pointer.to_owned(),
+                    expected_pointer: None,
+                    status: EvaluationStatus::Error,
+                    expected: None,
+                    actual: output.pointer(pointer).cloned(),
+                    message: "Required financial values were missing or nonnumeric.".to_owned(),
+                });
+            }
+        }
+    }
+    let status = if had_error {
+        EvaluationStatus::Error
+    } else if fields
+        .iter()
+        .all(|field| field.status == EvaluationStatus::Passed)
+    {
+        EvaluationStatus::Passed
+    } else {
+        EvaluationStatus::Failed
+    };
+    let message = match status {
+        EvaluationStatus::Passed => "All financial invariants held.",
+        EvaluationStatus::Failed => "One or more financial invariants failed.",
+        EvaluationStatus::Error => "Financial invariants could not be evaluated reliably.",
+        EvaluationStatus::NotApplicable => unreachable!(),
+    };
+    EvaluatorResult {
+        evaluator_id: id.to_owned(),
+        status,
+        passed: status == EvaluationStatus::Passed,
+        score: Some(if status == EvaluationStatus::Passed {
+            1.0
+        } else {
+            0.0
+        }),
+        message: message.to_owned(),
+        details: serde_json::json!({"tolerance": absolute}),
+        fields,
+    }
+}
+
+fn decimal_value(value: Option<&Value>) -> Option<Decimal> {
+    value.and_then(|value| match value {
+        Value::String(value) => Decimal::from_str(value).ok(),
+        Value::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+        _ => None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field_result(
+    id: &str,
+    status: EvaluationStatus,
+    pointer: &str,
+    expected_pointer: &str,
+    actual: Option<&Value>,
+    expected: Option<&Value>,
+    message: &str,
+    details: Value,
+) -> EvaluatorResult {
+    EvaluatorResult {
+        evaluator_id: id.to_owned(),
+        status,
+        passed: status == EvaluationStatus::Passed,
+        score: Some(if status == EvaluationStatus::Passed {
+            1.0
+        } else {
+            0.0
+        }),
+        message: message.to_owned(),
+        details,
+        fields: vec![FieldEvaluationFact {
+            pointer: pointer.to_owned(),
+            expected_pointer: Some(expected_pointer.to_owned()),
+            status,
+            expected: expected.cloned(),
+            actual: actual.cloned(),
+            message: message.to_owned(),
+        }],
+    }
+}
+
+fn field_error(
+    id: &str,
+    output: &Value,
+    pointer: &str,
+    expected_pointer: &str,
+    message: &str,
+) -> EvaluatorResult {
+    field_result(
+        id,
+        EvaluationStatus::Error,
+        pointer,
+        expected_pointer,
+        output.pointer(pointer),
+        None,
+        message,
+        Value::Null,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_numeric(
     id: &str,
@@ -521,21 +1119,51 @@ fn evaluate_numeric(
     relative: Option<&str>,
     exact_integer: bool,
 ) -> EvaluatorResult {
+    let field = |status: EvaluationStatus,
+                 actual: Option<&Value>,
+                 reference: Option<&Value>,
+                 message: &str| {
+        vec![FieldEvaluationFact {
+            pointer: pointer.to_owned(),
+            expected_pointer: Some(expected_pointer.to_owned()),
+            status,
+            expected: reference.cloned(),
+            actual: actual.cloned(),
+            message: message.to_owned(),
+        }]
+    };
     let Some(expected) = expected else {
-        return EvaluatorResult::error(id, "case has no expected value");
+        return EvaluatorResult::error(id, "case has no expected value").with_fields(field(
+            EvaluationStatus::Error,
+            output.pointer(pointer),
+            None,
+            "Case has no expected value.",
+        ));
     };
     let Some(actual_value) = output.pointer(pointer) else {
         return EvaluatorResult::failed(
             id,
             format!("Output pointer {pointer} did not resolve."),
             Value::Null,
-        );
+        )
+        .with_fields(field(
+            EvaluationStatus::Failed,
+            None,
+            expected.pointer(expected_pointer),
+            "Output pointer did not resolve.",
+        ));
     };
     let Some(expected_value) = expected.pointer(expected_pointer) else {
         return EvaluatorResult::error(
             id,
             format!("expected pointer {expected_pointer} did not resolve"),
-        );
+        )
+        .with_fields(field(
+            EvaluationStatus::Error,
+            Some(actual_value),
+            None,
+            "Expected pointer did not resolve.",
+        ));
     };
     let actual_text = number_text(actual_value);
     let expected_text = number_text(expected_value);
@@ -544,7 +1172,13 @@ fn evaluate_numeric(
             id,
             "Numeric evaluator received a non-numeric value.",
             serde_json::json!({"actual": actual_value, "expected": expected_value}),
-        );
+        )
+        .with_fields(field(
+            EvaluationStatus::Failed,
+            Some(actual_value),
+            Some(expected_value),
+            "Numeric evaluator received a non-numeric value.",
+        ));
     };
     if exact_integer {
         let actual = canonical_integer(actual_text);
@@ -554,17 +1188,35 @@ fn evaluate_numeric(
                 id,
                 "Integer values matched exactly.",
                 serde_json::json!({"value": actual}),
-            ),
+            )
+            .with_fields(field(
+                EvaluationStatus::Passed,
+                Some(actual_value),
+                Some(expected_value),
+                "Integer values matched exactly.",
+            )),
             (Some(actual), Some(reference)) => EvaluatorResult::failed(
                 id,
                 "Integer values did not match exactly.",
                 serde_json::json!({"actual": actual, "expected": reference}),
-            ),
+            )
+            .with_fields(field(
+                EvaluationStatus::Failed,
+                Some(actual_value),
+                Some(expected_value),
+                "Integer values did not match exactly.",
+            )),
             _ => EvaluatorResult::failed(
                 id,
                 "Exact-integer comparison requires integer values.",
                 Value::Null,
-            ),
+            )
+            .with_fields(field(
+                EvaluationStatus::Failed,
+                Some(actual_value),
+                Some(expected_value),
+                "Exact-integer comparison requires integer values.",
+            )),
         };
     }
     let actual = Decimal::from_str(actual_text);
@@ -574,14 +1226,26 @@ fn evaluate_numeric(
             id,
             "Values could not be represented as exact decimals.",
             Value::Null,
-        );
+        )
+        .with_fields(field(
+            EvaluationStatus::Failed,
+            Some(actual_value),
+            Some(expected_value),
+            "Values could not be represented as exact decimals.",
+        ));
     };
     let absolute_tolerance = absolute.and_then(|value| Decimal::from_str(value).ok());
     let relative_tolerance = relative.and_then(|value| Decimal::from_str(value).ok());
     if absolute.is_some() && absolute_tolerance.is_none()
         || relative.is_some() && relative_tolerance.is_none()
     {
-        return EvaluatorResult::error(id, "configured tolerance is not a valid decimal");
+        return EvaluatorResult::error(id, "configured tolerance is not a valid decimal")
+            .with_fields(field(
+                EvaluationStatus::Error,
+                Some(actual_value),
+                Some(expected_value),
+                "Configured tolerance is not a valid decimal.",
+            ));
     }
     let difference = (actual - reference).abs();
     let absolute_pass = absolute_tolerance.is_some_and(|limit| difference <= limit);
@@ -598,12 +1262,24 @@ fn evaluate_numeric(
             "Numeric value was within the configured tolerance.",
             serde_json::json!({"difference": difference.to_string()}),
         )
+        .with_fields(field(
+            EvaluationStatus::Passed,
+            Some(actual_value),
+            Some(expected_value),
+            "Numeric value was within the configured tolerance.",
+        ))
     } else {
         EvaluatorResult::failed(
             id,
             "Numeric value exceeded the configured tolerance.",
             serde_json::json!({"difference": difference.to_string()}),
         )
+        .with_fields(field(
+            EvaluationStatus::Failed,
+            Some(actual_value),
+            Some(expected_value),
+            "Numeric value exceeded the configured tolerance.",
+        ))
     }
 }
 
@@ -700,6 +1376,79 @@ mod tests {
         assert!(parse_strict("Here: {\"a\":1}").is_err());
     }
 
+    #[test]
+    fn json_schema_date_format_is_enforced() {
+        let schema = compile_schema(&json!({"type": "string", "format": "date"})).unwrap();
+        assert!(schema.is_valid(&json!("2026-08-09")));
+        assert!(!schema.is_valid(&json!("2026-02-30")));
+        assert!(!schema.is_valid(&json!("09/08/2026")));
+    }
+
+    #[test]
+    fn numeric_evaluator_emits_pointer_level_failure_evidence() {
+        let result = evaluate_numeric(
+            "total",
+            &json!({"total": "11.00"}),
+            Some(&json!({"total": "10.00"})),
+            "/total",
+            "/total",
+            Some("0.01"),
+            None,
+            false,
+        );
+        assert_eq!(result.status, EvaluationStatus::Failed);
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.fields[0].pointer, "/total");
+        assert_eq!(result.fields[0].status, EvaluationStatus::Failed);
+    }
+
+    #[test]
+    fn normalized_strings_handle_unicode_case_and_whitespace() {
+        let result = evaluate_normalized_string(
+            "vendor",
+            &json!({"vendor": "  CAFÉ\nSUPPLIES "}),
+            Some(&json!({"vendor": "cafe\u{301} supplies"})),
+            "/vendor",
+            "/vendor",
+            true,
+        );
+        assert_eq!(result.status, EvaluationStatus::Passed);
+    }
+
+    #[test]
+    fn canonical_dates_accept_declared_formats_and_reject_impossible_dates() {
+        let formats = vec!["iso".to_owned(), "dmy_slash".to_owned()];
+        assert_eq!(
+            canonical_date("09/08/2026", &formats).as_deref(),
+            Some("2026-08-09")
+        );
+        assert_eq!(canonical_date("2026-02-30", &formats), None);
+    }
+
+    #[test]
+    fn keyed_arrays_report_missing_items_without_order_sensitivity() {
+        let keys = vec!["/sku".to_owned()];
+        let reordered = evaluate_keyed_array(
+            "items",
+            &json!({"items": [{"sku": "B", "qty": 2}, {"sku": "A", "qty": 1}]}),
+            Some(&json!({"items": [{"sku": "A", "qty": 1}, {"sku": "B", "qty": 2}]})),
+            "/items",
+            "/items",
+            &keys,
+        );
+        assert_eq!(reordered.status, EvaluationStatus::Passed);
+        let missing = evaluate_keyed_array(
+            "items",
+            &json!({"items": [{"sku": "A", "qty": 1}]}),
+            Some(&json!({"items": [{"sku": "A", "qty": 1}, {"sku": "B", "qty": 2}]})),
+            "/items",
+            "/items",
+            &keys,
+        );
+        assert_eq!(missing.status, EvaluationStatus::Failed);
+        assert_eq!(missing.details["missing"].as_array().unwrap().len(), 1);
+    }
+
     proptest! {
         #[test]
         fn exact_integer_normalization_preserves_arbitrary_length_identity(
@@ -743,6 +1492,7 @@ mod tests {
         };
         let evaluators = vec![EvaluatorConfig {
             id: "priority".to_owned(),
+            implementation_version: None,
             kind: EvaluatorKind::JsonPointerExact {
                 pointer: "/priority".to_owned(),
                 expected_pointer: "/priority".to_owned(),
@@ -840,11 +1590,13 @@ mod tests {
         };
         let evaluators = vec![EvaluatorConfig {
             id: "external".to_owned(),
+            implementation_version: Some("test-v1".to_owned()),
             kind: EvaluatorKind::Command {
                 command: crate::config::CommandSpec {
                     program: "unused".to_owned(),
                     args: vec![],
                 },
+                process_mode: crate::config::ProcessMode::Persistent,
                 timeout_ms: 1000,
             },
         }];

@@ -12,17 +12,24 @@ use serde::Serialize;
 use serde_json::Value;
 use structtrace_adapters::{
     command::CommandLimits,
-    evaluator::{EVALUATOR_BRIDGE_SOURCE, EvaluatorRuntime, run_external_evaluator},
+    evaluator::{
+        EVALUATOR_BRIDGE_SOURCE, EvaluatorInvocation, EvaluatorRuntime,
+        run_external_evaluator_batch,
+    },
 };
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{
-        EvaluatorComparison, ExternalEvaluatorReceipt, FieldHotspot, MatchedOperationalSummary,
-        PairedCaseRecord, RunManifest, RunStatus, RunSummary, VariantSummary,
+        EvaluatorComparison, EvaluatorStateCounts, ExternalEvaluatorReceipt, FieldHotspot,
+        MatchedOperationalSummary, PairedCaseRecord, RunManifest, RunStatus, RunSummary,
+        VariantSummary,
     },
     config::{Config, EvaluatorKind, VariantConfig},
     dataset::Dataset,
-    evaluation::{EvaluationStatus, EvaluatorResult, compile_schema, evaluate_case_with_external},
+    evaluation::{
+        EvaluationStatus, EvaluatorResult, OutcomeStatus, compile_schema,
+        evaluate_case_with_external,
+    },
     gate::{GateInputs, evaluate_gate},
     hashing::{hash_bytes, hash_canonical_json, hash_file},
     output::{OutputStatus, RecordedOutputs},
@@ -62,6 +69,8 @@ pub struct PreparedVariant {
     /// Adapter-level protocol diagnostics.
     pub protocol_errors: Vec<String>,
 }
+
+type ExternalEvaluatorRows = Vec<BTreeMap<String, EvaluatorResult>>;
 
 /// Run the complete recorded-output workflow from a validated configuration.
 pub fn run_recorded(project_root: &Path, config_path: &Path) -> anyhow::Result<CompletedRun> {
@@ -227,30 +236,22 @@ pub fn finalize_prepared_for_run(
     let evaluator_bridge = materialize_evaluator_bridge(&storage_root)?;
     let mut evaluator_stderr = Vec::new();
     let mut evaluator_receipts = Vec::new();
+    let (baseline_external_rows, candidate_external_rows) = execute_external_evaluator_matrix(
+        &config,
+        &dataset,
+        &baseline,
+        &candidate,
+        project_root,
+        &evaluator_bridge,
+        &mut evaluator_stderr,
+        &mut evaluator_receipts,
+    );
     for index in 0..dataset.cases.len() {
         let case = &dataset.cases[index];
         let baseline_output = &baseline.rows[index];
         let candidate_output = &candidate.rows[index];
-        let baseline_external = execute_external_evaluators(
-            &config,
-            case,
-            baseline_output,
-            "baseline",
-            project_root,
-            &evaluator_bridge,
-            &mut evaluator_stderr,
-            &mut evaluator_receipts,
-        );
-        let candidate_external = execute_external_evaluators(
-            &config,
-            case,
-            candidate_output,
-            "candidate",
-            project_root,
-            &evaluator_bridge,
-            &mut evaluator_stderr,
-            &mut evaluator_receipts,
-        );
+        let baseline_external = &baseline_external_rows[index];
+        let candidate_external = &candidate_external_rows[index];
         let baseline_evaluation = evaluate_case_with_external(
             case,
             baseline_output,
@@ -258,7 +259,7 @@ pub fn finalize_prepared_for_run(
             &config.evaluators,
             &config.outcomes,
             &config.analysis.primary_outcome,
-            &baseline_external,
+            baseline_external,
         );
         let candidate_evaluation = evaluate_case_with_external(
             case,
@@ -267,7 +268,7 @@ pub fn finalize_prepared_for_run(
             &config.evaluators,
             &config.outcomes,
             &config.analysis.primary_outcome,
-            &candidate_external,
+            candidate_external,
         );
         store.insert_output("baseline", baseline_output)?;
         store.insert_output("candidate", candidate_output)?;
@@ -487,17 +488,22 @@ fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> anyhow::Result<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_external_evaluators(
+fn execute_external_evaluator_matrix(
     config: &Config,
-    case: &structtrace_core::dataset::Case,
-    output: &structtrace_core::output::VariantOutput,
-    variant_id: &str,
+    dataset: &Dataset,
+    baseline: &PreparedVariant,
+    candidate: &PreparedVariant,
     project_root: &Path,
     bridge_path: &Path,
     retained_stderr: &mut Vec<u8>,
     retained_receipts: &mut Vec<ExternalEvaluatorReceipt>,
-) -> BTreeMap<String, EvaluatorResult> {
-    let mut results = BTreeMap::new();
+) -> (ExternalEvaluatorRows, ExternalEvaluatorRows) {
+    let mut baseline_results = vec![BTreeMap::new(); dataset.cases.len()];
+    let mut candidate_results = vec![BTreeMap::new(); dataset.cases.len()];
+    let limits = CommandLimits {
+        max_output_bytes: config.limits.max_output_bytes_per_case,
+        max_stderr_bytes: config.limits.max_stderr_bytes_per_process,
+    };
     for evaluator in &config.evaluators {
         if !matches!(
             evaluator.kind,
@@ -505,35 +511,49 @@ fn execute_external_evaluators(
         ) {
             continue;
         }
-        let run = run_external_evaluator(
-            &evaluator.id,
-            &evaluator.kind,
-            case,
-            output,
-            EvaluatorRuntime {
-                variant_id,
-                working_directory: project_root,
-                python_bridge: bridge_path,
-                limits: &CommandLimits {
-                    max_output_bytes: config.limits.max_output_bytes_per_case,
-                    max_stderr_bytes: config.limits.max_stderr_bytes_per_process,
+        for (variant_id, outputs, target) in [
+            ("baseline", &baseline.rows, &mut baseline_results),
+            ("candidate", &candidate.rows, &mut candidate_results),
+        ] {
+            let invocations = dataset
+                .cases
+                .iter()
+                .zip(outputs)
+                .map(|(case, output)| EvaluatorInvocation { case, output })
+                .collect::<Vec<_>>();
+            let runs = run_external_evaluator_batch(
+                &evaluator.id,
+                &evaluator.kind,
+                evaluator.implementation_version.as_deref(),
+                &invocations,
+                EvaluatorRuntime {
+                    variant_id,
+                    working_directory: project_root,
+                    python_bridge: bridge_path,
+                    limits: &limits,
                 },
-            },
-        );
-        if !run.stderr.is_empty() {
-            retained_stderr.extend_from_slice(
-                format!(
-                    "\n--- variant={variant_id} case={} evaluator={} ---\n",
-                    case.id, evaluator.id
-                )
-                .as_bytes(),
             );
-            retained_stderr.extend_from_slice(&run.stderr);
+            if let Some(stderr) = runs
+                .first()
+                .map(|run| run.stderr.as_slice())
+                .filter(|stderr| !stderr.is_empty())
+            {
+                retained_stderr.extend_from_slice(
+                    format!(
+                        "\n--- variant={variant_id} evaluator={} ---\n",
+                        evaluator.id
+                    )
+                    .as_bytes(),
+                );
+                retained_stderr.extend_from_slice(stderr);
+            }
+            for (index, run) in runs.into_iter().enumerate() {
+                retained_receipts.push(run.receipt);
+                target[index].insert(evaluator.id.clone(), run.result);
+            }
         }
-        retained_receipts.push(run.receipt);
-        results.insert(evaluator.id.clone(), run.result);
     }
-    results
+    (baseline_results, candidate_results)
 }
 
 fn materialize_evaluator_bridge(storage_root: &Path) -> anyhow::Result<PathBuf> {
@@ -663,45 +683,32 @@ pub(crate) fn build_summary(
         .evaluators
         .iter()
         .map(|evaluator| {
-            let baseline_pass = records
-                .iter()
-                .filter(|record| {
-                    record
-                        .baseline_evaluation
-                        .evaluators
-                        .get(&evaluator.id)
-                        .is_some_and(|result| result.passed)
-                })
-                .count();
-            let candidate_pass = records
-                .iter()
-                .filter(|record| {
-                    record
-                        .candidate_evaluation
-                        .evaluators
-                        .get(&evaluator.id)
-                        .is_some_and(|result| result.passed)
-                })
-                .count();
             (
                 evaluator.id.clone(),
                 EvaluatorComparison {
-                    total: records.len(),
-                    baseline_pass,
-                    candidate_pass,
+                    baseline: evaluator_state_counts(records, &evaluator.id, true),
+                    candidate: evaluator_state_counts(records, &evaluator.id, false),
                 },
             )
         })
         .collect();
+    let jointly_scored = count_jointly_scored(records.iter().map(|record| {
+        (
+            record
+                .baseline_evaluation
+                .outcomes
+                .get(&config.analysis.primary_outcome),
+            record
+                .candidate_evaluation
+                .outcomes
+                .get(&config.analysis.primary_outcome),
+        )
+    }));
     let gate = evaluate_gate(
         &config.gate,
         &GateInputs {
             total_cases: records.len(),
-            primary_scored_rate: rate(
-                (baseline.primary_pass + baseline.primary_failed)
-                    .min(candidate.primary_pass + candidate.primary_failed),
-                records.len(),
-            ),
+            primary_scored_rate: rate(jointly_scored, records.len()),
             primary_evaluator_error_rate: rate(
                 baseline.primary_error.max(candidate.primary_error),
                 records.len(),
@@ -742,6 +749,7 @@ pub(crate) fn build_summary(
         primary_outcome: config.analysis.primary_outcome.clone(),
         baseline,
         candidate,
+        primary_jointly_scored: jointly_scored,
         matched_operational,
         paired,
         bootstrap,
@@ -922,7 +930,12 @@ fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHot
     for record in records {
         let baseline = field_statuses(&record.baseline_evaluation.evaluators, &evaluator_ids);
         let candidate = field_statuses(&record.candidate_evaluation.evaluators, &evaluator_ids);
-        for pointer in baseline.keys().chain(candidate.keys()) {
+        let pointers = baseline
+            .keys()
+            .chain(candidate.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for pointer in pointers {
             let hotspot = hotspots
                 .entry(pointer.clone())
                 .or_insert_with(|| FieldHotspot {
@@ -931,8 +944,8 @@ fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHot
                     improvements: 0,
                     candidate_failures: 0,
                 });
-            let baseline_pass = baseline.get(pointer).copied();
-            let candidate_pass = candidate.get(pointer).copied();
+            let baseline_pass = baseline.get(&pointer).copied();
+            let candidate_pass = candidate.get(&pointer).copied();
             hotspot.regressions +=
                 usize::from(baseline_pass == Some(true) && candidate_pass == Some(false));
             hotspot.improvements +=
@@ -940,7 +953,12 @@ fn field_hotspots(config: &Config, records: &[PairedCaseRecord]) -> Vec<FieldHot
             hotspot.candidate_failures += usize::from(candidate_pass == Some(false));
         }
     }
-    let mut hotspots = hotspots.into_values().collect::<Vec<_>>();
+    let mut hotspots = hotspots
+        .into_values()
+        .filter(|hotspot| {
+            hotspot.regressions > 0 || hotspot.improvements > 0 || hotspot.candidate_failures > 0
+        })
+        .collect::<Vec<_>>();
     hotspots.sort_by(|left, right| {
         right
             .regressions
@@ -973,6 +991,51 @@ fn field_statuses(
         }
     }
     statuses
+}
+
+fn evaluator_state_counts(
+    records: &[PairedCaseRecord],
+    evaluator_id: &str,
+    baseline: bool,
+) -> EvaluatorStateCounts {
+    let mut counts = EvaluatorStateCounts {
+        total: records.len(),
+        ..EvaluatorStateCounts::default()
+    };
+    for record in records {
+        let evaluation = if baseline {
+            &record.baseline_evaluation
+        } else {
+            &record.candidate_evaluation
+        };
+        match evaluation
+            .evaluators
+            .get(evaluator_id)
+            .map(|result| result.status)
+        {
+            Some(EvaluationStatus::Passed) => counts.passed += 1,
+            Some(EvaluationStatus::Failed) => counts.failed += 1,
+            Some(EvaluationStatus::Error) => counts.error += 1,
+            Some(EvaluationStatus::NotApplicable) => counts.not_applicable += 1,
+            None => counts.unscored += 1,
+        }
+    }
+    counts
+}
+
+fn explicit_binary_outcome(status: Option<&OutcomeStatus>) -> bool {
+    matches!(status, Some(OutcomeStatus::True | OutcomeStatus::False))
+}
+
+fn count_jointly_scored<'a>(
+    pairs: impl IntoIterator<Item = (Option<&'a OutcomeStatus>, Option<&'a OutcomeStatus>)>,
+) -> usize {
+    pairs
+        .into_iter()
+        .filter(|(baseline, candidate)| {
+            explicit_binary_outcome(*baseline) && explicit_binary_outcome(*candidate)
+        })
+        .count()
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -1079,7 +1142,7 @@ fn unix_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use tempfile::tempdir;
 
@@ -1088,6 +1151,92 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn joint_scoring_coverage_does_not_use_marginal_minimums() {
+        let passed = OutcomeStatus::True;
+        let error = OutcomeStatus::Error;
+        let pairs = [(Some(&error), Some(&passed)), (Some(&passed), Some(&error))];
+
+        assert_eq!(count_jointly_scored(pairs), 0);
+    }
+
+    #[test]
+    fn disjoint_variant_errors_reduce_joint_scored_coverage() {
+        let root = tempdir().unwrap();
+        let mut dataset = String::new();
+        let mut outputs = String::new();
+        for index in 0..100 {
+            dataset.push_str(&format!(
+                "{{\"id\":\"case-{index:03}\",\"input\":{{}},\"expected\":{{\"label\":\"yes\"}}}}\n"
+            ));
+            outputs.push_str(&format!(
+                "{{\"case_id\":\"case-{index:03}\",\"status\":\"ok\",\"raw_output\":\"{{\\\"label\\\":\\\"yes\\\"}}\"}}\n"
+            ));
+        }
+        write(&root.path().join("data.jsonl"), &dataset);
+        write(&root.path().join("baseline.jsonl"), &outputs);
+        write(&root.path().join("candidate.jsonl"), &outputs);
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 1
+project: {name: joint-coverage}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: exact, kind: exact_json}
+outcomes:
+  correct: {all_of: [exact]}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+gate:
+  min_cases: 100
+  min_primary_scored_rate: 0.99
+  max_primary_evaluator_error_rate: 0.02
+  max_primary_not_applicable_rate: 0
+  max_primary_unscored_rate: 0
+  max_primary_regression_pp: 100
+"#,
+        );
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        let text = std::fs::read_to_string(run.run_dir.join("cases.jsonl")).unwrap();
+        let mut records = text
+            .lines()
+            .map(serde_json::from_str::<PairedCaseRecord>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        records[0]
+            .baseline_evaluation
+            .outcomes
+            .insert("correct".to_owned(), OutcomeStatus::Error);
+        records[0].baseline_evaluation.primary_pass = false;
+        records[1]
+            .candidate_evaluation
+            .outcomes
+            .insert("correct".to_owned(), OutcomeStatus::Error);
+        records[1].candidate_evaluation.primary_pass = false;
+        let config = Config::load(&root.path().join("structtrace.yaml")).unwrap();
+        let summary = build_summary("joint-coverage", &config, &records).unwrap();
+        assert_eq!(summary.primary_jointly_scored, 98);
+        let rule = summary
+            .gate
+            .rules
+            .iter()
+            .find(|rule| rule.rule == "min_primary_scored_rate")
+            .unwrap();
+        assert_eq!(rule.observed, Some(0.98));
+        assert_eq!(
+            rule.status,
+            structtrace_core::gate::GateRuleStatus::InsufficientEvidence
+        );
+        assert_eq!(
+            summary.gate.status,
+            structtrace_core::gate::GateStatus::InsufficientEvidence
+        );
     }
 
     #[test]
@@ -1201,6 +1350,63 @@ analysis:
             .collect::<Vec<_>>();
         assert_eq!(regressions.len(), 1);
         assert_eq!(regressions[0].pointer, "/priority");
+        assert_eq!(regressions[0].regressions, 1);
+        assert_eq!(regressions[0].candidate_failures, 1);
+    }
+
+    #[test]
+    fn invoice_fixture_has_exact_field_hotspot_diagnostics() {
+        let root = tempdir().unwrap();
+        for (path, contents) in [
+            (
+                "data/golden.jsonl",
+                include_str!("../../../examples/document-extraction/data/golden.jsonl"),
+            ),
+            (
+                "outputs/baseline.jsonl",
+                include_str!("../../../examples/document-extraction/outputs/baseline.jsonl"),
+            ),
+            (
+                "outputs/candidate.jsonl",
+                include_str!("../../../examples/document-extraction/outputs/candidate.jsonl"),
+            ),
+            (
+                "schema.json",
+                include_str!("../../../examples/document-extraction/schemas/output.schema.json"),
+            ),
+        ] {
+            write(&root.path().join(path), contents);
+        }
+        let config = include_str!("../../../examples/document-extraction/structtrace.yaml")
+            .replace("schemas/output.schema.json", "schema.json");
+        write(&root.path().join("structtrace.yaml"), &config);
+
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        let actual = run
+            .summary
+            .field_hotspots
+            .into_iter()
+            .map(|hotspot| {
+                (
+                    hotspot.pointer,
+                    (
+                        hotspot.regressions,
+                        hotspot.improvements,
+                        hotspot.candidate_failures,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("/currency".to_owned(), (0, 2, 0)),
+                ("/line_items".to_owned(), (1, 0, 1)),
+                ("/tax".to_owned(), (1, 0, 1)),
+                ("/total".to_owned(), (2, 0, 2)),
+                ("/vendor_name".to_owned(), (0, 1, 0)),
+            ])
+        );
     }
 
     #[test]
@@ -1348,6 +1554,7 @@ variants:
   candidate: {{kind: recorded, path: candidate.jsonl}}
 evaluators:
   - id: business
+    implementation_version: fixture-v1
     kind: python
     interpreter: {interpreter}
     callable: variants.evaluator:score
@@ -1371,6 +1578,78 @@ analysis:
             run.run_dir
                 .join("external-evaluator-receipts.jsonl")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn persistent_python_evaluator_handles_1000_cases_per_variant() {
+        let interpreter = ["python3", "python"].into_iter().find(|program| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        });
+        let Some(interpreter) = interpreter else {
+            return;
+        };
+        let root = tempdir().unwrap();
+        let mut dataset = String::new();
+        let mut outputs = String::new();
+        for index in 0..1000 {
+            dataset.push_str(&format!(
+                "{{\"id\":\"case-{index:04}\",\"input\":{{}},\"expected\":{{\"label\":\"yes\"}}}}\n"
+            ));
+            outputs.push_str(&format!(
+                "{{\"case_id\":\"case-{index:04}\",\"status\":\"ok\",\"raw_output\":\"{{\\\"label\\\":\\\"yes\\\"}}\"}}\n"
+            ));
+        }
+        write(&root.path().join("data.jsonl"), &dataset);
+        write(&root.path().join("baseline.jsonl"), &outputs);
+        write(&root.path().join("candidate.jsonl"), &outputs);
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("variants/evaluator.py"),
+            "import json\n\ndef score(request):\n    return request['model_output']['raw_output'] == json.dumps({'label': 'yes'}, separators=(',', ':'))\n",
+        );
+        write(
+            &root.path().join("structtrace.yaml"),
+            &format!(
+                r#"version: 1
+project: {{name: evaluator-scale}}
+dataset: {{path: data.jsonl}}
+schema: {{path: schema.json}}
+variants:
+  baseline: {{kind: recorded, path: baseline.jsonl}}
+  candidate: {{kind: recorded, path: candidate.jsonl}}
+evaluators:
+  - id: business
+    implementation_version: scale-fixture-v1
+    kind: python
+    interpreter: {interpreter}
+    callable: variants.evaluator:score
+    process_mode: persistent
+    timeout_ms: 2000
+outcomes:
+  correct: {{all_of: [business]}}
+analysis: {{primary_outcome: correct, bootstrap: {{samples: 100, confidence: 0.95, seed: 17}}}}
+"#
+            ),
+        );
+        let started = std::time::Instant::now();
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        assert_eq!(run.summary.baseline.primary_pass, 1000);
+        assert_eq!(run.summary.candidate.primary_pass, 1000);
+        assert_eq!(run.summary.primary_jointly_scored, 1000);
+        assert_eq!(
+            std::fs::read_to_string(run.run_dir.join("external-evaluator-receipts.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2000
+        );
+        eprintln!(
+            "persistent evaluator scale fixture: 1000 cases x 2 variants in {:?}",
+            started.elapsed()
         );
     }
 }

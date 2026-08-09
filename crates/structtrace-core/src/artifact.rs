@@ -262,6 +262,9 @@ pub struct RunSummary {
     pub baseline: VariantSummary,
     /// Candidate aggregate.
     pub candidate: VariantSummary,
+    /// Cases with an explicit binary primary outcome for both variants.
+    #[serde(default)]
+    pub primary_jointly_scored: usize,
     /// Pair-matched operational measurements used by operational gates.
     #[serde(default)]
     pub matched_operational: MatchedOperationalSummary,
@@ -280,12 +283,27 @@ pub struct RunSummary {
 /// Per-evaluator aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvaluatorComparison {
-    /// Complete denominator.
+    /// Baseline evaluator states.
+    pub baseline: EvaluatorStateCounts,
+    /// Candidate evaluator states.
+    pub candidate: EvaluatorStateCounts,
+}
+
+/// Complete-denominator state counts for one evaluator and variant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluatorStateCounts {
+    /// Complete case denominator.
     pub total: usize,
-    /// Baseline passes.
-    pub baseline_pass: usize,
-    /// Candidate passes.
-    pub candidate_pass: usize,
+    /// Explicit passes.
+    pub passed: usize,
+    /// Explicit failures.
+    pub failed: usize,
+    /// Evaluator errors.
+    pub error: usize,
+    /// Explicitly not-applicable results.
+    pub not_applicable: usize,
+    /// Cases with no evaluator result.
+    pub unscored: usize,
 }
 
 /// JSON Pointer-level paired changes.

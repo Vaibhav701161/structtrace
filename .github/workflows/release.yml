@@ -28,8 +28,8 @@ jobs:
             archive: zip
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: "1.87.0"
           targets: ${{ matrix.target }}
@@ -59,12 +59,20 @@ jobs:
           else
             shasum -a 256 "$asset" > "$asset.sha256"
           fi
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          artifact-name: structtrace-${{ matrix.target }}.spdx.json
+          output-file: structtrace-${{ matrix.target }}.spdx.json
+          upload-artifact: false
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: structtrace-${{ matrix.target }}.${{ matrix.archive }}
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             structtrace-${{ matrix.target }}.${{ matrix.archive }}
             structtrace-${{ matrix.target }}.${{ matrix.archive }}.sha256
+            structtrace-${{ matrix.target }}.spdx.json

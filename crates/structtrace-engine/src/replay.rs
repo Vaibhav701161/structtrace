@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use structtrace_adapters::evaluator::evaluator_request;
+use structtrace_adapters::evaluator::{evaluator_definition, evaluator_request};
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{ExternalEvaluatorReceipt, PairedCaseRecord, RunManifest, RunSummary},
@@ -155,8 +155,9 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
             }
         }
     }
-    let mut stored_by_id = BTreeMap::new();
     let mut cross_artifact_mismatches = Vec::new();
+    compare_manifest_to_config(&manifest, &config, &mut cross_artifact_mismatches)?;
+    let mut stored_by_id = BTreeMap::new();
     for record in stored_records {
         if stored_by_id
             .insert(record.case.id.clone(), record)
@@ -298,6 +299,64 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
     })
 }
 
+fn compare_manifest_to_config(
+    manifest: &RunManifest,
+    config: &Config,
+    mismatches: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let expected_variants = serde_json::to_value(&config.variants)?;
+    let expected_evaluation = serde_json::json!({
+        "evaluators": config.evaluators,
+        "outcomes": config.outcomes,
+        "primary_outcome": config.analysis.primary_outcome,
+    });
+    let expected_gate = serde_json::to_value(&config.gate)?;
+    let observed_gate = serde_json::to_value(&manifest.gate)?;
+    let expected_bootstrap = serde_json::to_value(&config.analysis.bootstrap)?;
+    let observed_bootstrap = serde_json::to_value(&manifest.bootstrap)?;
+    let expected_schedule = RunManifest::new(String::new(), String::new()).execution_schedule;
+    let checks = [
+        (
+            "manifest project_name differs from retained configuration",
+            manifest.project_name == config.project.name,
+        ),
+        (
+            "manifest variants differ from retained configuration",
+            manifest.variants == expected_variants,
+        ),
+        (
+            "manifest evaluation_definition differs from retained configuration",
+            manifest.evaluation_definition == expected_evaluation,
+        ),
+        (
+            "manifest gate differs from retained configuration",
+            observed_gate == expected_gate,
+        ),
+        (
+            "manifest bootstrap differs from retained configuration",
+            observed_bootstrap == expected_bootstrap,
+        ),
+        (
+            "manifest dataset_path differs from retained configuration",
+            manifest.dataset_path == config.dataset.path.display().to_string(),
+        ),
+        (
+            "manifest schema_path differs from retained configuration",
+            manifest.schema_path == config.schema.path.display().to_string(),
+        ),
+        (
+            "manifest execution_schedule is not the supported fixed schedule",
+            manifest.execution_schedule == expected_schedule,
+        ),
+    ];
+    mismatches.extend(
+        checks
+            .into_iter()
+            .filter_map(|(message, matches)| (!matches).then_some(message.to_owned())),
+    );
+    Ok(())
+}
+
 fn is_external(kind: &structtrace_core::config::EvaluatorKind) -> bool {
     matches!(
         kind,
@@ -330,7 +389,10 @@ fn verified_external_results(
                 return None;
             };
             let request = evaluator_request(&evaluator.id, case, output, variant_id);
-            let definition = serde_json::to_value(&evaluator.kind).unwrap_or(Value::Null);
+            let definition = evaluator_definition(
+                &evaluator.kind,
+                evaluator.implementation_version.as_deref(),
+            );
             let response = serde_json::to_value(&receipt.result).unwrap_or(Value::Null);
             let checks = [
                 (
@@ -557,5 +619,41 @@ analysis:
         let replay = replay_run(&run_dir).unwrap();
         assert!(!replay.verified);
         assert!(!replay.summary_mismatches.is_empty());
+    }
+
+    #[test]
+    fn replay_detects_manifest_description_tampering() {
+        let (_root, run_dir) = completed_run();
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: RunManifest = read_json(&manifest_path).unwrap();
+        manifest.project_name = "tampered-project".to_owned();
+        manifest.dataset_path = "tampered-dataset.jsonl".to_owned();
+        manifest.variants = serde_json::json!({"tampered": true});
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let replay = replay_run(&run_dir).unwrap();
+        assert!(!replay.verified);
+        assert!(
+            replay
+                .cross_artifact_mismatches
+                .iter()
+                .any(|item| item.contains("project_name"))
+        );
+        assert!(
+            replay
+                .cross_artifact_mismatches
+                .iter()
+                .any(|item| item.contains("dataset_path"))
+        );
+        assert!(
+            replay
+                .cross_artifact_mismatches
+                .iter()
+                .any(|item| item.contains("variants"))
+        );
     }
 }

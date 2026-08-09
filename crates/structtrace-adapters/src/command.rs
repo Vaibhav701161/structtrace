@@ -9,7 +9,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+pub(crate) const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 use serde_json::Value;
@@ -233,29 +233,23 @@ async fn run_persistent(
         }
     }
     drop(stdin);
-    if terminal_failure.is_none() {
-        match timeout(
-            Duration::from_millis(20),
-            read_limited_line(&mut stdout, limits.max_output_bytes),
-        )
-        .await
-        {
-            Ok(Ok(Some(extra))) if !extra.trim().is_empty() => {
-                protocol_errors.push("process emitted unsolicited extra stdout".to_owned());
-            }
-            _ => {}
-        }
-    }
+    let mut lifecycle_trusted = terminal_failure.is_none();
     match timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await {
         Ok(Ok(status)) if !status.success() && terminal_failure.is_none() => {
             let message = format!("persistent process exited unsuccessfully with {status}");
             protocol_errors.push(message.clone());
+            lifecycle_trusted = false;
             for (case, row) in cases.iter().zip(&mut rows) {
                 *row = error_output(&case.id, "process_exit", &message, row.latency_ms);
             }
         }
         Ok(Err(error)) if terminal_failure.is_none() => {
-            protocol_errors.push(format!("could not wait for persistent process: {error}"));
+            let message = format!("could not wait for persistent process: {error}");
+            protocol_errors.push(message.clone());
+            lifecycle_trusted = false;
+            for (case, row) in cases.iter().zip(&mut rows) {
+                *row = error_output(&case.id, "process_wait", &message, row.latency_ms);
+            }
         }
         Err(_) if terminal_failure.is_none() => {
             let message = format!(
@@ -263,6 +257,7 @@ async fn run_persistent(
                 PROCESS_SHUTDOWN_GRACE.as_millis()
             );
             protocol_errors.push(message.clone());
+            lifecycle_trusted = false;
             terminate_process_tree(&mut child, process_id).await;
             for (case, row) in cases.iter().zip(&mut rows) {
                 *row = error_output(
@@ -275,6 +270,30 @@ async fn run_persistent(
         }
         Err(_) => terminate_process_tree(&mut child, process_id).await,
         _ => {}
+    }
+    if lifecycle_trusted {
+        match timeout(
+            Duration::from_millis(20),
+            read_limited_line(&mut stdout, limits.max_output_bytes),
+        )
+        .await
+        {
+            Ok(Ok(Some(extra))) if !extra.trim().is_empty() => {
+                let message = "process emitted unsolicited extra stdout".to_owned();
+                protocol_errors.push(message.clone());
+                for (case, row) in cases.iter().zip(&mut rows) {
+                    *row = error_output(&case.id, "protocol_violation", &message, row.latency_ms);
+                }
+            }
+            Ok(Err(error)) => {
+                let message = format!("could not verify protocol completion: {error:?}");
+                protocol_errors.push(message.clone());
+                for (case, row) in cases.iter().zip(&mut rows) {
+                    *row = error_output(&case.id, "protocol_io", &message, row.latency_ms);
+                }
+            }
+            _ => {}
+        }
     }
     terminate_remaining_process_tree(process_id).await;
     let stderr = match stderr_task {
@@ -289,13 +308,13 @@ async fn run_persistent(
 }
 
 #[derive(Debug)]
-enum LimitedLineError {
+pub(crate) enum LimitedLineError {
     Io(String),
     InvalidUtf8(String),
     Limit,
 }
 
-async fn read_limited_line<R>(
+pub(crate) async fn read_limited_line<R>(
     reader: &mut BufReader<R>,
     max_bytes: usize,
 ) -> Result<Option<String>, LimitedLineError>
@@ -537,7 +556,7 @@ async fn run_per_case(
     }
 }
 
-fn spawn(spec: &CommandSpec, working_directory: &Path) -> std::io::Result<Child> {
+pub(crate) fn spawn(spec: &CommandSpec, working_directory: &Path) -> std::io::Result<Child> {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -554,7 +573,7 @@ fn spawn(spec: &CommandSpec, working_directory: &Path) -> std::io::Result<Child>
     command.spawn()
 }
 
-async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
+pub(crate) async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
     terminate_tree_signal(process_id, false).await;
     if timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await.is_ok() {
         return;
@@ -565,15 +584,15 @@ async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
 }
 
 #[cfg(unix)]
-async fn terminate_remaining_process_tree(process_id: Option<u32>) {
+pub(crate) async fn terminate_remaining_process_tree(process_id: Option<u32>) {
     terminate_tree_signal(process_id, true).await;
 }
 
 #[cfg(windows)]
-async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
+pub(crate) async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
 
 #[cfg(not(any(unix, windows)))]
-async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
+pub(crate) async fn terminate_remaining_process_tree(_process_id: Option<u32>) {}
 
 #[cfg(unix)]
 async fn terminate_tree_signal(process_id: Option<u32>, force: bool) {
@@ -613,7 +632,7 @@ async fn terminate_tree_signal(process_id: Option<u32>, force: bool) {
 #[cfg(not(any(unix, windows)))]
 async fn terminate_tree_signal(_process_id: Option<u32>, _force: bool) {}
 
-async fn bounded_stderr_task(
+pub(crate) async fn bounded_stderr_task(
     mut task: JoinHandle<Vec<u8>>,
     protocol_errors: &mut Vec<String>,
 ) -> Vec<u8> {
@@ -720,7 +739,7 @@ fn all_failed(cases: &[VariantCase], kind: &str, message: &str) -> AdapterRun {
     }
 }
 
-async fn drain_stderr(mut reader: impl AsyncRead + Unpin, limit: usize) -> Vec<u8> {
+pub(crate) async fn drain_stderr(mut reader: impl AsyncRead + Unpin, limit: usize) -> Vec<u8> {
     drain_bounded(&mut reader, limit)
         .await
         .map_or_else(|_| Vec::new(), |(retained, _)| retained)
@@ -817,6 +836,11 @@ for line in sys.stdin:
         sys.exit(9)
 if args.mode == "ignore-eof":
     time.sleep(60)
+if args.mode == "extra-after-complete":
+    print("unsolicited", flush=True)
+if args.mode == "delayed-extra-after-complete":
+    time.sleep(0.1)
+    print("unsolicited", flush=True)
 "#;
 
     fn cases() -> Vec<VariantCase> {
@@ -871,6 +895,27 @@ if args.mode == "ignore-eof":
             run.rows[0].parsed_output,
             Some(json!({"label": "accepted"}))
         );
+    }
+
+    #[tokio::test]
+    async fn unsolicited_stdout_invalidates_every_persistent_row() {
+        for mode in ["extra-after-complete", "delayed-extra-after-complete"] {
+            let (directory, spec) = fixture(mode);
+            let run = run_command(
+                &spec,
+                ProcessMode::Persistent,
+                FIXTURE_TIMEOUT_MS,
+                &cases(),
+                directory.path(),
+                &CommandLimits::default(),
+            )
+            .await;
+            assert!(run.rows.iter().all(|row| {
+                row.status == OutputStatus::Error
+                    && row.error.as_ref().map(|error| error.kind.as_str())
+                        == Some("protocol_violation")
+            }));
+        }
     }
 
     #[tokio::test]

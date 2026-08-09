@@ -6,6 +6,18 @@ use anyhow::Context;
 
 use crate::InitTemplate;
 
+const EXTRACTION_CONFIG: &str =
+    include_str!("../../../examples/document-extraction/structtrace.yaml");
+const EXTRACTION_SCHEMA: &str =
+    include_str!("../../../examples/document-extraction/schemas/output.schema.json");
+const EXTRACTION_DATASET: &str =
+    include_str!("../../../examples/document-extraction/data/golden.jsonl");
+const EXTRACTION_BASELINE: &str =
+    include_str!("../../../examples/document-extraction/outputs/baseline.jsonl");
+const EXTRACTION_CANDIDATE: &str =
+    include_str!("../../../examples/document-extraction/outputs/candidate.jsonl");
+const EXTRACTION_README: &str = include_str!("../../../examples/document-extraction/README.md");
+
 /// Materialize one complete integration template.
 pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<PathBuf> {
     let mut protected = vec![
@@ -73,6 +85,39 @@ pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<
         InitTemplate::OpenaiCompatible => {
             write_new(&destination.join("variants/README.md"), OPENAI_NOTES)?;
         }
+    }
+    destination
+        .canonicalize()
+        .with_context(|| format!("could not resolve {}", destination.display()))
+}
+
+/// Materialize the production-shaped invoice extraction preset.
+pub fn initialize_extraction(destination: &Path) -> anyhow::Result<PathBuf> {
+    let files = [
+        ("structtrace.yaml", EXTRACTION_CONFIG),
+        ("schemas/output.schema.json", EXTRACTION_SCHEMA),
+        ("data/golden.jsonl", EXTRACTION_DATASET),
+        ("outputs/baseline.jsonl", EXTRACTION_BASELINE),
+        ("outputs/candidate.jsonl", EXTRACTION_CANDIDATE),
+        ("README.md", EXTRACTION_README),
+        (".gitignore", ".structtrace/\n"),
+    ];
+    let conflicts = files
+        .iter()
+        .filter(|(relative, _)| destination.join(relative).exists())
+        .map(|(relative, _)| *relative)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        conflicts.is_empty(),
+        "refusing to overwrite existing StructTrace files: {}",
+        conflicts.join(", ")
+    );
+    for (relative, contents) in files {
+        let path = destination.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_new(&path, contents)?;
     }
     destination
         .canonicalize()
@@ -311,6 +356,27 @@ mod tests {
         assert_eq!(run.summary.baseline.primary_pass, 2);
         assert_eq!(run.summary.candidate.primary_pass, 1);
         assert!(!run.summary.gate.status.is_passed());
+    }
+
+    #[test]
+    fn extraction_preset_runs_with_production_evaluators() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("invoice-project");
+        initialize_extraction(&project).unwrap();
+        let config =
+            structtrace_core::config::Config::load(&project.join("structtrace.yaml")).unwrap();
+        assert!(config.evaluators.iter().any(|evaluator| matches!(
+            evaluator.kind,
+            structtrace_core::config::EvaluatorKind::CanonicalDate { .. }
+        )));
+        assert!(config.evaluators.iter().any(|evaluator| matches!(
+            evaluator.kind,
+            structtrace_core::config::EvaluatorKind::FinancialInvariants { .. }
+        )));
+        let run =
+            structtrace_engine::run_recorded(&project, Path::new("structtrace.yaml")).unwrap();
+        assert_eq!(run.summary.baseline.total, 12);
+        assert_eq!(run.summary.field_hotspots[0].pointer, "/total");
     }
 
     #[test]

@@ -7,6 +7,9 @@ validity, adapter errors, timeouts, p95 latency, and average cost.
 
 An empty gate is `NOT_CONFIGURED`, never passed. Once any release criterion is configured, all five
 evidence safeguards are required; missing or inadequate coverage is `INSUFFICIENT_EVIDENCE`.
+If a run has both inadequate evidence and a directly observed quality-rule failure, the headline is
+`FAILED`; every rule remains visible, including the evidence warning. A known regression is never
+hidden behind a weaker evidence label.
 
 ```yaml
 gate:

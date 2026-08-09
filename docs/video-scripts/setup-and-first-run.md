@@ -8,7 +8,7 @@ Target length: 6 minutes.
 4. Walk through the generated dataset, schema, recorded outputs, evaluator, outcome, and gate.
 5. Run `structtrace run`.
 6. Explain why analysis succeeds even though two cases are insufficient release evidence.
-7. Run `structtrace gate latest`; show `INSUFFICIENT_EVIDENCE` and exit code 12.
+7. Run `structtrace gate latest`; show `FAILED` and exit code 10, then point out the separate insufficient-evidence rule.
 8. Run `structtrace replay latest` and show zero mismatches.
 
 Keep the demo offline. No credentials or external services should appear on screen.

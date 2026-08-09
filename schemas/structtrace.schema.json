@@ -126,7 +126,7 @@
         "title": {"type": ["string", "null"]},
         "include_raw_outputs": {"type": "boolean", "default": true},
         "include_prompts": {"type": "boolean", "default": false},
-        "default_case_filter": {"enum": ["all", "discordant", "baseline_only_pass", "candidate_only_pass", "both_fail", "valid_but_wrong", "parse_failure", "schema_failure", "adapter_error"], "default": "discordant"}
+        "default_case_filter": {"enum": ["all", "discordant", "baseline_only_pass", "candidate_only_pass", "both_fail", "valid_but_wrong", "parse_failure", "schema_failure", "adapter_error", "evaluator_error", "not_applicable", "unscored"], "default": "discordant"}
       }
     }
   },
@@ -186,12 +186,16 @@
       "oneOf": [
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "exact_json"}}},
         {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"enum": ["json_pointer_exact", "enum_accuracy"]}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}}},
+        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "normalized_string"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "case_insensitive": {"type": "boolean", "default": true}}},
+        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "canonical_date"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "formats": {"type": "array", "items": {"enum": ["iso", "dmy_slash", "mdy_slash"]}, "minItems": 1}}},
         {"type": "object", "required": ["id", "kind", "pointers"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"enum": ["json_pointers_exact", "tool_arguments"]}, "pointers": {"type": "array", "items": {"$ref": "#/$defs/pointerPair"}, "minItems": 1}}},
         {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "numeric_tolerance"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "absolute": {"type": ["string", "null"]}, "relative": {"type": ["string", "null"]}, "exact_integer": {"type": "boolean"}}},
         {"type": "object", "required": ["id", "kind", "pointers"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "required_fields"}, "pointers": {"type": "array", "items": {"type": "string"}, "minItems": 1}}},
         {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "tool_selection"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}}},
-        {"type": "object", "required": ["id", "kind", "command"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
-        {"type": "object", "required": ["id", "kind", "callable"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}}
+        {"type": "object", "required": ["id", "kind", "pointer", "expected_pointer", "keys"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "keyed_array"}, "pointer": {"type": "string"}, "expected_pointer": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}},
+        {"type": "object", "required": ["id", "kind"], "additionalProperties": false, "properties": {"id": {"type": "string"}, "kind": {"const": "financial_invariants"}, "line_items_pointer": {"type": "string"}, "subtotal_pointer": {"type": "string"}, "tax_pointer": {"type": "string"}, "total_pointer": {"type": "string"}, "absolute": {"type": "string"}}},
+        {"type": "object", "required": ["id", "implementation_version", "kind", "command"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "command"}, "command": {"$ref": "#/$defs/commandSpec"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}},
+        {"type": "object", "required": ["id", "implementation_version", "kind", "callable"], "additionalProperties": false, "properties": {"id": {"type": "string", "minLength": 1}, "implementation_version": {"type": "string", "minLength": 1}, "kind": {"const": "python"}, "interpreter": {"type": "string", "minLength": 1}, "callable": {"type": "string", "pattern": "^[^:]+:[^:]+$"}, "process_mode": {"enum": ["persistent", "per_case"], "default": "persistent"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000}}}
       ]
     }
   }

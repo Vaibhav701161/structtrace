@@ -19,6 +19,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -344,6 +344,9 @@ pub struct PricingConfig {
 pub struct EvaluatorConfig {
     /// Stable identifier used by outcomes and reports.
     pub id: String,
+    /// Immutable implementation version or digest for external evaluators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_version: Option<String>,
     /// Evaluator behavior.
     #[serde(flatten)]
     pub kind: EvaluatorKind,
@@ -373,6 +376,26 @@ pub enum EvaluatorKind {
         pointer: String,
         /// Pointer in expected value.
         expected_pointer: String,
+    },
+    /// Unicode-normalized, whitespace-collapsed string comparison.
+    NormalizedString {
+        /// Pointer in model output.
+        pointer: String,
+        /// Pointer in expected value.
+        expected_pointer: String,
+        /// Compare case-insensitively after normalization.
+        #[serde(default = "default_true")]
+        case_insensitive: bool,
+    },
+    /// Calendar-aware date comparison after canonicalization.
+    CanonicalDate {
+        /// Pointer in model output.
+        pointer: String,
+        /// Pointer in expected value.
+        expected_pointer: String,
+        /// Accepted input formats: `iso`, `dmy_slash`, or `mdy_slash`.
+        #[serde(default = "default_date_formats")]
+        formats: Vec<String>,
     },
     /// Decimal tolerance or exact-integer comparison.
     NumericTolerance {
@@ -409,10 +432,40 @@ pub enum EvaluatorKind {
         /// Pointer pairs below the argument object.
         pointers: Vec<PointerPair>,
     },
+    /// Order-independent array comparison keyed by selected item fields.
+    KeyedArray {
+        /// Array pointer in model output.
+        pointer: String,
+        /// Array pointer in expected value.
+        expected_pointer: String,
+        /// Relative JSON Pointers that form each item's identity.
+        keys: Vec<String>,
+    },
+    /// Invoice arithmetic consistency independent of golden-answer matching.
+    FinancialInvariants {
+        /// Line-item array pointer.
+        #[serde(default = "default_line_items_pointer")]
+        line_items_pointer: String,
+        /// Subtotal pointer.
+        #[serde(default = "default_subtotal_pointer")]
+        subtotal_pointer: String,
+        /// Tax pointer.
+        #[serde(default = "default_tax_pointer")]
+        tax_pointer: String,
+        /// Total pointer.
+        #[serde(default = "default_total_pointer")]
+        total_pointer: String,
+        /// Absolute decimal tolerance.
+        #[serde(default = "default_decimal_tolerance")]
+        absolute: String,
+    },
     /// Versioned command evaluator.
     Command {
         /// Executable and arguments.
         command: CommandSpec,
+        /// Persistent worker or one process per request.
+        #[serde(default)]
+        process_mode: ProcessMode,
         /// Per-case timeout.
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
@@ -424,6 +477,9 @@ pub enum EvaluatorKind {
         interpreter: String,
         /// Import path formatted as `module:callable`.
         callable: String,
+        /// Persistent worker or one interpreter per request.
+        #[serde(default)]
+        process_mode: ProcessMode,
         /// Per-case timeout.
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
@@ -432,6 +488,34 @@ pub enum EvaluatorKind {
 
 fn default_tool_name_pointer() -> String {
     "/name".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_date_formats() -> Vec<String> {
+    vec!["iso".to_owned()]
+}
+
+fn default_line_items_pointer() -> String {
+    "/line_items".to_owned()
+}
+
+fn default_subtotal_pointer() -> String {
+    "/subtotal".to_owned()
+}
+
+fn default_tax_pointer() -> String {
+    "/tax".to_owned()
+}
+
+fn default_total_pointer() -> String {
+    "/total".to_owned()
+}
+
+fn default_decimal_tolerance() -> String {
+    "0.01".to_owned()
 }
 
 /// Output and expected pointer pair.
@@ -733,6 +817,19 @@ impl Config {
                 ));
             }
             validate_evaluator(&evaluator.id, &evaluator.kind)?;
+            if matches!(
+                evaluator.kind,
+                EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. }
+            ) && evaluator
+                .implementation_version
+                .as_deref()
+                .is_none_or(|version| version.trim().is_empty())
+            {
+                return Err(CoreError::Configuration(format!(
+                    "external evaluator `{}` requires a nonempty implementation_version",
+                    evaluator.id
+                )));
+            }
         }
         validate_gate(&config.gate)?;
         const REPORT_FILTERS: &[&str] = &[
@@ -745,6 +842,9 @@ impl Config {
             "parse_failure",
             "schema_failure",
             "adapter_error",
+            "evaluator_error",
+            "not_applicable",
+            "unscored",
         ];
         if !REPORT_FILTERS.contains(&config.report.default_case_filter.as_str()) {
             return Err(CoreError::Configuration(format!(
@@ -871,6 +971,11 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             pointer,
             expected_pointer,
         }
+        | EvaluatorKind::NormalizedString {
+            pointer,
+            expected_pointer,
+            ..
+        }
         | EvaluatorKind::ToolSelection {
             pointer,
             expected_pointer,
@@ -878,8 +983,68 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             validate_json_pointer(&format!("{name}.pointer"), pointer)?;
             validate_json_pointer(&format!("{name}.expected_pointer"), expected_pointer)
         }
+        EvaluatorKind::CanonicalDate {
+            pointer,
+            expected_pointer,
+            formats,
+        } => {
+            validate_json_pointer(&format!("{name}.pointer"), pointer)?;
+            validate_json_pointer(&format!("{name}.expected_pointer"), expected_pointer)?;
+            if formats.is_empty()
+                || formats
+                    .iter()
+                    .any(|format| !matches!(format.as_str(), "iso" | "dmy_slash" | "mdy_slash"))
+            {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.formats must contain only iso, dmy_slash, or mdy_slash"
+                )));
+            }
+            Ok(())
+        }
         EvaluatorKind::JsonPointersExact { pointers }
         | EvaluatorKind::ToolArguments { pointers } => validate_pointer_pairs(&name, pointers),
+        EvaluatorKind::KeyedArray {
+            pointer,
+            expected_pointer,
+            keys,
+        } => {
+            validate_json_pointer(&format!("{name}.pointer"), pointer)?;
+            validate_json_pointer(&format!("{name}.expected_pointer"), expected_pointer)?;
+            if keys.is_empty() {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.keys must not be empty"
+                )));
+            }
+            for key in keys {
+                validate_json_pointer(&format!("{name}.keys"), key)?;
+            }
+            Ok(())
+        }
+        EvaluatorKind::FinancialInvariants {
+            line_items_pointer,
+            subtotal_pointer,
+            tax_pointer,
+            total_pointer,
+            absolute,
+        } => {
+            for (field, pointer) in [
+                ("line_items_pointer", line_items_pointer),
+                ("subtotal_pointer", subtotal_pointer),
+                ("tax_pointer", tax_pointer),
+                ("total_pointer", total_pointer),
+            ] {
+                validate_json_pointer(&format!("{name}.{field}"), pointer)?;
+            }
+            let tolerance = Decimal::from_str(absolute).map_err(|_| {
+                CoreError::Configuration(format!("{name}.absolute must be a valid decimal"))
+            })?;
+            if tolerance.is_sign_negative() {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.absolute must be non-negative"
+                )));
+            }
+            Ok(())
+        }
         EvaluatorKind::NumericTolerance {
             pointer,
             expected_pointer,
@@ -917,6 +1082,7 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
         EvaluatorKind::Command {
             command,
             timeout_ms,
+            ..
         } => {
             validate_command(&format!("{name}.command"), command)?;
             validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
@@ -925,6 +1091,7 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             interpreter,
             callable,
             timeout_ms,
+            ..
         } => {
             validate_python(&name, interpreter, callable)?;
             validate_timeout(&format!("{name}.timeout_ms"), *timeout_ms)
@@ -1131,6 +1298,7 @@ mod tests {
             ]),
             evaluators: vec![EvaluatorConfig {
                 id: "exact".to_owned(),
+                implementation_version: None,
                 kind: EvaluatorKind::ExactJson,
             }],
             outcomes: BTreeMap::from([(
@@ -1152,6 +1320,15 @@ mod tests {
     #[test]
     fn accepts_minimal_configuration() {
         Config::validate(minimal()).unwrap();
+    }
+
+    #[test]
+    fn accepts_every_report_filter_emitted_by_case_classification() {
+        for filter in ["evaluator_error", "not_applicable", "unscored"] {
+            let mut config = minimal();
+            config.report.default_case_filter = filter.to_owned();
+            Config::validate(config).unwrap();
+        }
     }
 
     #[test]

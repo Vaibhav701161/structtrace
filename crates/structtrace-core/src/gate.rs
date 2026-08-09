@@ -244,14 +244,14 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         GateStatus::Error
     } else if rules
         .iter()
-        .any(|rule| rule.status == GateRuleStatus::InsufficientEvidence)
-    {
-        GateStatus::InsufficientEvidence
-    } else if rules
-        .iter()
         .any(|rule| rule.status == GateRuleStatus::Failed)
     {
         GateStatus::Failed
+    } else if rules
+        .iter()
+        .any(|rule| rule.status == GateRuleStatus::InsufficientEvidence)
+    {
+        GateStatus::InsufficientEvidence
     } else {
         GateStatus::Passed
     };
@@ -493,5 +493,20 @@ mod tests {
         config.min_cases = Some(100);
         let decision = evaluate_gate(&config, &inputs(&primary));
         assert_eq!(decision.status, GateStatus::InsufficientEvidence);
+    }
+
+    #[test]
+    fn observed_quality_failure_takes_precedence_over_insufficient_evidence() {
+        let primary = paired_metrics(&[(true, false), (true, true)]);
+        let mut config = release_config();
+        config.min_cases = Some(100);
+        let decision = evaluate_gate(&config, &inputs(&primary));
+        assert_eq!(decision.status, GateStatus::Failed);
+        assert!(decision.rules.iter().any(|rule| {
+            rule.rule == "min_cases" && rule.status == GateRuleStatus::InsufficientEvidence
+        }));
+        assert!(decision.rules.iter().any(|rule| {
+            rule.rule == "max_primary_regression_pp" && rule.status == GateRuleStatus::Failed
+        }));
     }
 }

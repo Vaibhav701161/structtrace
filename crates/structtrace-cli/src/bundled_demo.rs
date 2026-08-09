@@ -13,6 +13,15 @@ const SUPPORT_SCHEMA: &str =
 const SUPPORT_BASELINE: &str = include_str!("../../../demo/support-ticket/outputs/baseline.jsonl");
 const SUPPORT_CANDIDATE: &str =
     include_str!("../../../demo/support-ticket/outputs/candidate.jsonl");
+const INVOICE_CONFIG: &str = include_str!("../../../examples/document-extraction/structtrace.yaml");
+const INVOICE_DATASET: &str =
+    include_str!("../../../examples/document-extraction/data/golden.jsonl");
+const INVOICE_SCHEMA: &str =
+    include_str!("../../../examples/document-extraction/schemas/output.schema.json");
+const INVOICE_BASELINE: &str =
+    include_str!("../../../examples/document-extraction/outputs/baseline.jsonl");
+const INVOICE_CANDIDATE: &str =
+    include_str!("../../../examples/document-extraction/outputs/candidate.jsonl");
 const RESEARCH_CONFIG: &str = include_str!("../../../demo/accepted-research/structtrace.yaml");
 const RESEARCH_SCHEMA: &str = include_str!("../../../demo/accepted-research/schema.json");
 const RESEARCH_COUNTS: &str = include_str!("../../../demo/accepted-research/expected-counts.json");
@@ -25,6 +34,84 @@ struct ResearchStudy {
     baseline_only_pass: usize,
     candidate_only_pass: usize,
     both_fail: usize,
+}
+
+/// Materialize and run the invoice extraction fixture below local state.
+pub fn run_invoice(project_root: &Path) -> anyhow::Result<structtrace_engine::CompletedRun> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("project root {} does not exist", project_root.display()))?;
+    let fixture_root = root.join(".structtrace/demo-inputs/invoice");
+    write_fixture(&fixture_root.join("structtrace.yaml"), INVOICE_CONFIG)?;
+    let (dataset, baseline, candidate) = expanded_invoice_jsonl()?;
+    write_fixture(&fixture_root.join("data/golden.jsonl"), &dataset)?;
+    write_fixture(
+        &fixture_root.join("schemas/output.schema.json"),
+        INVOICE_SCHEMA,
+    )?;
+    write_fixture(&fixture_root.join("outputs/baseline.jsonl"), &baseline)?;
+    write_fixture(&fixture_root.join("outputs/candidate.jsonl"), &candidate)?;
+    let config_path = fixture_root.join("structtrace.yaml");
+    let mut config = Config::load(&config_path)?;
+    config.storage.root = root.join(".structtrace");
+    config.dataset.path = fixture_root.join("data/golden.jsonl");
+    config.schema.path = fixture_root.join("schemas/output.schema.json");
+    config.variants.insert(
+        "baseline".to_owned(),
+        VariantConfig::Recorded {
+            path: fixture_root.join("outputs/baseline.jsonl"),
+        },
+    );
+    config.variants.insert(
+        "candidate".to_owned(),
+        VariantConfig::Recorded {
+            path: fixture_root.join("outputs/candidate.jsonl"),
+        },
+    );
+    structtrace_engine::run_recorded_with_config(&root, &config_path, config)
+}
+
+fn expanded_invoice_jsonl() -> anyhow::Result<(String, String, String)> {
+    let dataset_rows = INVOICE_DATASET
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let baseline_rows = INVOICE_BASELINE
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let candidate_rows = INVOICE_CANDIDATE
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut dataset = String::new();
+    let mut baseline = String::new();
+    let mut candidate = String::new();
+    for repetition in 1..=10 {
+        for index in 0..dataset_rows.len() {
+            let source_id = dataset_rows[index]
+                .pointer("/id")
+                .and_then(serde_json::Value::as_str)
+                .context("invoice fixture ID is missing")?;
+            let id = format!("{source_id}-r{repetition:02}");
+            let mut case = dataset_rows[index].clone();
+            case["id"] = serde_json::Value::String(id.clone());
+            let mut baseline_row = baseline_rows[index].clone();
+            baseline_row["case_id"] = serde_json::Value::String(id.clone());
+            let use_baseline_candidate = repetition <= 5
+                && matches!(source_id, "invoice-002" | "invoice-008" | "invoice-010");
+            let mut candidate_row = if use_baseline_candidate {
+                baseline_rows[index].clone()
+            } else {
+                candidate_rows[index].clone()
+            };
+            candidate_row["case_id"] = serde_json::Value::String(id);
+            append_json_line(&mut dataset, &case)?;
+            append_json_line(&mut baseline, &baseline_row)?;
+            append_json_line(&mut candidate, &candidate_row)?;
+        }
+    }
+    Ok((dataset, baseline, candidate))
 }
 
 /// Materialize and run the support-ticket fixture below local state.
@@ -194,6 +281,27 @@ mod tests {
         assert_eq!(run.summary.paired.baseline_only_pass, 4);
         assert_eq!(run.summary.paired.candidate_only_pass, 2);
         assert!(!run.summary.gate.status.is_passed());
+    }
+
+    #[test]
+    fn invoice_demo_exposes_exact_field_level_regressions() {
+        let root = tempdir().unwrap();
+        let run = run_invoice(root.path()).unwrap();
+        assert_eq!(run.summary.baseline.total, 120);
+        assert_eq!(run.summary.baseline.primary_pass, 90);
+        assert_eq!(run.summary.candidate.primary_pass, 75);
+        assert_eq!(run.summary.paired.baseline_only_pass, 30);
+        assert_eq!(run.summary.paired.candidate_only_pass, 15);
+        assert_eq!(
+            run.summary.gate.status,
+            structtrace_core::gate::GateStatus::Failed
+        );
+        assert!(
+            run.summary
+                .field_hotspots
+                .iter()
+                .any(|hotspot| hotspot.pointer == "/total" && hotspot.regressions == 20)
+        );
     }
 
     #[test]

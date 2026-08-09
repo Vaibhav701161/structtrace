@@ -48,15 +48,41 @@ pub fn redact_matching_values(value: &mut Value, secrets: &[Value]) {
             }
         }
         Value::String(text) => {
-            for secret in secrets {
-                if let Value::String(secret) = secret {
-                    if !secret.is_empty() {
-                        *text = text.replace(secret, REDACTION_MARKER);
-                    }
-                }
-            }
+            redact_text(text, secrets);
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Remove configured values echoed into free-form text without replacing every
+/// occurrence of tiny, common scalar tokens such as `0`, `1`, `true`, or `false`.
+pub fn redact_text(text: &mut String, secrets: &[Value]) {
+    for secret in secrets {
+        let (needle, may_replace_substring) = match secret {
+            Value::String(value) => (value.clone(), !value.is_empty()),
+            Value::Number(value) => {
+                let value = value.to_string();
+                let replace = value.len() >= 4;
+                (value, replace)
+            }
+            Value::Bool(value) => (value.to_string(), false),
+            Value::Array(_) | Value::Object(_) => {
+                let value = serde_json::to_string(secret).unwrap_or_default();
+                let replace = value.len() >= 8;
+                (value, replace)
+            }
+            Value::Null => ("null".to_owned(), false),
+        };
+        if needle.is_empty() {
+            continue;
+        }
+        if text == &needle {
+            *text = REDACTION_MARKER.to_owned();
+            return;
+        }
+        if may_replace_substring {
+            *text = text.replace(&needle, REDACTION_MARKER);
+        }
     }
 }
 
@@ -102,6 +128,36 @@ mod tests {
                 .unwrap()
                 .contains("secret@example.com")
         );
+    }
+
+    #[test]
+    fn removes_cross_type_scalar_and_object_echoes() {
+        let secrets = vec![json!(123456), json!(true), json!({"account": "private-91"})];
+        let mut report = json!({
+            "number_as_text": "reference 123456 was processed",
+            "boolean_as_text": "true",
+            "object_as_text": "payload={\"account\":\"private-91\"}",
+        });
+        redact_matching_values(&mut report, &secrets);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("123456"));
+        assert!(!serialized.contains("private-91"));
+        assert_eq!(report["boolean_as_text"], REDACTION_MARKER);
+    }
+
+    #[test]
+    fn tiny_common_scalars_do_not_over_redact_unrelated_text() {
+        let mut value = json!({
+            "zero": 0,
+            "one": 1,
+            "flag": true,
+            "sentence": "version 10 is true enough",
+        });
+        redact_matching_values(&mut value, &[json!(0), json!(1), json!(true)]);
+        assert_eq!(value["zero"], REDACTION_MARKER);
+        assert_eq!(value["one"], REDACTION_MARKER);
+        assert_eq!(value["flag"], REDACTION_MARKER);
+        assert_eq!(value["sentence"], "version 10 is true enough");
     }
 
     proptest! {

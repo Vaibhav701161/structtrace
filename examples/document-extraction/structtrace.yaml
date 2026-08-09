@@ -12,16 +12,17 @@ evaluators:
     kind: json_pointers_exact
     pointers:
       - {pointer: /invoice_number, expected_pointer: /invoice_number}
-      - {pointer: /vendor_name, expected_pointer: /vendor_name}
-      - {pointer: /invoice_date, expected_pointer: /invoice_date}
+  - {id: vendor, kind: normalized_string, pointer: /vendor_name, expected_pointer: /vendor_name, case_insensitive: true}
+  - {id: date, kind: canonical_date, pointer: /invoice_date, expected_pointer: /invoice_date, formats: [iso, dmy_slash, mdy_slash]}
   - {id: currency, kind: enum_accuracy, pointer: /currency, expected_pointer: /currency}
   - {id: subtotal, kind: numeric_tolerance, pointer: /subtotal, expected_pointer: /subtotal, absolute: "0.01", exact_integer: false}
   - {id: tax, kind: numeric_tolerance, pointer: /tax, expected_pointer: /tax, absolute: "0.01", exact_integer: false}
   - {id: total, kind: numeric_tolerance, pointer: /total, expected_pointer: /total, absolute: "0.01", exact_integer: false}
-  - {id: line_items, kind: json_pointer_exact, pointer: /line_items, expected_pointer: /line_items}
+  - {id: line_items, kind: keyed_array, pointer: /line_items, expected_pointer: /line_items, keys: [/description]}
+  - {id: financial_consistency, kind: financial_invariants, line_items_pointer: /line_items, subtotal_pointer: /subtotal, tax_pointer: /tax, total_pointer: /total, absolute: "0.01"}
   - {id: completeness, kind: required_fields, pointers: [/invoice_number, /vendor_name, /invoice_date, /currency, /subtotal, /tax, /total, /line_items]}
 outcomes:
-  extraction_correct: {all_of: [identity_fields, currency, subtotal, tax, total, line_items, completeness]}
+  extraction_correct: {all_of: [identity_fields, vendor, date, currency, subtotal, tax, total, line_items, financial_consistency, completeness]}
 analysis:
   primary_outcome: extraction_correct
   bootstrap: {samples: 10000, confidence: 0.95, seed: 17}

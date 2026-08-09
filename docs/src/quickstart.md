@@ -32,6 +32,12 @@ structtrace gate latest
 structtrace replay latest
 ```
 
+For a production-shaped extraction starting point, use:
+
+```bash
+structtrace init my-check --preset extraction
+```
+
 The generated candidate deliberately regresses one of two cases, so the run completes successfully but the gate exits with code `10`. That is different from malformed input or an execution failure.
 
 Inspect `data/golden.jsonl`, `schemas/output.schema.json`, both files in `outputs/`, and `structtrace.yaml`. Replace the fixture with your matched cases and configure deterministic evaluators that represent correctness for your application.

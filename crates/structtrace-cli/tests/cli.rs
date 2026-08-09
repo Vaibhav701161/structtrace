@@ -140,7 +140,7 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         ])
         .status()
         .unwrap();
-    assert_eq!(replay_verified_gate.code(), Some(12));
+    assert_eq!(replay_verified_gate.code(), Some(10));
     let github_summary = root.path().join("github-step-summary.md");
     let status = binary()
         .args([
@@ -154,9 +154,9 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .env("GITHUB_STEP_SUMMARY", &github_summary)
         .status()
         .unwrap();
-    assert_eq!(status.code(), Some(12));
+    assert_eq!(status.code(), Some(10));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
-    assert!(github_summary.contains("## StructTrace release gate: insufficient evidence"));
+    assert!(github_summary.contains("## StructTrace release gate: failed"));
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
     assert!(github_summary.contains("| Primary outcome |"));
 

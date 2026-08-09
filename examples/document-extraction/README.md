@@ -12,5 +12,5 @@ cargo run --manifest-path ../../Cargo.toml -p structtrace-cli -- --project-root 
 
 The candidate fixes missing currencies and one vendor name, but introduces a tax error, a total
 error, and a missing line item. All candidate rows remain strict JSON; the financially wrong rows
-are visible as valid-but-wrong. Because this fixture has only 12 cases, its gate is deliberately
-`INSUFFICIENT EVIDENCE`, not a deployment authorization.
+are visible as valid-but-wrong. The gate reports `FAILED` because the quality regression is real;
+an individual evidence rule also reports that 12 cases cannot authorize a release.

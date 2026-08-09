@@ -75,13 +75,16 @@ enum Commands {
         /// New project directory. Defaults to the current project root.
         path: Option<PathBuf>,
         /// Integration template.
-        #[arg(long, value_enum, default_value = "recorded")]
-        template: InitTemplate,
+        #[arg(long, value_enum, conflicts_with = "preset")]
+        template: Option<InitTemplate>,
+        /// Opinionated application preset.
+        #[arg(long, value_enum, conflicts_with = "template")]
+        preset: Option<InitPreset>,
     },
     /// Run a complete deterministic demo without network access or credentials.
     Demo {
         /// Bundled scenario.
-        #[arg(value_enum, default_value = "support-ticket")]
+        #[arg(value_enum, default_value = "invoice")]
         demo: DemoKind,
         /// Open the generated report through a loopback-only server.
         #[arg(long)]
@@ -163,6 +166,7 @@ enum Commands {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DemoKind {
+    Invoice,
     SupportTicket,
     Research,
 }
@@ -181,6 +185,11 @@ enum InitTemplate {
     Python,
     Command,
     OpenaiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InitPreset {
+    Extraction,
 }
 
 #[tokio::main]
@@ -219,7 +228,11 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     match &cli.command {
-        Commands::Init { path, template } => {
+        Commands::Init {
+            path,
+            template,
+            preset,
+        } => {
             let destination = path.as_ref().map_or_else(
                 || cli.project_root.clone(),
                 |path| {
@@ -230,7 +243,13 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                     }
                 },
             );
-            let created = initialize::initialize(&destination, *template)?;
+            let created = match preset {
+                Some(InitPreset::Extraction) => initialize::initialize_extraction(&destination)?,
+                None => initialize::initialize(
+                    &destination,
+                    template.unwrap_or(InitTemplate::Recorded),
+                )?,
+            };
             if !cli.quiet {
                 match cli.format {
                     OutputFormat::Json => println!(
@@ -254,6 +273,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
         }
         Commands::Demo { demo, open } => {
             let run = match demo {
+                DemoKind::Invoice => bundled_demo::run_invoice(&cli.project_root)?,
                 DemoKind::SupportTicket => bundled_demo::run_support_ticket(&cli.project_root)?,
                 DemoKind::Research => bundled_demo::run_research(&cli.project_root)?,
             };
@@ -348,7 +368,17 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                         OutputFormat::Json => {
                             println!("{}", serde_json::json!({"report": report.index_path}))
                         }
-                        _ => println!("Report: {}", report.index_path.display()),
+                        _ => {
+                            println!("Report files: {}", report.index_path.display());
+                            println!(
+                                "Open safely with: structtrace --project-root {} report {} --open",
+                                cli.project_root.display(),
+                                run
+                            );
+                            println!(
+                                "Do not open a chunked report through file://; browsers may block its case data."
+                            );
+                        }
                     }
                 }
             }
@@ -582,6 +612,8 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
             );
             println!("Gate:         {}", run.summary.gate.status.label());
             println!("Report:       {}/report/index.html", run.run_dir.display());
+            println!("Open with:    structtrace report {} --open", run.run_id);
+            println!("              (chunked reports may not work through file://)");
         }
     }
     Ok(())

@@ -38,18 +38,28 @@ tax, total, and line-item values that still satisfy the schema.
 | Evidence | What StructTrace checks |
 |---|---|
 | Structure | strict JSON and the unchanged invoice schema |
-| Identity | invoice number, vendor, and date |
-| Finance | currency, subtotal, tax, and total with exact decimals |
-| Detail | complete, exact line-item arrays |
+| Identity | exact invoice number, Unicode-normalized vendor, and canonical date |
+| Finance | currency, exact-decimal fields, and arithmetic invariants |
+| Detail | keyed line-item matching with missing, extra, and changed items |
 | Deployment | sample size, scored coverage, errors, regressions, and uncertainty |
 
 ```bash
-cargo run -p structtrace-cli -- --project-root examples/document-extraction run
-cargo run -p structtrace-cli -- --project-root examples/document-extraction report latest --open
+structtrace demo invoice --open
+structtrace init invoice-extractor --preset extraction
 ```
 
-The 12-case fixture is explicitly demonstration-only: `min_cases: 100` prevents it from producing
-a deployment PASS. The support-ticket and normalized research fixtures remain secondary examples.
+The bundled 120-case release scenario records 90/120 baseline passes and 75/120 candidate passes,
+with 30 baseline-only and 15 candidate-only transitions. Its release gate is `FAILED`, not merely
+underpowered. The generated 12-case extraction project remains an inspectable onboarding fixture.
+Its exact hotspot acceptance test requires:
+
+| Pointer | Regressions | Improvements | Candidate failures |
+|---|---:|---:|---:|
+| `/total` | 2 | 0 | 2 |
+| `/tax` | 1 | 0 | 1 |
+| `/line_items` | 1 | 0 | 1 |
+| `/vendor_name` | 0 | 1 | 0 |
+| `/currency` | 0 | 2 | 0 |
 
 ## What the report gives you
 
@@ -111,6 +121,7 @@ structtrace init my-check --template recorded
 structtrace init my-check --template command
 structtrace init my-check --template python
 structtrace init my-check --template openai-compatible
+structtrace init my-check --preset extraction
 ```
 
 Initialization refuses to overwrite existing StructTrace files.
@@ -133,11 +144,19 @@ Built-in deterministic evaluators cover:
 - exact JSON equality;
 - one or multiple JSON Pointer comparisons;
 - enum/classification accuracy;
+- Unicode-normalized strings and calendar-aware canonical dates;
 - arbitrary-length exact integers and exact-decimal numeric tolerance;
+- keyed array matching with missing/extra item evidence and financial invariants;
 - required fields;
 - tool selection;
 - selected tool arguments;
-- versioned custom command and Python evaluators for user-defined deterministic checks.
+- experimental custom command and Python evaluators for user-defined deterministic checks.
+
+Custom evaluators use persistent, bounded workers by default and require an implementation version
+that is bound into replay receipts. They remain beta until the release benchmark and independent
+workload validation are complete; built-in evaluators are the private-alpha stable path. The
+checked-in [1,000-case by two-variant scale check](benchmarks/external-evaluator-1000/README.md)
+retains all 2,000 receipts and exercises worker shutdown with the normal test suite.
 
 Evaluators are composed into named `all_of` or `any_of` outcomes. The user must choose one primary semantic or executable outcome; StructTrace refuses to infer correctness from schema validity.
 

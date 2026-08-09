@@ -17,7 +17,7 @@ use structtrace_core::{
     config::Config,
     gate::{GateRuleStatus, GateStatus},
     hashing::hash_file,
-    privacy::{REDACTION_MARKER, redact_matching_values, selected_values},
+    privacy::{REDACTION_MARKER, redact_matching_values, redact_text, selected_values},
 };
 use tempfile::NamedTempFile;
 
@@ -48,7 +48,7 @@ struct ReportView {
     transition: TransitionView,
     research_studies: Vec<ResearchStudyView>,
     gate_rules: Vec<GateRuleView>,
-    evaluator_rows: Vec<ComparisonRow>,
+    evaluator_rows: Vec<EvaluatorRowView>,
     operational_rows: Vec<OperationalRow>,
     hotspots: Vec<HotspotView>,
     cases: Vec<CaseView>,
@@ -76,6 +76,22 @@ struct OperationalRow {
     label: String,
     baseline: String,
     candidate: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvaluatorRowView {
+    id: String,
+    baseline: EvaluatorCountsView,
+    candidate: EvaluatorCountsView,
+}
+
+#[derive(Debug, Serialize)]
+struct EvaluatorCountsView {
+    pass: usize,
+    fail: usize,
+    error: usize,
+    not_applicable: usize,
+    unscored: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,8 +270,66 @@ pub fn export_share_directory(run_dir: &Path, destination: &Path) -> anyhow::Res
     let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
     verify_bound_artifact(run_dir, &manifest, "summary.json")?;
     let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
-    let mut view = build_view(&summary, &manifest, &[], &config)?;
+    write_share_directory(&summary, &manifest, &config, destination)
+}
+
+fn write_share_directory(
+    summary: &RunSummary,
+    manifest: &RunManifest,
+    config: &Config,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let mut view = build_view(summary, manifest, &[], config)?;
     view.share_derivative = true;
+    view.project_name = "StructTrace aggregate report".to_owned();
+    view.default_filter = "all".to_owned();
+    view.evaluator_rows.clear();
+    view.hotspots.clear();
+    view.research_studies.clear();
+    view.manifest_rows = vec![
+        ("Run ID".to_owned(), manifest.run_id.clone()),
+        (
+            "StructTrace version".to_owned(),
+            manifest.structtrace_version.clone(),
+        ),
+        (
+            "Total paired cases".to_owned(),
+            summary.paired.total.to_string(),
+        ),
+        (
+            "Jointly scored cases".to_owned(),
+            jointly_scored_cases(summary).to_string(),
+        ),
+        (
+            "Discordant cases".to_owned(),
+            (summary.paired.baseline_only_pass + summary.paired.candidate_only_pass).to_string(),
+        ),
+        (
+            "Exact McNemar p-value".to_owned(),
+            format!("{:.6}", summary.paired.mcnemar_exact_p),
+        ),
+        (
+            "Bootstrap".to_owned(),
+            format!(
+                "{} samples, {:.1}% interval, seed {}",
+                summary.bootstrap.samples,
+                summary.bootstrap.confidence * 100.0,
+                summary.bootstrap.seed
+            ),
+        ),
+        (
+            "Execution schedule".to_owned(),
+            manifest.execution_schedule.clone(),
+        ),
+        (
+            "Artifact format".to_owned(),
+            manifest.artifact_format_version.to_string(),
+        ),
+        (
+            "Report format".to_owned(),
+            REPORT_FORMAT_VERSION.to_string(),
+        ),
+    ];
     let mut environment = Environment::new();
     environment.set_auto_escape_callback(|_| AutoEscape::Html);
     environment.add_template("report.html", TEMPLATE)?;
@@ -263,6 +337,10 @@ pub fn export_share_directory(run_dir: &Path, destination: &Path) -> anyhow::Res
     std::fs::create_dir_all(destination)?;
     atomic_write(&destination.join("index.html"), html.as_bytes())?;
     atomic_write(&destination.join("case-index.json"), b"[]")
+}
+
+fn jointly_scored_cases(summary: &RunSummary) -> usize {
+    summary.primary_jointly_scored
 }
 
 /// Serve a report on a random loopback-only port until interrupted.
@@ -496,13 +574,22 @@ fn build_view(
     let evaluator_rows = summary
         .evaluator_passes
         .iter()
-        .map(|(id, counts)| {
-            comparison(
-                id,
-                counts.baseline_pass,
-                counts.candidate_pass,
-                counts.total,
-            )
+        .map(|(id, counts)| EvaluatorRowView {
+            id: id.clone(),
+            baseline: EvaluatorCountsView {
+                pass: counts.baseline.passed,
+                fail: counts.baseline.failed,
+                error: counts.baseline.error,
+                not_applicable: counts.baseline.not_applicable,
+                unscored: counts.baseline.unscored,
+            },
+            candidate: EvaluatorCountsView {
+                pass: counts.candidate.passed,
+                fail: counts.candidate.failed,
+                error: counts.candidate.error,
+                not_applicable: counts.candidate.not_applicable,
+                unscored: counts.candidate.unscored,
+            },
         })
         .collect();
     let cases = records
@@ -531,6 +618,9 @@ fn build_view(
             | "parse_failure"
             | "schema_failure"
             | "adapter_error"
+            | "evaluator_error"
+            | "not_applicable"
+            | "unscored"
             | "discordant" => config.report.default_case_filter.clone(),
             _ => "all".to_owned(),
         },
@@ -610,6 +700,13 @@ fn build_view(
                     summary.baseline.total,
                     summary.candidate.primary_pass + summary.candidate.primary_failed,
                     summary.candidate.total
+                ),
+            ),
+            (
+                "Jointly scored cases".to_owned(),
+                format!(
+                    "{} / {}",
+                    summary.primary_jointly_scored, summary.paired.total
                 ),
             ),
             (
@@ -910,7 +1007,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         .cloned()
         .unwrap_or(Value::Null);
     let mut filter_string = filters.join(" ");
-    redact_string(&mut filter_string, &secrets);
+    redact_text(&mut filter_string, &secrets);
     Ok(CaseView {
         id: redacted_value
             .pointer("/case/id")
@@ -1016,22 +1113,9 @@ fn redact_value_raw_text(value: &mut Value, pointer: &str, secrets: &[Value]) {
     let Some(mut raw) = raw else {
         return;
     };
-    redact_string(&mut raw, secrets);
+    redact_text(&mut raw, secrets);
     if let Some(target) = value.pointer_mut(pointer) {
         *target = Value::String(raw);
-    }
-}
-
-fn redact_string(value: &mut String, secrets: &[Value]) {
-    for secret in secrets {
-        let needle = match secret {
-            Value::String(value) => value.clone(),
-            Value::Null => "null".to_owned(),
-            other => serde_json::to_string(other).unwrap_or_default(),
-        };
-        if !needle.is_empty() {
-            *value = value.replace(&needle, REDACTION_MARKER);
-        }
     }
 }
 
@@ -1182,7 +1266,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
   <h2>Release gate</h2><div class="panel">{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
 
-  <h2>Evaluator results</h2><table><thead><tr><th>Evaluator</th><th>Baseline passes</th><th>Candidate passes</th></tr></thead><tbody>{% for row in evaluator_rows %}<tr><td><code>{{ row.label }}</code></td><td class="num">{{ row.baseline.count }}/{{ row.baseline.total }}</td><td class="num">{{ row.candidate.count }}/{{ row.candidate.total }}</td></tr>{% endfor %}</tbody></table>
+  <h2>Evaluator results</h2><p class="muted">Every evaluator state remains explicit; errors, not-applicable results, and missing scores are never folded into semantic failure.</p><table><thead><tr><th rowspan="2">Evaluator</th><th colspan="5">Baseline</th><th colspan="5">Candidate</th></tr><tr><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th></tr></thead><tbody>{% for row in evaluator_rows %}<tr><td><code>{{ row.id }}</code></td><td class="num">{{ row.baseline.pass }}</td><td class="num">{{ row.baseline.fail }}</td><td class="num">{{ row.baseline.error }}</td><td class="num">{{ row.baseline.not_applicable }}</td><td class="num">{{ row.baseline.unscored }}</td><td class="num">{{ row.candidate.pass }}</td><td class="num">{{ row.candidate.fail }}</td><td class="num">{{ row.candidate.error }}</td><td class="num">{{ row.candidate.not_applicable }}</td><td class="num">{{ row.candidate.unscored }}</td></tr>{% endfor %}</tbody></table>
 
   <h2>Operational comparison</h2><p class="muted">Latency is descriptive unless a threshold is configured. Costs are shown only from explicit adapter pricing and are never inferred.</p><table><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody>{% for row in operational_rows %}<tr><td>{{ row.label }}</td><td class="num">{{ row.baseline }}</td><td class="num">{{ row.candidate }}</td></tr>{% endfor %}</tbody></table>
 
@@ -1335,6 +1419,7 @@ mod tests {
             primary_outcome: "correct".to_owned(),
             baseline: variant.clone(),
             candidate: variant,
+            primary_jointly_scored: total,
             matched_operational: Default::default(),
             paired,
             bootstrap: BootstrapInterval {
@@ -1397,6 +1482,56 @@ mod tests {
         assert!(!html.contains(attack));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("No field-level evaluators were configured."));
+    }
+
+    #[test]
+    fn share_directory_omits_all_user_controlled_provenance_sentinels() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("share");
+        let mut config = report_config("SECRET_TITLE_91");
+        config.project.name = "SECRET_PROJECT_92".to_owned();
+        config.dataset.path = PathBuf::from("SECRET_DATASET_PATH_93");
+        config.schema.path = PathBuf::from("SECRET_SCHEMA_PATH_94");
+        let summary = summary_for(10);
+        let mut manifest = RunManifest::new(
+            "report-run".to_owned(),
+            "SECRET_MANIFEST_PROJECT_95".to_owned(),
+        );
+        manifest.variants = json!({
+            "prompt": "SECRET_PROMPT_96",
+            "command": ["SECRET_COMMAND_ARG_97"],
+            "endpoint": "SECRET_ENDPOINT_98"
+        });
+        manifest.evaluation_definition = json!({
+            "callable": "SECRET_EVALUATOR_PATH_99"
+        });
+
+        write_share_directory(&summary, &manifest, &config, &destination).unwrap();
+
+        let sentinels = [
+            "SECRET_TITLE_91",
+            "SECRET_PROJECT_92",
+            "SECRET_DATASET_PATH_93",
+            "SECRET_SCHEMA_PATH_94",
+            "SECRET_MANIFEST_PROJECT_95",
+            "SECRET_PROMPT_96",
+            "SECRET_COMMAND_ARG_97",
+            "SECRET_ENDPOINT_98",
+            "SECRET_EVALUATOR_PATH_99",
+        ];
+        for entry in std::fs::read_dir(&destination).unwrap() {
+            let entry = entry.unwrap();
+            let contents = std::fs::read(entry.path()).unwrap();
+            for sentinel in sentinels {
+                assert!(
+                    !contents
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "{sentinel} leaked to {}",
+                    entry.path().display()
+                );
+            }
+        }
     }
 
     #[test]
