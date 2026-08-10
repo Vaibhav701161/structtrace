@@ -327,7 +327,7 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .unwrap();
     assert_eq!(replay_verified_gate.code(), Some(12));
     let github_summary = root.path().join("github-step-summary.md");
-    let status = binary()
+    let github_gate = binary()
         .args([
             "--format",
             "github",
@@ -337,9 +337,10 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
             "latest",
         ])
         .env("GITHUB_STEP_SUMMARY", &github_summary)
-        .status()
+        .output()
         .unwrap();
-    assert_eq!(status.code(), Some(12));
+    assert_eq!(github_gate.status.code(), Some(12));
+    assert!(String::from_utf8_lossy(&github_gate.stdout).contains("::error title="));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
     assert!(github_summary.contains("## StructTrace regression check: INSUFFICIENT EVIDENCE"));
     assert!(github_summary.contains("THIS IS NOT RELEASE AUTHORIZATION"));
