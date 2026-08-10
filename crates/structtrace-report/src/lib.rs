@@ -2516,9 +2516,12 @@ mod tests {
     }
 
     fn server_state() -> Arc<ReportServerState> {
+        static NEXT_SERVER_STATE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let state_id = NEXT_SERVER_STATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "structtrace-report-server-test-{}.html",
-            std::process::id()
+            "structtrace-report-server-test-{}-{state_id}.html",
+            std::process::id(),
         ));
         std::fs::write(&path, b"safe").unwrap();
         Arc::new(ReportServerState {
