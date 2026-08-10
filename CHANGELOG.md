@@ -5,6 +5,21 @@ here.
 
 ## Unreleased
 
+- Add an authorization-only `release-check` command that always replays evidence and succeeds only
+  for an authorized Release gate; synchronize deployment documentation and editor-schema Release
+  constraints with runtime policy.
+- Import ordinary JSONL through configurable dataset/output pointers, generate normalized recorded
+  artifacts, report cross-source field coverage, and support explicit normalized string, date,
+  integer, decimal, keyed-array, and financial evaluator choices during onboarding.
+- Require caller-supplied run-scoped transport tokens, make external evaluator scores explicitly
+  diagnostic, warn that Python handshake imports execute module code, and bound remaining imported
+  metadata reads.
+- Add redaction-aware report search pointers, a checked editor/runtime configuration corpus, a
+  10,000-case recorded benchmark, and a conservative 10,000-case default with a 100,000 hard ceiling.
+- Test every final release archive after extraction, publish version-aware checksum/provenance-aware
+  installers, and bind package evidence to source, lockfile, archive, executable, and SBOM digests.
+- Add fuzz coverage for imported manifests and paired case artifacts.
+
 - Advance configuration to version 3, portable artifacts to version 9, reports to version 4, and
   SQLite metadata to version 5. Version 2 runs are never silently reinterpreted.
 - Make scoring retention-invariant: strict parsing, external evaluation, outcomes, statistics, and

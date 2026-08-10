@@ -33,7 +33,7 @@ limits:
   max_dataset_bytes: 268435456
   max_recorded_output_bytes: 536870912
   max_schema_bytes: 16777216
-  max_cases: 1000000
+  max_cases: 10000
   max_jsonl_line_bytes: 16777216
   max_replay_artifact_bytes: 536870912
   max_output_bytes_per_case: 4194304
@@ -88,3 +88,16 @@ subject to per-file and aggregate fingerprint bounds. Unrelated files elsewhere 
 not participate in the run identity. Cross-field rules that JSON Schema cannot safely express,
 including JSON Pointer overlap, evaluator/outcome references, and unique evaluator IDs, remain
 runtime checks.
+
+Report search indexes case IDs and redacted metadata by default. Opt in specific case fields without
+indexing the entire payload:
+
+```yaml
+report:
+  search_pointers:
+    - /metadata/vendor
+    - /expected/invoice_number
+```
+
+At most 32 valid JSON Pointers are accepted. Values pass through report redaction before indexing,
+and each indexed value is bounded.

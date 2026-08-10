@@ -18,7 +18,7 @@ use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{RunKind, RunStatus},
     config::{Config, VariantConfig},
-    dataset::{Dataset, VariantCase},
+    dataset::{Dataset, ExecutionToken, VariantCase},
     evaluation::compile_schema,
     hashing::{hash_bytes, hash_canonical_json, hash_file},
     output::RecordedOutputs,
@@ -768,15 +768,10 @@ fn variant_cases_for_run(dataset: &Dataset, run_nonce: &str) -> anyhow::Result<V
         .iter()
         .enumerate()
         .map(|(ordinal, case)| {
-            let digest = hash_canonical_json(&serde_json::json!({
-                "run_nonce": run_nonce,
-                "ordinal": ordinal,
-            }))?;
-            Ok(VariantCase {
-                id: format!("stx-{}", &digest[..32]),
-                input: case.input.clone(),
-                metadata: case.model_visible_metadata.clone(),
-            })
+            Ok(VariantCase::for_execution(
+                case,
+                ExecutionToken::new(run_nonce, ordinal),
+            ))
         })
         .collect()
 }
@@ -828,7 +823,22 @@ fn materialize_python_bridge(project_root: &Path, config: &Config) -> anyhow::Re
         .join("python-bridge-v3.py");
     let parent = bridge_path.parent().context("bridge path has no parent")?;
     std::fs::create_dir_all(parent)?;
-    if std::fs::read(&bridge_path).ok().as_deref() != Some(BRIDGE_SOURCE.as_bytes()) {
+    if let Ok(metadata) = std::fs::symlink_metadata(&bridge_path) {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing symlinked Python bridge {}",
+            bridge_path.display()
+        );
+    }
+    if structtrace_core::hashing::read_bounded(
+        &bridge_path,
+        BRIDGE_SOURCE.len() + 1,
+        "Python bridge",
+    )
+    .ok()
+    .as_deref()
+        != Some(BRIDGE_SOURCE.as_bytes())
+    {
         std::fs::write(&bridge_path, BRIDGE_SOURCE)?;
     }
     Ok(bridge_path)
@@ -920,7 +930,11 @@ fn atomic_write(path: PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
 
 fn read_optional(path: &Path) -> anyhow::Result<Vec<u8>> {
     if path.is_file() {
-        Ok(std::fs::read(path)?)
+        Ok(structtrace_core::hashing::read_bounded(
+            path,
+            64 * 1024 * 1024,
+            "execution checkpoint",
+        )?)
     } else {
         Ok(Vec::new())
     }
@@ -928,9 +942,11 @@ fn read_optional(path: &Path) -> anyhow::Result<Vec<u8>> {
 
 fn read_optional_json(path: &Path) -> anyhow::Result<Vec<String>> {
     if path.is_file() {
-        Ok(structtrace_core::strict_json::from_slice(&std::fs::read(
+        Ok(structtrace_core::hashing::read_json_bounded(
             path,
-        )?)?)
+            64 * 1024 * 1024,
+            "execution checkpoint",
+        )?)
     } else {
         Ok(Vec::new())
     }

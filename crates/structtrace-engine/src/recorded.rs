@@ -725,7 +725,22 @@ fn materialize_evaluator_bridge(storage_root: &Path) -> anyhow::Result<PathBuf> 
         .parent()
         .context("evaluator bridge path has no parent")?;
     std::fs::create_dir_all(parent)?;
-    if std::fs::read(&path).ok().as_deref() != Some(EVALUATOR_BRIDGE_SOURCE.as_bytes()) {
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing symlinked evaluator bridge {}",
+            path.display()
+        );
+    }
+    if structtrace_core::hashing::read_bounded(
+        &path,
+        EVALUATOR_BRIDGE_SOURCE.len() + 1,
+        "Python evaluator bridge",
+    )
+    .ok()
+    .as_deref()
+        != Some(EVALUATOR_BRIDGE_SOURCE.as_bytes())
+    {
         std::fs::write(&path, EVALUATOR_BRIDGE_SOURCE)?;
     }
     Ok(path)

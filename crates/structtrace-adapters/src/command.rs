@@ -847,16 +847,16 @@ if args.mode == "delayed-extra-after-complete":
 
     fn cases() -> Vec<VariantCase> {
         vec![
-            VariantCase {
-                id: "one".to_owned(),
-                input: json!({"text": "first"}),
-                metadata: None,
-            },
-            VariantCase {
-                id: "two".to_owned(),
-                input: json!({"text": "second"}),
-                metadata: None,
-            },
+            VariantCase::from_parts(
+                structtrace_core::dataset::ExecutionToken::new("command-test", 0),
+                json!({"text": "first"}),
+                None,
+            ),
+            VariantCase::from_parts(
+                structtrace_core::dataset::ExecutionToken::new("command-test", 1),
+                json!({"text": "second"}),
+                None,
+            ),
         ]
     }
 
@@ -998,16 +998,18 @@ if args.mode == "delayed-extra-after-complete":
     #[tokio::test]
     async fn stderr_is_captured_separately() {
         let (directory, spec) = fixture("stderr");
+        let cases = cases();
+        let expected = format!("diagnostic for {}", cases[0].id);
         let run = run_command(
             &spec,
             ProcessMode::Persistent,
             FIXTURE_TIMEOUT_MS,
-            &cases(),
+            &cases,
             directory.path(),
             &CommandLimits::default(),
         )
         .await;
-        assert!(String::from_utf8_lossy(&run.stderr).contains("diagnostic for one"));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(&expected));
         assert!(run.rows.iter().all(|row| row.status == OutputStatus::Ok));
     }
 

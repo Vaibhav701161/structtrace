@@ -259,7 +259,19 @@ fn write_fixture(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.is_file() && std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing symlinked demo fixture {}",
+            path.display()
+        );
+    }
+    if path.is_file()
+        && structtrace_core::hashing::read_bounded(path, contents.len() + 1, "bundled demo fixture")
+            .ok()
+            .as_deref()
+            == Some(contents.as_bytes())
+    {
         return Ok(());
     }
     std::fs::write(path, contents)?;

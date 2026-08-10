@@ -1,0 +1,11 @@
+variants:
+  baseline:
+    kind: openai_compatible
+    base_url: file:///tmp/not-an-api
+    model: baseline-model
+    request: {system: "Return JSON.", user_template: "{{ input }}"}
+  candidate:
+    kind: openai_compatible
+    base_url: https://localhost/v1
+    model: candidate-model
+    request: {system: "Return JSON.", user_template: "{{ input }}"}

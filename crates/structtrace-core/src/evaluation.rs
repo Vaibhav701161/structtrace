@@ -47,7 +47,7 @@ pub struct EvaluatorResult {
     pub status: EvaluationStatus,
     /// Binary convenience value. Errors and not-applicable results are false.
     pub passed: bool,
-    /// Optional score in the inclusive zero-to-one range.
+    /// Optional diagnostic score in the inclusive zero-to-one range. Status is authoritative.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     /// Human-readable reason.

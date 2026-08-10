@@ -643,11 +643,11 @@ mod tests {
     }
 
     fn case() -> VariantCase {
-        VariantCase {
-            id: "one".to_owned(),
-            input: json!({"text": "accepted"}),
-            metadata: None,
-        }
+        VariantCase::from_parts(
+            structtrace_core::dataset::ExecutionToken::new("openai-test", 0),
+            json!({"text": "accepted"}),
+            None,
+        )
     }
 
     #[test]

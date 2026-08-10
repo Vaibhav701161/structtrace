@@ -152,11 +152,11 @@ mod tests {
 
     #[test]
     fn variant_request_never_contains_expected() {
-        let case = VariantCase {
-            id: "case-1".to_owned(),
-            input: json!({"question": "safe"}),
-            metadata: Some(json!({"locale": "en"})),
-        };
+        let case = VariantCase::from_parts(
+            structtrace_core::dataset::ExecutionToken::new("protocol-test", 0),
+            json!({"question": "safe"}),
+            Some(json!({"locale": "en"})),
+        );
         let value = serde_json::to_value(VariantRequest::from(&case)).unwrap();
         assert!(value.get("expected").is_none());
         assert_eq!(value.pointer("/metadata/locale"), Some(&json!("en")));

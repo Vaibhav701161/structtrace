@@ -33,11 +33,12 @@ this file is not treated as machine evidence.
 | Failed lifecycle | an error after run allocation records a failure event and leaves durable state `failed`, never `complete` |
 | Multi-state gate | empty gates are not configured; evaluator errors, low joint coverage, not-applicable rows, unscored rows, small samples, schema failure, parse failure, and vacuous thresholds cannot authorize deployment |
 | Gate intent | advisory never authorizes; regression requires complete evidence safeguards and a relative quality rule; release requires the safe deployment, parse, schema, valid-but-wrong, and evidence profile and is the only authorizing mode; CI can require authorization explicitly |
+| Authorization-only CI | `release-check` always performs replay and exits zero only when the resulting Release gate sets `deployment_authorized`; official deployment snippets use this command |
 | Outcome health | composed logical truth and required-component health are stored separately; mixed failure plus error/not-applicable states remain visible and block fully evaluated evidence |
 | Strict JSON | one recursive parser rejects duplicate keys in schemas, datasets, recorded and raw outputs, worker protocols, evaluator responses, provider envelopes, and replayed artifacts across compare, run, doctor, and replay |
 | Process logs | default retention is off; sanitized logs redact configured literals and header-shaped values under one total budget; truncation is marked and share exports omit logs |
 | Run management | kind-aware list/show/latest, inactive-run deletion with confirmation and symlink confinement, and manifest-allowlisted verified archives that exclude unbound files are available |
-| Guided recorded onboarding | `init --from-outputs` validates and snapshots all four inputs, discovers pointers from schema, expected, baseline, and candidate evidence so omitted candidate fields remain selectable, requires explicit semantics, and produces a runtime-valid project |
+| Guided recorded onboarding | `init --from-outputs` accepts canonical or ordinary JSONL, supports nondefault dataset/output mappings, validates and snapshots all four inputs, reports schema/expected/baseline/candidate field coverage and types so omitted candidate fields remain selectable, generates built-in evaluator semantics only when explicitly selected, and produces a strict-doctor/run/replay-valid project |
 | Example projects | recorded, Python, command, document extraction, and tool-selection/argument fixtures ran through the shared scoring path |
 | Invoice hero workflow | 12 nested invoices produced 9/12 versus 9/12 with six discordances, schema validity 10/12 versus 12/12, valid-but-wrong 1 versus 3, and an insufficient-evidence gate |
 | Evidence independence | singleton, exact-duplicate, repeated-trial and label-conflict groups are explicit; scoring occurs before retention; strict parse receipts preserve raw-disabled results; paired coverage is the true fully evaluated intersection; repeated trials block independent inference |
@@ -54,6 +55,9 @@ this file is not treated as machine evidence.
 | Process lifecycle | adversarial tests bound persistent EOF shutdown, inherited reader pipes, per-case timeouts, and Unix descendant process termination |
 | Bounded resources | output, stderr, report, provider, bootstrap-sample, and bootstrap-work ceilings fail closed |
 | Report scale | 1,000 nested invoice pairs generate a shell under 512 KiB, 20 lazy chunks, a total bundle under 16 MiB, and no oversized single-file derivative; isolated generation took 1.76 s with 90,428 KiB test-process RSS locally |
+| Recorded workflow scale | The deterministic 10,000-case release-binary run and complete replay are captured in `benchmarks/recorded-output-10000/result.json`; the 100,000-case hard ceiling remains explicitly unmeasured |
+| Release archive validation | The Linux release binary was archived, extracted into a clean temporary directory, then passed `--version`, doctor, invoice demo, and full replay; the same validator is mandatory for every target in the release workflow |
+| Parser and artifact fuzzing | strict JSON, adapter protocol JSON, and imported manifest/paired-case artifact targets completed local smoke runs without a crash |
 | Configuration safety | runtime validation enforces paths, pointers, callables, timeouts, concurrency, retries, token limits, tolerances, pricing, gates, and report-filter constraints independently of editor tooling |
 | Documentation | mdBook built 43 HTML pages locally, including the explicit scale envelope and release-candidate user protocol |
 | Formatting and linting | `cargo fmt --all --check` and warnings-denied Clippy passed |

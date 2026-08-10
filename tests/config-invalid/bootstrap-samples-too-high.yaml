@@ -1,0 +1,3 @@
+analysis:
+  primary_outcome: semantic_correct
+  bootstrap: {samples: 1000001, confidence: 0.95, seed: 17}

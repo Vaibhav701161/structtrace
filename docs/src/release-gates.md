@@ -42,11 +42,14 @@ structtrace gate latest --format json
 structtrace gate latest --format github
 structtrace gate latest --verify replay
 structtrace gate latest --require-release-authorization
+structtrace release-check latest
 ```
 
 By default, exit code `0` means the configured advisory, regression, or release rules passed; the
 mode and `deployment_authorized` remain explicit. CI deployment jobs must use
 `--require-release-authorization`, which returns `0` only for an authorized release-mode gate.
+`release-check` is the safer deployment alias: replay verification is mandatory and cannot be
+downgraded through command options.
 Exit codes `10`, `11`, `12`,
 and `13` mean `FAILED`, `NOT_CONFIGURED`, `INSUFFICIENT_EVIDENCE`, and gate `ERROR`, respectively.
 Input, runtime, artifact, and protocol failures use distinct exit codes.

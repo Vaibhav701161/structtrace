@@ -1,0 +1,9 @@
+dataset:
+  path: data/golden.jsonl
+  format: jsonl
+  fields:
+    id: /id
+    input: /payload
+    expected: /payload/expected
+    model_visible_metadata: /model_visible_metadata
+    metadata: /metadata

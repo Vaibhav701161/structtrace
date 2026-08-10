@@ -30,6 +30,7 @@ use tempfile::NamedTempFile;
 
 /// The report asset format is versioned independently from stored scores.
 pub const REPORT_FORMAT_VERSION: u32 = 4;
+const MAX_REPORT_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 const CASE_CHUNK_SIZE: usize = 50;
 
@@ -161,6 +162,8 @@ struct CaseView {
     id: String,
     transition: String,
     filters: String,
+    #[serde(skip)]
+    search: String,
     input: String,
     expected: String,
     metadata: String,
@@ -428,8 +431,8 @@ fn write_case_chunk(
                 transition: case.transition.clone(),
                 filters: case.filters.clone(),
                 search: format!(
-                    "{} {} {} {}",
-                    case.id, case.metadata, case.model_visible_metadata, case.filters
+                    "{} {} {} {} {}",
+                    case.id, case.metadata, case.model_visible_metadata, case.filters, case.search
                 )
                 .to_lowercase(),
                 chunk: chunk_index,
@@ -448,10 +451,13 @@ fn read_embedded_chunks(
     let mut embedded = String::with_capacity(case_count.saturating_mul(256));
     embedded.push('[');
     for chunk_index in 0..chunk_count {
-        let bytes = std::fs::read(
-            report_dir
-                .join("cases")
-                .join(format!("{chunk_index:05}.json")),
+        let chunk_path = report_dir
+            .join("cases")
+            .join(format!("{chunk_index:05}.json"));
+        let bytes = structtrace_core::hashing::read_bounded(
+            &chunk_path,
+            MAX_REPORT_METADATA_BYTES,
+            "report case chunk",
         )?;
         let text = std::str::from_utf8(&bytes)?;
         let body = text
@@ -481,7 +487,11 @@ pub fn export_single_file(run_dir: &Path, destination: &Path) -> anyhow::Result<
         single_path.is_file(),
         "this report exceeds limits.max_single_file_report_bytes; use the chunked report directory"
     );
-    let bytes = std::fs::read(single_path)?;
+    let bytes = structtrace_core::hashing::read_bounded(
+        &single_path,
+        structtrace_core::config::HARD_MAX_SINGLE_FILE_REPORT_BYTES,
+        "single-file report",
+    )?;
     atomic_write(destination, &bytes)
 }
 
@@ -1677,6 +1687,22 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         .unwrap_or(Value::Null);
     let mut filter_string = filters.join(" ");
     redact_text_with_policy(&mut filter_string, &secrets, aggressive, patterns);
+    let mut search = config
+        .report
+        .search_pointers
+        .iter()
+        .filter_map(|pointer| {
+            let pointer = if pointer.starts_with("/case/") || pointer == "/case" {
+                pointer.clone()
+            } else {
+                format!("/case{pointer}")
+            };
+            redacted_value.pointer(&pointer).map(compact_json)
+        })
+        .map(|value| value.chars().take(4096).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ");
+    redact_text_with_policy(&mut search, &secrets, aggressive, patterns);
     Ok(CaseView {
         id: redacted_value
             .pointer("/case/id")
@@ -1689,6 +1715,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
             .unwrap_or(REDACTION_MARKER)
             .replace('_', " "),
         filters: filter_string,
+        search,
         input: pretty_json(pointer_or_null(&redacted_value, "/case/input")),
         expected: optional_pretty(&redacted_value, "/case/expected"),
         metadata: optional_pretty(&redacted_value, "/case/metadata"),
@@ -1869,10 +1896,8 @@ fn metric(count: usize, total: usize) -> MetricView {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    structtrace_core::strict_json::from_slice(&bytes)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    structtrace_core::hashing::read_json_bounded(path, MAX_REPORT_METADATA_BYTES, "report artifact")
+        .with_context(|| format!("invalid or oversized JSON in {}", path.display()))
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -1966,7 +1991,7 @@ const TEMPLATE: &str = r##"<!doctype html>
   <h2>All-evaluator field diagnostics</h2><p class="muted">Diagnostic only. Evaluator identities and pass, fail, error, not-applicable, and unscored states remain separate.</p>{% if diagnostic_hotspots %}<table><thead><tr><th>Evaluator</th><th>JSON Pointer</th><th>Regressions</th><th>Improvements</th><th>Baseline states</th><th>Candidate states</th></tr></thead><tbody>{% for item in diagnostic_hotspots %}<tr><td><code>{{ item.evaluator_id }}</code></td><td><code>{{ item.pointer }}</code></td><td class="num">{{ item.regressions }}</td><td class="num">{{ item.improvements }}</td><td>{{ item.baseline_states }}</td><td>{{ item.candidate_states }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No field-level evaluator diagnostics are available.</p>{% endif %}
 
   {% if not share_derivative %}<h2>Case explorer</h2>
-  <p class="muted">Case details are loaded in bounded chunks. Search covers case IDs and redacted metadata; filters include outcome, validity, adapter, and evaluator states.</p>
+  <p class="muted">Case details are loaded in bounded chunks. Search covers case IDs, redacted metadata, and explicitly configured redacted search pointers; filters include outcome, validity, adapter, and evaluator states.</p>
   <div class="case-tools"><label><span class="sr-only">Search cases</span><input id="case-search" type="search" placeholder="Search case ID or metadata"></label><span id="case-count" class="muted">Loading case index…</span></div>
   <div class="filters" role="group" aria-label="Case filters"><button data-filter="all" aria-pressed="false">All</button><button data-filter="discordant" aria-pressed="false">Discordant</button><button data-filter="baseline_only_pass" aria-pressed="false">Baseline-only</button><button data-filter="candidate_only_pass" aria-pressed="false">Candidate-only</button><button data-filter="both_fail" aria-pressed="false">Both fail</button><button data-filter="valid_but_wrong" aria-pressed="false">Valid but wrong</button><button data-filter="parse_failure" aria-pressed="false">Parse failures</button><button data-filter="schema_failure" aria-pressed="false">Schema failures</button><button data-filter="adapter_error" aria-pressed="false">Adapter errors</button><button data-filter="evaluator_error" aria-pressed="false">Evaluator errors</button><button data-filter="not_applicable" aria-pressed="false">Not applicable</button><button data-filter="unscored" aria-pressed="false">Unscored</button></div>
   <div id="cases" aria-live="polite"></div>
@@ -2007,6 +2032,12 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn report_format_documentation_matches_the_exported_constant() {
+        let documentation = include_str!("../../../docs/src/report-scale-validation.md");
+        assert!(documentation.contains(&format!("Report format {REPORT_FORMAT_VERSION}")));
+    }
 
     fn report_config(title: &str) -> Config {
         serde_json::from_value(json!({
@@ -2514,6 +2545,19 @@ mod tests {
         assert!(!serialized.contains(secret));
         assert!(serialized.contains(REDACTION_MARKER));
         assert!(view.model_visible_metadata.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn configured_search_fields_are_bounded_and_redacted_before_indexing() {
+        let mut config = report_config("search privacy");
+        config.report.search_pointers = vec!["/expected/invoice_number".to_owned()];
+        config.storage.redaction.json_pointers = vec!["/expected/invoice_number".to_owned()];
+        let secret = "INV-PRIVATE-1035";
+        let mut record = passing_record("search-case".to_owned(), json!({"text": "invoice"}));
+        record.case.expected = Some(json!({"invoice_number": secret}));
+        let view = case_view(&record, &config).unwrap();
+        assert!(!view.search.contains(secret));
+        assert!(view.search.contains(REDACTION_MARKER));
     }
 
     #[test]

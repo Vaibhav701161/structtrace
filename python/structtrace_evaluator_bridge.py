@@ -180,8 +180,11 @@ def validate_evaluator_result(result: dict[str, Any]) -> None:
         field_statuses.add(str(field.get("status", "")))
     if status == "passed" and field_statuses.intersection({"failed", "error"}):
         raise NormalizationError("contradictory_evaluator_result", "passed result has failed/error field")
-    if status == "error" and score == 1:
-        raise NormalizationError("contradictory_evaluator_result", "error result cannot score 1")
+    if status in {"error", "not_applicable"} and score is not None:
+        raise NormalizationError(
+            "contradictory_evaluator_result",
+            "error and not-applicable results require a null diagnostic score",
+        )
     if status == "not_applicable" and field_statuses.intersection({"passed", "failed"}):
         raise NormalizationError(
             "contradictory_evaluator_result",

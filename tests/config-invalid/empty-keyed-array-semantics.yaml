@@ -1,0 +1,9 @@
+evaluators:
+  - id: empty_array
+    kind: keyed_array
+    pointer: /line_items
+    expected_pointer: /line_items
+    keys: []
+    fields: []
+outcomes:
+  semantic_correct: {all_of: [empty_array]}

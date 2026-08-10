@@ -3,12 +3,12 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use structtrace_adapters::{
     command::{CommandLimits, run_command},
     evaluator::{
@@ -38,6 +38,7 @@ const EXIT_GATE_FAILED: u8 = 10;
 const EXIT_GATE_NOT_CONFIGURED: u8 = 11;
 const EXIT_GATE_INSUFFICIENT_EVIDENCE: u8 = 12;
 const EXIT_GATE_ERROR: u8 = 13;
+const MAX_CLI_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,42 +95,8 @@ enum Commands {
         /// Opinionated application preset.
         #[arg(long, value_enum, conflicts_with_all = ["template", "from_outputs"])]
         preset: Option<InitPreset>,
-        /// Build a recorded comparison from existing matched artifacts.
-        #[arg(long)]
-        from_outputs: bool,
-        /// Golden dataset used by --from-outputs.
-        #[arg(long, requires = "from_outputs")]
-        dataset: Option<PathBuf>,
-        /// Baseline output JSONL used by --from-outputs.
-        #[arg(long, requires = "from_outputs")]
-        baseline: Option<PathBuf>,
-        /// Candidate output JSONL used by --from-outputs.
-        #[arg(long, requires = "from_outputs")]
-        candidate: Option<PathBuf>,
-        /// Caller-facing JSON Schema used by --from-outputs.
-        #[arg(long, requires = "from_outputs")]
-        schema: Option<PathBuf>,
-        /// JSON Pointer whose exact value defines correctness. Repeat for multiple fields.
-        #[arg(long, requires = "from_outputs")]
-        correctness_pointer: Vec<String>,
-        /// Compare the complete output object to expected instead of selected pointers.
-        #[arg(
-            long,
-            requires = "from_outputs",
-            conflicts_with = "correctness_pointer"
-        )]
-        exact_json: bool,
-        /// Gate intent for the generated project.
-        #[arg(
-            long,
-            value_enum,
-            default_value = "regression",
-            requires = "from_outputs"
-        )]
-        gate_mode: GuidedGateMode,
-        /// Required independent cases for the generated evidence gate.
-        #[arg(long, default_value_t = 100, requires = "from_outputs")]
-        min_cases: usize,
+        #[command(flatten)]
+        import: Box<FromOutputsArgs>,
     },
     /// Run a complete deterministic demo without network access or credentials.
     Demo {
@@ -199,6 +166,12 @@ enum Commands {
         #[arg(long)]
         require_release_authorization: bool,
     },
+    /// Verify replay and succeed only for an authorized release-mode decision.
+    ReleaseCheck {
+        /// Run ULID, `latest`, `latest-any`, `latest-demo`, or `latest-research`.
+        #[arg(default_value = "latest")]
+        run: String,
+    },
     /// Recompute retained scores, summaries, intervals, and gate results.
     Replay {
         /// Run ULID, `latest`, `latest-any`, `latest-demo`, or `latest-research`.
@@ -216,9 +189,9 @@ enum Commands {
     /// Validate the local environment without making network requests.
     Doctor {
         /// Fail on insecure storage, duplicate evidence, and leakage-risk values.
-        #[arg(long)]
+        #[arg(long, visible_alias = "static")]
         strict: bool,
-        /// Import configured Python workers and resolve callables without executing cases.
+        /// Import configured Python modules and resolve callables. Import-time code executes; no dataset case is supplied.
         #[arg(long, requires = "strict", conflicts_with = "execute_cases")]
         handshake: bool,
         /// Deliberately execute this many local business cases; configured code may have side effects.
@@ -235,6 +208,80 @@ enum Commands {
         #[command(subcommand)]
         command: RunsCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct FromOutputsArgs {
+    /// Build a recorded comparison from existing matched artifacts.
+    #[arg(long)]
+    from_outputs: bool,
+    /// Golden dataset used by --from-outputs.
+    #[arg(long, requires = "from_outputs")]
+    dataset: Option<PathBuf>,
+    /// Baseline output JSONL used by --from-outputs.
+    #[arg(long, requires = "from_outputs")]
+    baseline: Option<PathBuf>,
+    /// Candidate output JSONL used by --from-outputs.
+    #[arg(long, requires = "from_outputs")]
+    candidate: Option<PathBuf>,
+    /// Caller-facing JSON Schema used by --from-outputs.
+    #[arg(long, requires = "from_outputs")]
+    schema: Option<PathBuf>,
+    /// JSON Pointer whose exact value defines correctness. Repeat for multiple fields.
+    #[arg(long, requires = "from_outputs")]
+    correctness_pointer: Vec<String>,
+    /// Deterministic field evaluator as POINTER=KIND.
+    #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
+    field_evaluator: Vec<String>,
+    /// Keyed-array evaluator as ARRAY_POINTER=KEYS;FIELD:EVALUATOR.
+    #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
+    keyed_array: Vec<String>,
+    /// Add opt-in invoice arithmetic invariants.
+    #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
+    financial_invariants: bool,
+    /// Dataset case-ID JSON Pointer.
+    #[arg(long, default_value = "/id", requires = "from_outputs")]
+    dataset_id_pointer: String,
+    /// Dataset model-input JSON Pointer.
+    #[arg(long, default_value = "/input", requires = "from_outputs")]
+    dataset_input_pointer: String,
+    /// Dataset expected/reference JSON Pointer.
+    #[arg(long, default_value = "/expected", requires = "from_outputs")]
+    dataset_expected_pointer: String,
+    /// Dataset metadata intentionally visible to variants.
+    #[arg(
+        long,
+        default_value = "/model_visible_metadata",
+        requires = "from_outputs"
+    )]
+    dataset_model_visible_metadata_pointer: String,
+    /// Dataset evaluator-only metadata JSON Pointer.
+    #[arg(long, default_value = "/metadata", requires = "from_outputs")]
+    dataset_metadata_pointer: String,
+    /// Case-ID pointer in simple output JSONL. Canonical envelopes are auto-detected.
+    #[arg(long, default_value = "/id", requires = "from_outputs")]
+    output_id_pointer: String,
+    /// Output pointer in simple output JSONL. Canonical envelopes are auto-detected.
+    #[arg(long, default_value = "/output", requires = "from_outputs")]
+    output_value_pointer: String,
+    /// Compare the complete output object to expected.
+    #[arg(
+        long,
+        requires = "from_outputs",
+        conflicts_with_all = ["correctness_pointer", "field_evaluator", "keyed_array", "financial_invariants"]
+    )]
+    exact_json: bool,
+    /// Gate intent for the generated project.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "regression",
+        requires = "from_outputs"
+    )]
+    gate_mode: GuidedGateMode,
+    /// Required independent cases for the generated evidence gate.
+    #[arg(long, default_value_t = 100, requires = "from_outputs")]
+    min_cases: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,15 +400,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             path,
             template,
             preset,
-            from_outputs,
-            dataset,
-            baseline,
-            candidate,
-            schema,
-            correctness_pointer,
-            exact_json,
-            gate_mode,
-            min_cases,
+            import,
         } => {
             let destination = path.as_ref().map_or_else(
                 || cli.project_root.clone(),
@@ -373,23 +412,59 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                     }
                 },
             );
-            let created = if *from_outputs {
+            let created = if import.from_outputs {
                 initialize::initialize_from_outputs(initialize::FromOutputsOptions {
                     destination: &destination,
-                    dataset: &required_init_path(&cli.project_root, dataset, "--dataset")?,
-                    baseline: &required_init_path(&cli.project_root, baseline, "--baseline")?,
-                    candidate: &required_init_path(&cli.project_root, candidate, "--candidate")?,
-                    schema: &required_init_path(&cli.project_root, schema, "--schema")?,
-                    correctness_pointers: correctness_pointer,
-                    exact_json: *exact_json,
-                    gate_mode: match gate_mode {
+                    dataset: &required_or_prompt_init_path(
+                        &cli.project_root,
+                        &import.dataset,
+                        "--dataset",
+                        "Golden dataset JSONL",
+                    )?,
+                    baseline: &required_or_prompt_init_path(
+                        &cli.project_root,
+                        &import.baseline,
+                        "--baseline",
+                        "Baseline outputs JSONL",
+                    )?,
+                    candidate: &required_or_prompt_init_path(
+                        &cli.project_root,
+                        &import.candidate,
+                        "--candidate",
+                        "Candidate outputs JSONL",
+                    )?,
+                    schema: &required_or_prompt_init_path(
+                        &cli.project_root,
+                        &import.schema,
+                        "--schema",
+                        "Caller-facing JSON Schema",
+                    )?,
+                    dataset_fields: structtrace_core::config::DatasetFields {
+                        id: import.dataset_id_pointer.clone(),
+                        input: import.dataset_input_pointer.clone(),
+                        expected: import.dataset_expected_pointer.clone(),
+                        model_visible_metadata: import
+                            .dataset_model_visible_metadata_pointer
+                            .clone(),
+                        metadata: import.dataset_metadata_pointer.clone(),
+                    },
+                    output_fields: initialize::SimpleOutputFields {
+                        id: import.output_id_pointer.clone(),
+                        output: import.output_value_pointer.clone(),
+                    },
+                    correctness_pointers: &import.correctness_pointer,
+                    field_evaluators: &import.field_evaluator,
+                    keyed_arrays: &import.keyed_array,
+                    financial_invariants: import.financial_invariants,
+                    exact_json: import.exact_json,
+                    gate_mode: match import.gate_mode {
                         GuidedGateMode::Advisory => structtrace_core::config::GateMode::Advisory,
                         GuidedGateMode::Regression => {
                             structtrace_core::config::GateMode::Regression
                         }
                         GuidedGateMode::Release => structtrace_core::config::GateMode::Release,
                     },
-                    min_cases: *min_cases,
+                    min_cases: import.min_cases,
                 })?
             } else {
                 match preset {
@@ -569,6 +644,9 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             *verify,
             *require_release_authorization,
         ),
+        Commands::ReleaseCheck { run } => {
+            gate(cli, &resolve_run(cli, run)?, GateVerification::Replay, true)
+        }
         Commands::Replay {
             run,
             research_fixture,
@@ -1335,6 +1413,11 @@ async fn doctor(
     handshake: bool,
     execute_cases: Option<usize>,
 ) -> anyhow::Result<u8> {
+    if handshake && !cli.quiet && matches!(cli.format, OutputFormat::Human) {
+        eprintln!(
+            "WARNING: Python handshake imports configured Python modules. Import-time code will execute. No dataset case is supplied."
+        );
+    }
     let root = cli
         .project_root
         .canonicalize()
@@ -1608,6 +1691,12 @@ async fn doctor(
                     }));
                 }
                 if handshake {
+                    checks.push(serde_json::json!({
+                        "check": "python_import_side_effect_warning",
+                        "passed": true,
+                        "required": true,
+                        "detail": "Python handshake imports configured Python modules. Import-time code will execute. No dataset case is supplied."
+                    }));
                     let handshake_checks = local_worker_static_handshake(&root, &config)?;
                     for check in handshake_checks {
                         passed &= check["passed"].as_bool() == Some(true);
@@ -1717,11 +1806,25 @@ async fn local_worker_handshake(
     requested_cases: usize,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let count = requested_cases.min(dataset.cases.len());
+    let doctor_nonce = format!(
+        "doctor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let cases = dataset
         .cases
         .iter()
+        .enumerate()
         .take(count)
-        .map(structtrace_core::dataset::VariantCase::from)
+        .map(|(ordinal, case)| {
+            structtrace_core::dataset::VariantCase::for_execution(
+                case,
+                structtrace_core::dataset::ExecutionToken::new(&doctor_nonce, ordinal),
+            )
+        })
         .collect::<Vec<_>>();
     let limits = CommandLimits {
         max_output_bytes: config.limits.max_output_bytes_per_case,
@@ -2185,10 +2288,8 @@ fn verify_manifest_artifact(run_dir: &Path, relative: &str) -> anyhow::Result<()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    structtrace_core::strict_json::from_slice(&bytes)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    structtrace_core::hashing::read_json_bounded(path, MAX_CLI_METADATA_BYTES, "CLI artifact")
+        .with_context(|| format!("invalid or oversized JSON in {}", path.display()))
 }
 
 fn resolve(root: &Path, path: &Path) -> PathBuf {
@@ -2208,6 +2309,28 @@ fn required_init_path(root: &Path, path: &Option<PathBuf>, flag: &str) -> anyhow
     } else {
         root.join(path)
     })
+}
+
+fn required_or_prompt_init_path(
+    root: &Path,
+    path: &Option<PathBuf>,
+    flag: &str,
+    prompt: &str,
+) -> anyhow::Result<PathBuf> {
+    if path.is_some() {
+        return required_init_path(root, path, flag);
+    }
+    anyhow::ensure!(
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        "{flag} is required with --from-outputs in non-interactive mode"
+    );
+    eprint!("{prompt}: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    anyhow::ensure!(!answer.is_empty(), "{flag} must not be empty");
+    required_init_path(root, &Some(PathBuf::from(answer)), flag)
 }
 
 fn percent(count: usize, total: usize) -> f64 {

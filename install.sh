@@ -5,6 +5,14 @@ repository="Vaibhav701161/structtrace"
 version="${STRUCTTRACE_VERSION:-latest}"
 install_dir="${STRUCTTRACE_INSTALL_DIR:-${HOME}/.local/bin}"
 
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) [ "$#" -ge 2 ] || { echo "--version requires a tag such as v1.0.0" >&2; exit 2; }; version="$2"; shift 2 ;;
+    --uninstall) rm -f "$install_dir/structtrace"; echo "Removed $install_dir/structtrace"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target="x86_64-unknown-linux-musl" ;;
   Darwin-x86_64) target="x86_64-apple-darwin" ;;
@@ -34,6 +42,14 @@ fi
 curl --fail --location --silent --show-error "$base_url/$asset" -o "$temporary_dir/$asset"
 curl --fail --location --silent --show-error "$base_url/$asset.sha256" -o "$temporary_dir/$asset.sha256"
 (cd "$temporary_dir" && $checksum_command "$asset.sha256")
+if command -v gh >/dev/null 2>&1; then
+  gh attestation verify "$temporary_dir/$asset" --repo "$repository"
+elif [ "${STRUCTTRACE_REQUIRE_ATTESTATION:-0}" = "1" ]; then
+  echo "GitHub CLI is required when STRUCTTRACE_REQUIRE_ATTESTATION=1." >&2
+  exit 1
+else
+  echo "GitHub CLI not found; SHA-256 verified, provenance verification skipped."
+fi
 tar -xzf "$temporary_dir/$asset" -C "$temporary_dir"
 mkdir -p "$install_dir"
 install -m 0755 "$temporary_dir/structtrace" "$install_dir/structtrace"
@@ -51,3 +67,4 @@ case ":${PATH}:" in
     ;;
 esac
 echo "Uninstall with: rm $install_dir/structtrace"
+echo "Update by rerunning this installer with --version <tag>."

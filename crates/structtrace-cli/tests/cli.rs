@@ -15,6 +15,16 @@ fn help_and_doctor_succeed() {
 }
 
 #[test]
+fn documented_deployment_ci_command_is_authorization_safe() {
+    let docs = include_str!("../../../docs/src/ci-integration.md");
+    let video = include_str!("../../../docs/video-scripts/ci-integration.md");
+    for source in [docs, video] {
+        assert!(source.contains("release-check latest"));
+        assert!(!source.contains("Enforce release thresholds\n  run: structtrace gate"));
+    }
+}
+
+#[test]
 fn strict_doctor_fails_expected_leaf_leakage() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -123,7 +133,7 @@ gate: {max_primary_regression_pp: 0}
 }
 
 #[test]
-fn strict_doctor_and_handshake_do_not_execute_business_cases() {
+fn strict_doctor_is_static_and_handshake_warns_before_importing() {
     let root = tempdir().unwrap();
     let project = root.path().join("doctor-project");
     assert!(
@@ -161,6 +171,20 @@ def candidate(case): return _run(case)
         );
         assert!(!project.join("business-case-executed").exists());
     }
+    let handshake = binary()
+        .args([
+            "--format",
+            "json",
+            "--project-root",
+            project.to_str().unwrap(),
+            "doctor",
+            "--strict",
+            "--handshake",
+        ])
+        .output()
+        .unwrap();
+    assert!(handshake.status.success());
+    assert!(String::from_utf8_lossy(&handshake.stdout).contains("Import-time code will execute"));
     let output = binary()
         .args([
             "--format",
@@ -361,6 +385,17 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .status()
         .unwrap();
     assert_eq!(authorization.code(), Some(10));
+    let release_check = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "release-check",
+            "latest",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(release_check.code(), Some(10));
     let json_gate = binary()
         .args([
             "--format",
@@ -427,6 +462,158 @@ fn offline_demos_complete_without_credentials() {
                 .success()
         );
     }
+}
+
+#[test]
+fn release_check_zero_means_an_authorized_release() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("release-project");
+    assert!(
+        binary()
+            .args(["init", project.to_str().unwrap(), "--template", "recorded"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut dataset = String::new();
+    let mut outputs = String::new();
+    for index in 0..100 {
+        dataset.push_str(&format!(
+            "{{\"id\":\"case-{index:03}\",\"input\":{{\"text\":\"unique-{index:03}\"}},\"expected\":{{\"label\":\"accepted\"}}}}\n"
+        ));
+        outputs.push_str(&format!(
+            "{{\"case_id\":\"case-{index:03}\",\"status\":\"ok\",\"parsed_output\":{{\"label\":\"accepted\",\"reason\":\"deterministic\"}}}}\n"
+        ));
+    }
+    std::fs::write(project.join("data/golden.jsonl"), dataset).unwrap();
+    std::fs::write(project.join("outputs/baseline.jsonl"), &outputs).unwrap();
+    std::fs::write(project.join("outputs/candidate.jsonl"), outputs).unwrap();
+    let config = std::fs::read_to_string(project.join("structtrace.yaml")).unwrap();
+    let config = config.split_once("gate:").unwrap().0.to_owned()
+        + r#"gate:
+  mode: release
+  min_cases: 100
+  min_unique_cases: 100
+  max_duplicate_case_rate: 0.01
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.01
+  max_primary_component_not_applicable_rate: 0.0
+  max_primary_component_unscored_rate: 0.0
+  max_deployment_regression_pp: 1.0
+  min_candidate_deployment_success_rate: 0.95
+  min_candidate_parse_validity: 0.99
+  min_candidate_schema_validity: 0.99
+  max_candidate_valid_but_wrong_rate: 0.02
+"#;
+    std::fs::write(project.join("structtrace.yaml"), config).unwrap();
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "run",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let release_check = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "release-check",
+            "latest",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(release_check.code(), Some(0));
+}
+
+#[test]
+fn ordinary_jsonl_import_generates_a_runnable_strict_project() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    let project = root.path().join("imported");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("dataset.jsonl"),
+        "{\"document_id\":\"doc-1\",\"payload\":{\"text\":\"invoice alpha\"},\"ground_truth\":{\"vendor\":\"Acme\",\"total\":\"10.00\"}}\n{\"document_id\":\"doc-2\",\"payload\":{\"text\":\"invoice beta\"},\"ground_truth\":{\"vendor\":\"Beta\",\"total\":\"20.00\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("baseline.jsonl"),
+        "{\"record_id\":\"doc-1\",\"result\":{\"vendor\":\" ACME \",\"total\":\"10.00\"}}\n{\"record_id\":\"doc-2\",\"result\":{\"vendor\":\"Beta\",\"total\":\"20.00\"}}\n",
+    )
+    .unwrap();
+    std::fs::copy(
+        source.join("baseline.jsonl"),
+        source.join("candidate.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("schema.json"),
+        r#"{"type":"object","required":["vendor","total"],"properties":{"vendor":{"type":"string"},"total":{"type":"string"}},"additionalProperties":false}"#,
+    )
+    .unwrap();
+    let initialized = binary()
+        .args([
+            "init",
+            project.to_str().unwrap(),
+            "--from-outputs",
+            "--dataset",
+            source.join("dataset.jsonl").to_str().unwrap(),
+            "--baseline",
+            source.join("baseline.jsonl").to_str().unwrap(),
+            "--candidate",
+            source.join("candidate.jsonl").to_str().unwrap(),
+            "--schema",
+            source.join("schema.json").to_str().unwrap(),
+            "--dataset-id-pointer",
+            "/document_id",
+            "--dataset-input-pointer",
+            "/payload",
+            "--dataset-expected-pointer",
+            "/ground_truth",
+            "--output-id-pointer",
+            "/record_id",
+            "--output-value-pointer",
+            "/result",
+            "--field-evaluator",
+            "/vendor=normalized_string",
+            "--field-evaluator",
+            "/total=decimal_exact",
+        ])
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    assert!(project.join("ONBOARDING.md").is_file());
+    for command in [["doctor", "--strict"].as_slice(), ["run"].as_slice()] {
+        assert!(
+            binary()
+                .arg("--quiet")
+                .arg("--project-root")
+                .arg(&project)
+                .args(command)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "replay",
+                "latest",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]

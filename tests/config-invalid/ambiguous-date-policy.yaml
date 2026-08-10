@@ -1,0 +1,8 @@
+evaluators:
+  - id: ambiguous_date
+    kind: canonical_date
+    pointer: /date
+    expected_pointer: /date
+    formats: [dmy_slash, mdy_slash]
+outcomes:
+  semantic_correct: {all_of: [ambiguous_date]}

@@ -26,4 +26,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "imported_artifact_json"
+path = "fuzz_targets/imported_artifact_json.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

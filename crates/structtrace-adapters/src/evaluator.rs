@@ -822,8 +822,9 @@ fn parse_response_inner(
                     .as_deref()
                     .is_some_and(|message| !message.trim().is_empty())
         }
-        EvaluationStatus::Error => score != Some(1.0) && !has_resolved,
-        EvaluationStatus::NotApplicable => !has_resolved,
+        EvaluationStatus::Error | EvaluationStatus::NotApplicable => {
+            score.is_none() && !has_resolved
+        }
     };
     if !consistent {
         return error(
@@ -972,6 +973,46 @@ mod tests {
             );
             assert_eq!(result.status, EvaluationStatus::Error);
         }
+    }
+
+    #[test]
+    fn error_and_not_applicable_require_a_null_diagnostic_score() {
+        for status in ["error", "not_applicable"] {
+            let response = serde_json::json!({
+                "protocol": EVALUATOR_PROTOCOL,
+                "protocol_version": structtrace_core::PROTOCOL_VERSION,
+                "evaluator_id": "business",
+                "case_id": "one",
+                "status": status,
+                "score": 0.25
+            });
+            let result = parse_response_for_case(
+                "business",
+                "one",
+                serde_json::to_string(&response).unwrap().as_bytes(),
+            );
+            assert_eq!(result.status, EvaluationStatus::Error);
+            assert!(result.message.contains("contradictory"));
+        }
+    }
+
+    #[test]
+    fn status_is_authoritative_and_score_is_diagnostic() {
+        let response = serde_json::json!({
+            "protocol": EVALUATOR_PROTOCOL,
+            "protocol_version": structtrace_core::PROTOCOL_VERSION,
+            "evaluator_id": "business",
+            "case_id": "one",
+            "status": "passed",
+            "score": 0.0
+        });
+        let result = parse_response_for_case(
+            "business",
+            "one",
+            serde_json::to_string(&response).unwrap().as_bytes(),
+        );
+        assert_eq!(result.status, EvaluationStatus::Passed);
+        assert_eq!(result.score, Some(0.0));
     }
 
     #[cfg(unix)]

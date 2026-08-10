@@ -84,8 +84,8 @@ The offline report contains no CDN assets, analytics, telemetry, or remote runti
 Large runs use a searchable case index, 50-case lazy-loaded chunks, and 25-case pagination rather
 than embedding every case into the summary page. A one-file export is produced only below its
 configured size ceiling. The checked-in [scale validation](docs/src/report-scale-validation.md)
-covers 1,000 paired nested invoice records and states the measured envelope and remaining browser
-validation gap.
+covers both 1,000 paired nested invoice reports and a complete 10,000-case recorded run/replay
+measurement, and states the remaining ingestion and browser-validation limits.
 
 ## Install
 
@@ -141,12 +141,30 @@ Existing retained outputs can be onboarded without inventing correctness semanti
 ```bash
 structtrace init comparison --from-outputs \
   --dataset data.jsonl --baseline baseline.jsonl --candidate candidate.jsonl \
-  --schema schema.json --correctness-pointer /invoice_number \
-  --correctness-pointer /total --gate-mode regression
+  --schema schema.json \
+  --dataset-id-pointer /document_id \
+  --dataset-input-pointer /payload \
+  --dataset-expected-pointer /ground_truth \
+  --output-id-pointer /record_id \
+  --output-value-pointer /result \
+  --field-evaluator /vendor_name=normalized_string \
+  --field-evaluator /invoice_date=canonical_date:iso,dmy_slash \
+  --field-evaluator /total=decimal_exact \
+  --keyed-array '/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01' \
+  --financial-invariants --gate-mode regression
 ```
 
-The initializer validates and snapshots each input. You must select whole-object equality or exact
-JSON Pointers; StructTrace never treats schema validity as inferred task correctness.
+The importer accepts canonical StructTrace envelopes and ordinary JSONL such as
+`{"record_id":"invoice-1","result":{...}}`. It validates and snapshots every bounded source,
+normalizes ordinary output rows, and writes `ONBOARDING.md` with expected/baseline/candidate field
+coverage and observed types. Its field union comes from the external schema and all three observed
+sources, so a field newly omitted by the candidate remains visible. In a terminal, omitted paths
+and field semantics are prompted; automation uses the explicit flags above.
+
+Supported guided choices include exact JSON or pointers, normalized strings, canonical dates,
+exact integers, exact/tolerant decimals, keyed arrays with per-field comparators, and opt-in invoice
+financial invariants. Suggestions never become semantic truth silently. A new imported workload
+defaults to a Regression gate; Release mode still requires the complete safe release profile.
 
 Bundled demos and research fixtures are isolated from production history. `latest` always means
 the latest completed production run; `latest-demo`, `latest-research`, and `latest-any` are
@@ -248,7 +266,8 @@ gate:
     min_coverage: 1.0
 ```
 
-Deployment automation must call `structtrace gate latest --require-release-authorization`.
+Deployment automation must call `structtrace release-check latest`. It performs complete replay and
+returns zero only for an explicitly authorized Release-mode decision.
 Advisory and regression passes remain useful analysis results but can never authorize release.
 
 ```bash
@@ -256,6 +275,7 @@ structtrace gate latest                 # human output
 structtrace gate latest --format json   # automation
 structtrace gate latest --format github # Actions annotations
 structtrace gate latest --verify replay # high-assurance CI
+structtrace release-check latest        # deployment authorization only
 ```
 
 The default gate verifies the manifest-bound `summary.json` hash before applying the stored
@@ -328,7 +348,7 @@ limits:
   max_dataset_bytes: 268435456
   max_recorded_output_bytes: 536870912
   max_schema_bytes: 16777216
-  max_cases: 1000000
+  max_cases: 10000
   max_jsonl_line_bytes: 16777216
   max_replay_artifact_bytes: 536870912
   max_output_bytes_per_case: 4194304
@@ -339,6 +359,10 @@ limits:
 ```
 
 Oversized command, Python, or provider output fails closed and remains in the denominator. Report truncation changes only the HTML view, never the scored artifact.
+The default case ceiling is the measured 10,000-case v1 envelope. The 100,000-case compiled ceiling
+is opt-in and is not advertised as measured capacity. Dataset and recorded-output sources are
+whole-file but bounded in v1, so memory still scales with the configured source-byte limits; the
+tool does not claim streaming or million-row ingestion.
 
 ## Research foundation, without universal claims
 

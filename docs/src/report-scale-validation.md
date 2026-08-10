@@ -1,6 +1,6 @@
 # Report scale validation
 
-Report format 3 separates the aggregate shell from case data:
+Report format 4 separates the aggregate shell from case data:
 
 ```text
 report/index.html
@@ -44,3 +44,30 @@ remain available for bulk analysis.
 Clean-browser open time and interactive filter latency have not yet been recorded across the
 release operating-system matrix. That evidence belongs to release-candidate VM and external-user
 validation and must not be inferred from the generator benchmark.
+
+## Complete 10,000-case recorded workflow
+
+`scripts/measure-recorded-scale.py` deterministically generates 10,000 matched cases and measures
+the release binary through strict ingestion, schema validation, paired scoring, SQLite/artifact and
+report creation, followed by complete replay. The checked-in result records source sizes, generated
+artifact bytes, binary digest, command exit codes, wall time, and peak RSS when `/usr/bin/time` is
+available.
+
+```bash
+cargo build --workspace --release --locked
+python3 scripts/measure-recorded-scale.py \
+  --cases 10000 \
+  --output benchmarks/recorded-output-10000/result.json
+```
+
+The default `limits.max_cases` is therefore 10,000. The compiled 100,000-case ceiling is an
+explicit opt-in boundary, not a measured promise.
+
+## Input-memory boundary
+
+The v1 dataset and recorded-output readers enforce byte, line, and case ceilings before parsing and
+avoid redundant source rereads during guided import. They still retain each complete bounded source
+artifact in memory to bind the exact executed bytes into the run. Memory therefore scales with the
+configured dataset and output byte ceilings. StructTrace does not claim streaming ingestion or
+million-row capacity; larger sources require measurement in the intended environment or lower
+source-byte limits.

@@ -69,7 +69,7 @@ pub const HARD_MAX_RECORDED_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// Hard ceiling for an external JSON Schema.
 pub const HARD_MAX_SCHEMA_BYTES: usize = 64 * 1024 * 1024;
 /// Hard ceiling for matched case count.
-pub const HARD_MAX_CASES: usize = 10_000_000;
+pub const HARD_MAX_CASES: usize = 100_000;
 /// Hard ceiling for one JSONL record.
 pub const HARD_MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
 /// Hard ceiling for one derived artifact consumed during replay.
@@ -120,7 +120,7 @@ impl Default for LimitsConfig {
             max_dataset_bytes: 256 * 1024 * 1024,
             max_recorded_output_bytes: 512 * 1024 * 1024,
             max_schema_bytes: 16 * 1024 * 1024,
-            max_cases: 1_000_000,
+            max_cases: 10_000,
             max_jsonl_line_bytes: 16 * 1024 * 1024,
             max_replay_artifact_bytes: 512 * 1024 * 1024,
             max_output_bytes_per_case: 4 * 1024 * 1024,
@@ -869,6 +869,8 @@ pub struct ReportConfig {
     pub include_prompts: bool,
     /// Initial case filter.
     pub default_case_filter: String,
+    /// Explicit redacted case pointers included in the local search index.
+    pub search_pointers: Vec<String>,
 }
 
 impl Default for ReportConfig {
@@ -878,6 +880,7 @@ impl Default for ReportConfig {
             include_raw_outputs: true,
             include_prompts: false,
             default_case_filter: "discordant".to_owned(),
+            search_pointers: Vec::new(),
         }
     }
 }
@@ -929,7 +932,7 @@ impl Config {
                 .cloned()
                 .collect::<Vec<_>>();
             return Err(CoreError::Configuration(format!(
-                "version 1 supports exactly baseline and candidate variants; unsupported variants: {}",
+                "configuration version {CONFIG_VERSION} supports exactly baseline and candidate variants; unsupported variants: {}",
                 extras.join(", ")
             )));
         }
@@ -1145,6 +1148,14 @@ impl Config {
                 "unsupported report.default_case_filter `{}`",
                 config.report.default_case_filter
             )));
+        }
+        if config.report.search_pointers.len() > 32 {
+            return Err(CoreError::Configuration(
+                "report.search_pointers supports at most 32 pointers".to_owned(),
+            ));
+        }
+        for pointer in &config.report.search_pointers {
+            validate_json_pointer("report.search_pointers", pointer)?;
         }
         Ok(config)
     }
@@ -1901,6 +1912,19 @@ mod tests {
     }
 
     #[test]
+    fn variant_count_error_names_the_current_configuration_version() {
+        let mut config = minimal();
+        config.variants.insert(
+            "shadow".to_owned(),
+            VariantConfig::Recorded {
+                path: "shadow.jsonl".into(),
+            },
+        );
+        let error = Config::validate(config).unwrap_err().to_string();
+        assert!(error.contains(&format!("configuration version {CONFIG_VERSION}")));
+    }
+
+    #[test]
     fn shipped_configurations_match_schema_and_runtime_validation() {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../schemas/structtrace.schema.json")).unwrap();
@@ -2296,5 +2320,90 @@ mod tests {
         config.gate.min_candidate_schema_validity = Some(1.0);
         config.gate.max_candidate_valid_but_wrong_rate = Some(0.02);
         Config::validate(config).unwrap();
+    }
+
+    #[test]
+    fn checked_configuration_corpus_has_editor_runtime_parity() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/structtrace.schema.json")).unwrap();
+        let validator = jsonschema::options().build(&schema).unwrap();
+        let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests");
+        for (directory, expected) in [("config-valid", true), ("config-invalid", false)] {
+            for entry in std::fs::read_dir(corpus_root.join(directory)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let overlay: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let overlay: serde_json::Value = serde_json::to_value(overlay).unwrap();
+                let base: serde_yaml_ng::Value = serde_yaml_ng::from_str(include_str!(
+                    "../../../examples/recorded-output-comparison/structtrace.yaml"
+                ))
+                .unwrap();
+                let mut value = serde_json::to_value(base).unwrap();
+                for (key, item) in overlay.as_object().unwrap() {
+                    value[key] = item.clone();
+                }
+                let schema_errors = validator
+                    .iter_errors(&value)
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>();
+                let schema_valid = schema_errors.is_empty();
+                let runtime_valid = serde_json::from_value::<Config>(value)
+                    .map_err(|error| error.to_string())
+                    .and_then(|config| Config::validate(config).map_err(|error| error.to_string()))
+                    .is_ok();
+                assert_eq!(
+                    schema_valid,
+                    expected,
+                    "unexpected editor-schema result for {}: {schema_errors:?}",
+                    path.display(),
+                );
+                assert_eq!(
+                    runtime_valid,
+                    expected,
+                    "unexpected runtime result for {}",
+                    path.display()
+                );
+                assert_eq!(
+                    schema_valid,
+                    runtime_valid,
+                    "editor/runtime drift for {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn documented_cross_field_configuration_corpus_fails_runtime_validation() {
+        let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/config-runtime-invalid");
+        for entry in std::fs::read_dir(corpus_root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                continue;
+            }
+            let overlay: serde_yaml_ng::Value =
+                serde_yaml_ng::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let overlay: serde_json::Value = serde_json::to_value(overlay).unwrap();
+            let base: serde_yaml_ng::Value = serde_yaml_ng::from_str(include_str!(
+                "../../../examples/recorded-output-comparison/structtrace.yaml"
+            ))
+            .unwrap();
+            let mut value = serde_json::to_value(base).unwrap();
+            for (key, item) in overlay.as_object().unwrap() {
+                value[key] = item.clone();
+            }
+            let result = serde_json::from_value::<Config>(value)
+                .map_err(|error| error.to_string())
+                .and_then(|config| Config::validate(config).map_err(|error| error.to_string()));
+            assert!(
+                result.is_err(),
+                "runtime unexpectedly accepted {}",
+                path.display()
+            );
+        }
     }
 }

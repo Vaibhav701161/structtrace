@@ -143,7 +143,26 @@ impl RecordedOutputs {
     /// Read recorded outputs under configured artifact and JSONL-line ceilings.
     pub fn read_bounded(path: &Path, dataset: &Dataset, limits: &LimitsConfig) -> Result<Self> {
         let bytes = read_bounded(path, limits.max_recorded_output_bytes, "recorded output")?;
-        let text = std::str::from_utf8(&bytes).map_err(|error| CoreError::RecordedOutput {
+        Self::from_bytes_bounded(&bytes, dataset, limits)
+    }
+
+    /// Parse already-captured canonical recorded-output JSONL under explicit limits.
+    pub fn from_bytes_bounded(
+        bytes: &[u8],
+        dataset: &Dataset,
+        limits: &LimitsConfig,
+    ) -> Result<Self> {
+        if bytes.len() > limits.max_recorded_output_bytes {
+            return Err(CoreError::RecordedOutput {
+                line: 1,
+                message: format!(
+                    "recorded output is {} bytes; limit is {}",
+                    bytes.len(),
+                    limits.max_recorded_output_bytes
+                ),
+            });
+        }
+        let text = std::str::from_utf8(bytes).map_err(|error| CoreError::RecordedOutput {
             line: 1,
             message: format!("output file is not valid UTF-8: {error}"),
         })?;
@@ -268,8 +287,8 @@ impl RecordedOutputs {
             .collect();
         Ok(Self {
             rows,
-            source_hash: hash_bytes(&bytes),
-            source_bytes: bytes,
+            source_hash: hash_bytes(bytes),
+            source_bytes: bytes.to_vec(),
         })
     }
 }

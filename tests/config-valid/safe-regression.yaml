@@ -1,0 +1,10 @@
+gate:
+  mode: regression
+  min_cases: 100
+  min_unique_cases: 100
+  max_duplicate_case_rate: 0.01
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.01
+  max_primary_component_not_applicable_rate: 0.0
+  max_primary_component_unscored_rate: 0.0
+  max_deployment_regression_pp: 1.0

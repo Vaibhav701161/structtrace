@@ -48,7 +48,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use structtrace_core::{dataset::VariantCase, output::OutputStatus};
+    use structtrace_core::{
+        dataset::{ExecutionToken, VariantCase},
+        output::OutputStatus,
+    };
 
     use super::*;
 
@@ -70,11 +73,11 @@ mod tests {
     }
 
     fn case() -> VariantCase {
-        VariantCase {
-            id: "one".to_owned(),
-            input: json!({"text": "hello"}),
-            metadata: None,
-        }
+        VariantCase::from_parts(
+            ExecutionToken::new("python-test", 0),
+            json!({"text": "hello"}),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -347,10 +350,12 @@ async def leaves_task(case):
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, mode)| VariantCase {
-            id: format!("case-{index}"),
-            input: json!({"mode": mode}),
-            metadata: None,
+        .map(|(index, mode)| {
+            VariantCase::from_parts(
+                ExecutionToken::new("normalization-test", index),
+                json!({"mode": mode}),
+                None,
+            )
         })
         .collect::<Vec<_>>();
         let run = run_python(

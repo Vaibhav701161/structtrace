@@ -41,6 +41,7 @@ pub struct Case {
 /// Expected values and evaluator-only metadata are structurally absent, so an
 /// adapter cannot leak them accidentally through serialization or templates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct VariantCase {
     /// Opaque transport token. This is never the dataset case ID.
     pub id: String,
@@ -51,18 +52,37 @@ pub struct VariantCase {
     pub metadata: Option<Value>,
 }
 
-impl From<&Case> for VariantCase {
-    fn from(case: &Case) -> Self {
-        let stimulus = serde_json::json!({
-            "input": case.input,
-            "model_visible_metadata": case.model_visible_metadata,
-        });
-        let stimulus_hash = hash_canonical_json(&stimulus)
-            .expect("JSON values always have a canonical StructTrace encoding");
+/// Explicit run-scoped execution identity. It cannot be derived implicitly from case content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionToken(String);
+
+impl ExecutionToken {
+    /// Derive an opaque row token from a run nonce and the row's ordinal.
+    pub fn new(run_nonce: &str, ordinal: usize) -> Self {
+        let digest = hash_bytes(format!("{run_nonce}\0{ordinal}").as_bytes());
+        Self(format!("stx-{}", &digest[..32]))
+    }
+}
+
+impl VariantCase {
+    /// Create the restricted adapter view with an explicit execution token.
+    pub fn for_execution(case: &Case, token: ExecutionToken) -> Self {
         Self {
-            id: format!("stx-{}", &stimulus_hash[..24]),
+            id: token.0,
             input: case.input.clone(),
             metadata: case.model_visible_metadata.clone(),
+        }
+    }
+
+    /// Create a restricted adapter view from already-separated values.
+    ///
+    /// This is primarily useful to adapter integrators and tests. The transport
+    /// token remains mandatory and must come from the current execution context.
+    pub fn from_parts(token: ExecutionToken, input: Value, metadata: Option<Value>) -> Self {
+        Self {
+            id: token.0,
+            input,
+            metadata,
         }
     }
 }
@@ -255,6 +275,16 @@ mod tests {
     }
 
     #[test]
+    fn execution_tokens_are_row_and_run_scoped() {
+        let first = ExecutionToken::new("run-a", 0);
+        let repeated = ExecutionToken::new("run-a", 1);
+        let another_run = ExecutionToken::new("run-b", 0);
+        assert_ne!(first, repeated);
+        assert_ne!(first, another_run);
+        assert!(!first.0.contains("customer-case-id"));
+    }
+
+    #[test]
     fn duplicate_ids_fail_with_line_number() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, r#"{{"id":"same","input":1}}"#).unwrap();
@@ -289,7 +319,8 @@ mod tests {
     fn evaluation_metadata_is_not_model_visible() {
         let bytes = b"{\"id\":\"a\",\"input\":{},\"expected\":{\"label\":\"gold\"},\"model_visible_metadata\":{\"locale\":\"en\"},\"metadata\":{\"private_label\":\"billing\"}}\n";
         let dataset = Dataset::from_bytes(bytes, &DatasetFields::default()).unwrap();
-        let variant = VariantCase::from(&dataset.cases[0]);
+        let variant =
+            VariantCase::for_execution(&dataset.cases[0], ExecutionToken::new("test-run", 0));
         let encoded = serde_json::to_value(variant).unwrap();
         assert_eq!(
             encoded.pointer("/metadata/locale"),

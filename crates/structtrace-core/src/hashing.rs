@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, io::Read, path::Path};
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{CoreError, Result, error::read_error};
@@ -55,6 +55,17 @@ pub fn read_bounded(path: &Path, maximum: usize, label: &str) -> Result<Vec<u8>>
         )));
     }
     Ok(bytes)
+}
+
+/// Strictly decode a user-controlled JSON artifact under an explicit byte ceiling.
+pub fn read_json_bounded<T: DeserializeOwned>(
+    path: &Path,
+    maximum: usize,
+    label: &str,
+) -> Result<T> {
+    let bytes = read_bounded(path, maximum, label)?;
+    crate::strict_json::from_slice(&bytes)
+        .map_err(|error| CoreError::Artifact(format!("invalid {label} JSON: {error}")))
 }
 
 /// Serialize a value with recursively sorted object keys.

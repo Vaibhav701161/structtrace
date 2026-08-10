@@ -521,10 +521,7 @@ fn transition_name(baseline: bool, candidate: bool) -> &'static str {
 
 #[cfg(test)]
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    structtrace_core::strict_json::from_slice(&bytes)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    read_json_bounded(path, 64 * 1024 * 1024, "test replay artifact")
 }
 
 fn read_json_bounded<T: serde::de::DeserializeOwned>(

@@ -51,7 +51,7 @@
         "max_dataset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824, "default": 268435456},
         "max_recorded_output_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 536870912},
         "max_schema_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
-        "max_cases": {"type": "integer", "minimum": 1, "maximum": 10000000, "default": 1000000},
+        "max_cases": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 10000},
         "max_jsonl_line_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
         "max_replay_artifact_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 536870912},
         "max_output_bytes_per_case": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 4194304},
@@ -141,7 +141,21 @@
         {
           "if": {"properties": {"mode": {"const": "release"}}, "required": ["mode"]},
           "then": {
-            "required": ["max_deployment_regression_pp", "min_candidate_deployment_success_rate", "min_candidate_parse_validity", "min_candidate_schema_validity", "max_candidate_valid_but_wrong_rate"]
+            "required": ["max_deployment_regression_pp", "min_candidate_deployment_success_rate", "min_candidate_parse_validity", "min_candidate_schema_validity", "max_candidate_valid_but_wrong_rate"],
+            "properties": {
+              "min_cases": {"type": "integer", "minimum": 100},
+              "min_unique_cases": {"type": "integer", "minimum": 100},
+              "max_duplicate_case_rate": {"type": "number", "maximum": 0.01},
+              "min_primary_fully_evaluated_rate": {"type": "number", "minimum": 0.99},
+              "max_primary_component_error_rate": {"type": "number", "maximum": 0.01},
+              "max_primary_component_not_applicable_rate": {"const": 0},
+              "max_primary_component_unscored_rate": {"const": 0},
+              "max_deployment_regression_pp": {"type": "number", "maximum": 1.0},
+              "min_candidate_deployment_success_rate": {"type": "number", "minimum": 0.95},
+              "min_candidate_parse_validity": {"type": "number", "minimum": 0.99},
+              "min_candidate_schema_validity": {"type": "number", "minimum": 0.99},
+              "max_candidate_valid_but_wrong_rate": {"type": "number", "maximum": 0.02}
+            }
           }
         }
       ],
@@ -178,6 +192,7 @@
         "title": {"type": ["string", "null"]},
         "include_raw_outputs": {"type": "boolean", "default": true},
         "include_prompts": {"type": "boolean", "default": false},
+        "search_pointers": {"type": "array", "items": {"type": "string", "pattern": "^(|/(?:[^~]|~[01])*)$"}, "maxItems": 32, "uniqueItems": true},
         "default_case_filter": {"enum": ["all", "discordant", "baseline_only_pass", "candidate_only_pass", "both_fail", "valid_but_wrong", "parse_failure", "schema_failure", "adapter_error", "evaluator_error", "not_applicable", "unscored"], "default": "discordant"}
       }
     }
