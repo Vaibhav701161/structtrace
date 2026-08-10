@@ -154,8 +154,8 @@ fn run_recorded_with_snapshot(
         config.limits.max_schema_bytes,
         "schema",
     )?;
-    let schema_value: Value = serde_json::from_slice(&schema_bytes)
-        .with_context(|| format!("schema {} is not valid JSON", schema_path.display()))?;
+    let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)
+        .with_context(|| format!("schema {} is not valid strict JSON", schema_path.display()))?;
     compile_schema(&schema_value)?;
 
     let baseline = read_recorded_variant(
@@ -215,22 +215,10 @@ fn finalize_prepared_kind(
     config: Config,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
-    mut baseline: PreparedVariant,
-    mut candidate: PreparedVariant,
+    baseline: PreparedVariant,
+    candidate: PreparedVariant,
     run_kind: RunKind,
 ) -> anyhow::Result<CompletedRun> {
-    apply_storage_retention(
-        &mut baseline,
-        config.storage.retain_raw_outputs,
-        config.storage.retain_provider_responses,
-        config.report.include_prompts,
-    )?;
-    apply_storage_retention(
-        &mut candidate,
-        config.storage.retain_raw_outputs,
-        config.storage.retain_provider_responses,
-        config.report.include_prompts,
-    )?;
     finalize_prepared_for_run(
         project_root,
         config_source_bytes,
@@ -253,8 +241,8 @@ pub fn finalize_prepared_for_run(
     config: Config,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
-    baseline: PreparedVariant,
-    candidate: PreparedVariant,
+    mut baseline: PreparedVariant,
+    mut candidate: PreparedVariant,
     existing_run_id: Option<String>,
     implementation_fingerprint: Option<String>,
     run_kind: RunKind,
@@ -273,8 +261,8 @@ pub fn finalize_prepared_for_run(
             }
         }
     }
-    let schema_value: Value =
-        serde_json::from_slice(&schema_bytes).context("retained schema is not valid JSON")?;
+    let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)
+        .context("retained schema is not valid strict JSON")?;
     let schema = compile_schema(&schema_value)?;
     let storage_root = resolve(project_root, &config.storage.root);
     let (run_id, store) = if let Some(run_id) = existing_run_id {
@@ -310,25 +298,45 @@ pub fn finalize_prepared_for_run(
     let evaluator_bridge = materialize_evaluator_bridge(&storage_root)?;
     let mut evaluator_stderr = Vec::new();
     let mut evaluator_receipts = Vec::new();
+    let mut analysis_baseline = baseline.clone();
+    let mut analysis_candidate = candidate.clone();
+    sanitize_evaluation_view(&mut analysis_baseline);
+    sanitize_evaluation_view(&mut analysis_candidate);
     let (baseline_external_rows, candidate_external_rows) = execute_external_evaluator_matrix(
         &config,
         &dataset,
-        &baseline,
-        &candidate,
+        &analysis_baseline,
+        &analysis_candidate,
         project_root,
         &evaluator_bridge,
         &mut evaluator_stderr,
         &mut evaluator_receipts,
     );
+    // Evaluation always consumes the immutable captured envelopes. Retention is a one-way
+    // persistence transformation and must never feed back into scoring or release decisions.
+    apply_storage_retention(
+        &mut baseline,
+        config.storage.retain_raw_outputs,
+        config.storage.retain_provider_responses,
+        config.report.include_prompts,
+    )?;
+    apply_storage_retention(
+        &mut candidate,
+        config.storage.retain_raw_outputs,
+        config.storage.retain_provider_responses,
+        config.report.include_prompts,
+    )?;
     for index in 0..dataset.cases.len() {
         let case = &dataset.cases[index];
+        let baseline_analysis_output = &analysis_baseline.rows[index];
+        let candidate_analysis_output = &analysis_candidate.rows[index];
         let baseline_output = &baseline.rows[index];
         let candidate_output = &candidate.rows[index];
         let baseline_external = &baseline_external_rows[index];
         let candidate_external = &candidate_external_rows[index];
         let baseline_evaluation = evaluate_case_with_external(
             case,
-            baseline_output,
+            baseline_analysis_output,
             &schema,
             &config.evaluators,
             &config.outcomes,
@@ -337,7 +345,7 @@ pub fn finalize_prepared_for_run(
         );
         let candidate_evaluation = evaluate_case_with_external(
             case,
-            candidate_output,
+            candidate_analysis_output,
             &schema,
             &config.evaluators,
             &config.outcomes,
@@ -353,8 +361,8 @@ pub fn finalize_prepared_for_run(
             baseline_output: baseline_output.clone(),
             candidate_output: candidate_output.clone(),
             transition: transition_name(
-                baseline_evaluation.primary_pass,
-                candidate_evaluation.primary_pass,
+                baseline_evaluation.deployment_success,
+                candidate_evaluation.deployment_success,
             )
             .to_owned(),
             baseline_evaluation,
@@ -367,11 +375,31 @@ pub fn finalize_prepared_for_run(
     store.insert_paired_result(&config.analysis.primary_outcome, &summary.paired)?;
 
     let run_dir = store.run_dir().to_owned();
+    let original_config =
+        Config::from_bytes(&PathBuf::from("configuration.source"), &config_source_bytes)?;
+    let variants_changed =
+        hash_canonical_json(&original_config.variants)? != hash_canonical_json(&config.variants)?;
+    let override_record = serde_json::json!({
+        "version": 1,
+        "invocation_kind": if original_config.dataset.path != config.dataset.path
+            || original_config.schema.path != config.schema.path
+            || variants_changed
+        { "compare_with_overrides" } else { "configured_run" },
+        "original_configuration_hash": hash_bytes(&config_source_bytes),
+        "effective_configuration_hash": hash_canonical_json(&config)?,
+        "overrides": {
+            "dataset": (original_config.dataset.path != config.dataset.path).then(|| config.dataset.path.display().to_string()),
+            "schema": (original_config.schema.path != config.schema.path).then(|| config.schema.path.display().to_string()),
+            "baseline": variants_changed.then(|| config.variants.get("baseline")),
+            "candidate": variants_changed.then(|| config.variants.get("candidate")),
+        }
+    });
     atomic_write_json(&run_dir.join("inputs/configuration.json"), &config)?;
     atomic_write(
         &run_dir.join("inputs/configuration.source"),
         &config_source_bytes,
     )?;
+    atomic_write_json(&run_dir.join("inputs/invocation.json"), &override_record)?;
     atomic_write(&run_dir.join("inputs/dataset.jsonl"), &dataset.source_bytes)?;
     atomic_write(&run_dir.join("inputs/schema.json"), &schema_bytes)?;
     atomic_write(
@@ -491,6 +519,7 @@ pub fn finalize_prepared_for_run(
     for relative in [
         "inputs/configuration.json",
         "inputs/configuration.source",
+        "inputs/invocation.json",
         "inputs/dataset.jsonl",
         "inputs/schema.json",
         "inputs/baseline.jsonl",
@@ -753,33 +782,64 @@ pub fn apply_storage_retention(
 ) -> anyhow::Result<()> {
     for row in &mut prepared.rows {
         if !retain_raw_outputs {
-            if row.parsed_output.is_none() {
-                if let Some(raw) = row.raw_output.as_deref() {
-                    match serde_json::from_str(raw) {
-                        Ok(parsed) => row.parsed_output = Some(parsed),
-                        Err(error) => {
-                            let metadata = if row.metadata.is_object() {
-                                row.metadata.as_object_mut().expect("checked object")
-                            } else {
-                                let original = std::mem::replace(
-                                    &mut row.metadata,
-                                    Value::Object(Default::default()),
-                                );
-                                let metadata = row.metadata.as_object_mut().expect("set object");
-                                if !original.is_null() {
-                                    metadata.insert(
-                                        "_structtrace_original_metadata".to_owned(),
-                                        original,
-                                    );
-                                }
-                                metadata
-                            };
-                            metadata.insert(
-                                "_structtrace_retained_parse_error".to_owned(),
-                                Value::String(error.to_string()),
-                            );
-                        }
-                    }
+            let raw_hash = row
+                .raw_output
+                .as_deref()
+                .map(|raw| hash_bytes(raw.as_bytes()));
+            let strict_result = row.raw_output.as_deref().map_or_else(
+                || {
+                    row.parsed_output
+                        .clone()
+                        .ok_or_else(|| "adapter did not return an output".to_owned())
+                },
+                |raw| {
+                    structtrace_core::strict_json::value_from_str(raw.trim())
+                        .map_err(|error| error.to_string())
+                },
+            );
+            let metadata = if row.metadata.is_object() {
+                row.metadata.as_object_mut().expect("checked object")
+            } else {
+                let original =
+                    std::mem::replace(&mut row.metadata, Value::Object(Default::default()));
+                let metadata = row.metadata.as_object_mut().expect("set object");
+                if !original.is_null() {
+                    metadata.insert("_structtrace_original_metadata".to_owned(), original);
+                }
+                metadata
+            };
+            match strict_result {
+                Ok(parsed) => {
+                    let canonical_hash = hash_canonical_json(&parsed)?;
+                    row.parsed_output = Some(parsed);
+                    metadata.insert(
+                        "_structtrace_parse_receipt".to_owned(),
+                        serde_json::json!({
+                            "version": 1,
+                            "parser": "structtrace-strict-json-v1",
+                            "original_raw_hash": raw_hash,
+                            "strict_parse_status": "passed",
+                            "canonical_parsed_value_hash": canonical_hash,
+                        }),
+                    );
+                    metadata.remove("_structtrace_retained_parse_error");
+                }
+                Err(error) => {
+                    row.parsed_output = None;
+                    metadata.insert(
+                        "_structtrace_parse_receipt".to_owned(),
+                        serde_json::json!({
+                            "version": 1,
+                            "parser": "structtrace-strict-json-v1",
+                            "original_raw_hash": raw_hash,
+                            "strict_parse_status": "failed",
+                            "error": error,
+                        }),
+                    );
+                    metadata.insert(
+                        "_structtrace_retained_parse_error".to_owned(),
+                        Value::String(error),
+                    );
                 }
             }
             row.raw_output = None;
@@ -809,6 +869,29 @@ pub fn apply_storage_retention(
     }
     prepared.source_bytes = outputs_jsonl(&prepared.rows)?;
     Ok(())
+}
+
+/// Remove provider-owned diagnostic bodies from the immutable scoring view. This transformation
+/// is unconditional so a storage preference can never change evaluator inputs or outcomes.
+fn sanitize_evaluation_view(prepared: &mut PreparedVariant) {
+    for row in &mut prepared.rows {
+        if let Some(error) = row
+            .error
+            .as_mut()
+            .filter(|error| error.kind == "provider_error")
+        {
+            error.message = "Provider rejected the request.".to_owned();
+        }
+        if let Some(metadata) = row.metadata.as_object_mut() {
+            metadata.remove("provider_response");
+            metadata.remove("rendered_prompt");
+        }
+        for retry in &mut row.retries {
+            if let Some(object) = retry.as_object_mut() {
+                object.remove("response");
+            }
+        }
+    }
 }
 
 pub(crate) fn build_summary(
@@ -911,17 +994,17 @@ pub(crate) fn build_summary(
             )
         })
         .collect();
-    let independent_pairs = representative_records
+    let deployment_pairs = representative_records
         .iter()
         .map(|record| {
             (
-                record.baseline_evaluation.primary_pass,
-                record.candidate_evaluation.primary_pass,
+                record.baseline_evaluation.deployment_success,
+                record.candidate_evaluation.deployment_success,
             )
         })
         .collect::<Vec<_>>();
-    let independent_paired = paired_metrics(&independent_pairs);
-    let independent_bootstrap = if independent_pairs.is_empty() {
+    let deployment_paired = paired_metrics(&deployment_pairs);
+    let independent_bootstrap = if deployment_pairs.is_empty() {
         structtrace_core::statistics::BootstrapInterval {
             lower_pp: 0.0,
             upper_pp: 0.0,
@@ -931,7 +1014,7 @@ pub(crate) fn build_summary(
         }
     } else {
         paired_bootstrap(
-            &independent_pairs,
+            &deployment_pairs,
             config.analysis.bootstrap.samples,
             config.analysis.bootstrap.confidence,
             config.analysis.bootstrap.seed,
@@ -950,18 +1033,19 @@ pub(crate) fn build_summary(
         inference_policy: evidence_unit_label(&config.dataset.evidence_unit),
         groups: group_diagnostics,
     };
-    let jointly_scored = count_jointly_scored(representative_records.iter().map(|record| {
-        (
-            record
-                .baseline_evaluation
-                .outcomes
-                .get(&config.analysis.primary_outcome),
-            record
-                .candidate_evaluation
-                .outcomes
-                .get(&config.analysis.primary_outcome),
-        )
-    }));
+    let jointly_scored =
+        count_jointly_fully_evaluated(representative_records.iter().map(|record| {
+            (
+                record
+                    .baseline_evaluation
+                    .outcomes
+                    .get(&config.analysis.primary_outcome),
+                record
+                    .candidate_evaluation
+                    .outcomes
+                    .get(&config.analysis.primary_outcome),
+            )
+        }));
     let jointly_scored_semantic = semantic_effect(
         &representative_records,
         &config.analysis.primary_outcome,
@@ -975,12 +1059,7 @@ pub(crate) fn build_summary(
             duplicate_case_rate: evidence.exact_duplicate_row_rate,
             repeated_trial_groups: evidence.repeated_trial_groups,
             label_conflict_groups: evidence.label_conflict_groups,
-            primary_fully_evaluated_rate: rate(
-                baseline
-                    .primary_fully_evaluated
-                    .min(candidate.primary_fully_evaluated),
-                evidence.effective_inference_units,
-            ),
+            primary_fully_evaluated_rate: rate(jointly_scored, evidence.effective_inference_units),
             primary_component_error_rate: rate(
                 baseline.primary_component_errors,
                 baseline.primary_required_components,
@@ -1005,12 +1084,18 @@ pub(crate) fn build_summary(
                 candidate.primary_component_unscored,
                 candidate.primary_required_components,
             )),
-            primary: &independent_paired,
+            primary: &jointly_scored_semantic.paired,
+            deployment: &deployment_paired,
             baseline_valid_but_wrong_rate: rate(baseline.valid_but_wrong, baseline.total),
             candidate_valid_but_wrong_rate: rate(candidate.valid_but_wrong, candidate.total),
-            candidate_primary_success_rate: rate(candidate.primary_pass, candidate.total),
+            candidate_primary_success_rate: rate(candidate.semantic_success, candidate.total),
+            candidate_deployment_success_rate: rate(candidate.deployment_success, candidate.total),
             candidate_parse_validity: rate(candidate.parse_valid, candidate.total),
-            primary_lower_confidence_bound_pp: (independent_bootstrap.samples > 0)
+            primary_lower_confidence_bound_pp: jointly_scored_semantic
+                .bootstrap
+                .as_ref()
+                .map(|interval| interval.lower_pp),
+            deployment_lower_confidence_bound_pp: (independent_bootstrap.samples > 0)
                 .then_some(independent_bootstrap.lower_pp),
             candidate_schema_validity: rate(candidate.schema_valid, candidate.total),
             candidate_error_rate: rate(candidate.errors, candidate.total),
@@ -1060,12 +1145,13 @@ pub(crate) fn build_summary(
         descriptive_candidate,
         primary_jointly_scored: jointly_scored,
         evidence,
-        independent_paired: independent_paired.clone(),
+        independent_paired: deployment_paired.clone(),
+        deployment_paired: deployment_paired.clone(),
         independent_bootstrap: independent_bootstrap.clone(),
         jointly_scored_semantic,
         matched_operational,
         descriptive_matched_operational,
-        paired: independent_paired.clone(),
+        paired: deployment_paired.clone(),
         bootstrap: independent_bootstrap.clone(),
         gate,
         evaluator_passes,
@@ -1327,7 +1413,8 @@ fn semantic_effect(
 }
 
 fn binary_outcome(result: Option<&OutcomeResult>) -> Option<bool> {
-    match result.map(|result| result.truth) {
+    let result = result.filter(|result| result.fully_evaluated)?;
+    match Some(result.truth) {
         Some(OutcomeStatus::True) => Some(true),
         Some(OutcomeStatus::False) => Some(false),
         _ => None,
@@ -1335,6 +1422,9 @@ fn binary_outcome(result: Option<&OutcomeResult>) -> Option<bool> {
 }
 
 fn outcome_state(result: Option<&OutcomeResult>) -> &'static str {
+    if result.is_some_and(|result| !result.fully_evaluated) {
+        return "incomplete";
+    }
     match result.map(|result| result.truth) {
         Some(OutcomeStatus::True) => "true",
         Some(OutcomeStatus::False) => "false",
@@ -1440,6 +1530,9 @@ fn variant_summary(
         summary.parse_valid += usize::from(evaluation.parse_valid);
         summary.schema_valid += usize::from(evaluation.schema_valid);
         summary.primary_pass += usize::from(evaluation.primary_pass);
+        summary.structured_success += usize::from(evaluation.structured_success);
+        summary.semantic_success += usize::from(evaluation.semantic_success);
+        summary.deployment_success += usize::from(evaluation.deployment_success);
         let primary_result = evaluation.outcomes.get(primary_outcome);
         match primary_result.map(|result| result.truth) {
             Some(structtrace_core::evaluation::OutcomeStatus::True) => {}
@@ -1673,20 +1766,20 @@ fn evaluator_state_counts(
     counts
 }
 
-fn explicit_binary_outcome(result: Option<&OutcomeResult>) -> bool {
-    matches!(
-        result.map(|result| result.truth),
-        Some(OutcomeStatus::True | OutcomeStatus::False)
-    )
+fn explicit_fully_evaluated_binary_outcome(result: Option<&OutcomeResult>) -> bool {
+    result.is_some_and(|result| {
+        result.fully_evaluated && matches!(result.truth, OutcomeStatus::True | OutcomeStatus::False)
+    })
 }
 
-fn count_jointly_scored<'a>(
+fn count_jointly_fully_evaluated<'a>(
     pairs: impl IntoIterator<Item = (Option<&'a OutcomeResult>, Option<&'a OutcomeResult>)>,
 ) -> usize {
     pairs
         .into_iter()
         .filter(|(baseline, candidate)| {
-            explicit_binary_outcome(*baseline) && explicit_binary_outcome(*candidate)
+            explicit_fully_evaluated_binary_outcome(*baseline)
+                && explicit_fully_evaluated_binary_outcome(*candidate)
         })
         .count()
 }
@@ -1722,14 +1815,30 @@ fn transition_name(baseline: bool, candidate: bool) -> &'static str {
 }
 
 fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
-    let gate = summary.gate.status.label();
+    let gate = match summary.gate.gate_mode {
+        structtrace_core::config::GateMode::Advisory => format!(
+            "Advisory analysis {}. No release decision was made.",
+            summary.gate.status.label()
+        ),
+        structtrace_core::config::GateMode::Regression => format!(
+            "Regression check {}. This is not release authorization.",
+            summary.gate.status.label()
+        ),
+        structtrace_core::config::GateMode::Release if summary.gate.deployment_authorized => {
+            "Release gate passed. Deployment authorized.".to_owned()
+        }
+        structtrace_core::config::GateMode::Release => format!(
+            "Release gate {}. Do not deploy.",
+            summary.gate.status.label()
+        ),
+    };
     format!(
         "# StructTrace run: {project_name}\n\n\
-         **Release gate: {gate}**\n\n\
+         **{gate}**\n\n\
          Independent evidence-unit results (used for inference and gate):\n\n\
          | Metric | Baseline | Candidate |\n\
          |---|---:|---:|\n\
-         | Primary outcome | {}/{} | {}/{} |\n\
+         | Deployment success | {}/{} | {}/{} |\n\
          | Strict JSON | {}/{} | {}/{} |\n\
          | Schema valid | {}/{} | {}/{} |\n\
          | Valid but wrong | {}/{} | {}/{} |\n\n\
@@ -1741,16 +1850,16 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
          Effective inference denominator: **{}**  \n\
          Inference policy: **{}**  \n\
          Descriptive all-row primary results: baseline **{}/{}**, candidate **{}/{}** (no independence claim)  \n\
-         Independent paired difference: **{:+.2} percentage points**  \n\
+         Deployment-success paired difference: **{:+.2} percentage points**  \n\
          Candidate-only wins: **{}**  \n\
          Baseline-only wins: **{}**  \n\
          Exact McNemar p: **{:.6}**  \n\
          Independent paired bootstrap interval: **[{:.2}, {:.2}] pp**  \n\
          Jointly scored semantic pairs: **{}** ({} operational/error pairs excluded)  \n\
          Jointly scored semantic difference: **{:+.2} pp**\n",
-        summary.baseline.primary_pass,
+        summary.baseline.deployment_success,
         summary.baseline.total,
-        summary.candidate.primary_pass,
+        summary.candidate.deployment_success,
         summary.candidate.total,
         summary.baseline.parse_valid,
         summary.baseline.total,
@@ -1837,7 +1946,232 @@ mod tests {
         let error = OutcomeResult::from_truth(OutcomeStatus::Error);
         let pairs = [(Some(&error), Some(&passed)), (Some(&passed), Some(&error))];
 
-        assert_eq!(count_jointly_scored(pairs), 0);
+        assert_eq!(count_jointly_fully_evaluated(pairs), 0);
+    }
+
+    #[test]
+    fn duplicate_key_result_is_retention_invariant() {
+        let case = structtrace_core::dataset::Case {
+            id: "duplicate".to_owned(),
+            input: Value::Null,
+            expected: Some(serde_json::json!({"total": 1000})),
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let row = structtrace_core::output::VariantOutput {
+            case_id: case.id.clone(),
+            status: OutputStatus::Ok,
+            raw_output: Some(r#"{"total":100,"total":1000}"#.to_owned()),
+            parsed_output: Some(serde_json::json!({"total": 1000})),
+            error: None,
+            latency_ms: None,
+            usage: None,
+            cost: None,
+            metadata: Value::Object(Default::default()),
+            retries: Vec::new(),
+        };
+        let schema = compile_schema(&serde_json::json!({"type": "object"})).unwrap();
+        let evaluators = vec![structtrace_core::config::EvaluatorConfig {
+            id: "exact".to_owned(),
+            implementation_version: None,
+            implementation: Default::default(),
+            kind: EvaluatorKind::ExactJson,
+        }];
+        let outcomes = BTreeMap::from([(
+            "correct".to_owned(),
+            structtrace_core::config::OutcomeConfig {
+                all_of: vec!["exact".to_owned()],
+                any_of: vec![],
+            },
+        )]);
+        let before = structtrace_core::evaluation::evaluate_case(
+            &case,
+            &row,
+            &schema,
+            &evaluators,
+            &outcomes,
+            "correct",
+        );
+        let mut prepared = PreparedVariant {
+            source_label: "memory".to_owned(),
+            input_hash: hash_bytes(b"duplicate"),
+            source_bytes: Vec::new(),
+            rows: vec![row],
+            stderr: Vec::new(),
+            protocol_errors: Vec::new(),
+        };
+        apply_storage_retention(&mut prepared, false, false, false).unwrap();
+        let after = structtrace_core::evaluation::evaluate_case(
+            &case,
+            &prepared.rows[0],
+            &schema,
+            &evaluators,
+            &outcomes,
+            "correct",
+        );
+        assert_eq!(before, after);
+        assert!(prepared.rows[0].raw_output.is_none());
+        assert_eq!(
+            prepared.rows[0]
+                .metadata
+                .pointer("/_structtrace_parse_receipt/strict_parse_status"),
+            Some(&Value::String("failed".to_owned()))
+        );
+    }
+
+    #[test]
+    fn every_retention_combination_has_identical_summary_and_gate() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"one\",\"input\":{},\"expected\":{\"total\":1000}}\n",
+        );
+        let output = "{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{\\\"total\\\":100,\\\"total\\\":1000}\",\"metadata\":{\"provider_response\":{\"private\":true},\"rendered_prompt\":\"private\"}}\n";
+        write(&root.path().join("baseline.jsonl"), output);
+        write(&root.path().join("candidate.jsonl"), output);
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        let mut expected: Option<RunSummary> = None;
+        for retain_raw in [false, true] {
+            for retain_provider in [false, true] {
+                for include_prompts in [false, true] {
+                    write(
+                        &root.path().join("structtrace.yaml"),
+                        &format!(
+                            r#"version: 3
+project: {{name: retention-invariance}}
+storage:
+  root: .structtrace-{retain_raw}-{retain_provider}-{include_prompts}
+  retain_raw_outputs: {retain_raw}
+  retain_provider_responses: {retain_provider}
+dataset: {{path: data.jsonl}}
+schema: {{path: schema.json}}
+variants:
+  baseline: {{kind: recorded, path: baseline.jsonl}}
+  candidate: {{kind: recorded, path: candidate.jsonl}}
+evaluators:
+  - {{id: exact, kind: exact_json}}
+outcomes:
+  correct: {{all_of: [exact]}}
+analysis: {{primary_outcome: correct, bootstrap: {{samples: 100, confidence: 0.95, seed: 17}}}}
+gate: {{mode: advisory, min_cases: 1, max_primary_regression_pp: 0}}
+report: {{include_prompts: {include_prompts}}}
+"#
+                        ),
+                    );
+                    let mut summary = run_recorded(root.path(), Path::new("structtrace.yaml"))
+                        .unwrap()
+                        .summary;
+                    summary.run_id.clear();
+                    if let Some(expected) = &expected {
+                        assert_eq!(&summary, expected);
+                    } else {
+                        expected = Some(summary);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compare_rejects_duplicate_schema_keys() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"one\",\"input\":{},\"expected\":{}}\n",
+        );
+        let output = "{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{}\"}\n";
+        write(&root.path().join("baseline.jsonl"), output);
+        write(&root.path().join("candidate.jsonl"), output);
+        write(
+            &root.path().join("schema.json"),
+            r#"{"type":"object","properties":{},"properties":{"x":{"type":"string"}}}"#,
+        );
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 3
+project: {name: strict-schema}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: exact, kind: exact_json}
+outcomes:
+  correct: {all_of: [exact]}
+analysis: {primary_outcome: correct}
+"#,
+        );
+        let error = run_recorded(root.path(), Path::new("structtrace.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid strict JSON"), "{error}");
+    }
+
+    #[test]
+    fn compare_retains_original_effective_and_override_provenance() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"one\",\"input\":{},\"expected\":{}}\n",
+        );
+        let output = "{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{}\"}\n";
+        for name in [
+            "baseline-original.jsonl",
+            "candidate-original.jsonl",
+            "baseline-effective.jsonl",
+            "candidate-effective.jsonl",
+        ] {
+            write(&root.path().join(name), output);
+        }
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 3
+project: {name: compare-provenance}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline-original.jsonl}
+  candidate: {kind: recorded, path: candidate-original.jsonl}
+evaluators:
+  - {id: exact, kind: exact_json}
+outcomes:
+  correct: {all_of: [exact]}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+"#,
+        );
+        let mut config = Config::load(&root.path().join("structtrace.yaml")).unwrap();
+        config.variants.insert(
+            "baseline".to_owned(),
+            VariantConfig::Recorded {
+                path: "baseline-effective.jsonl".into(),
+            },
+        );
+        config.variants.insert(
+            "candidate".to_owned(),
+            VariantConfig::Recorded {
+                path: "candidate-effective.jsonl".into(),
+            },
+        );
+        let run =
+            run_recorded_with_config(root.path(), Path::new("structtrace.yaml"), config).unwrap();
+        let invocation: Value = structtrace_core::strict_json::from_slice(
+            &std::fs::read(run.run_dir.join("inputs/invocation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(invocation["invocation_kind"], "compare_with_overrides");
+        assert_eq!(
+            invocation.pointer("/overrides/baseline/path"),
+            Some(&Value::String("baseline-effective.jsonl".to_owned()))
+        );
+        assert!(
+            run.manifest
+                .artifacts
+                .contains_key("inputs/invocation.json")
+        );
+        assert!(crate::replay::replay_run(&run.run_dir).unwrap().verified);
     }
 
     #[test]
@@ -1859,7 +2193,7 @@ mod tests {
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: joint-coverage}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -1908,11 +2242,14 @@ gate:
             .iter()
             .find(|rule| rule.rule == "min_primary_fully_evaluated_rate")
             .unwrap();
-        assert_eq!(rule.observed, Some(0.99));
-        assert_eq!(rule.status, structtrace_core::gate::GateRuleStatus::Passed);
+        assert_eq!(rule.observed, Some(0.98));
+        assert_eq!(
+            rule.status,
+            structtrace_core::gate::GateRuleStatus::InsufficientEvidence
+        );
         assert_eq!(
             summary.gate.status,
-            structtrace_core::gate::GateStatus::Passed
+            structtrace_core::gate::GateStatus::InsufficientEvidence
         );
         assert!(!summary.gate.deployment_authorized);
     }
@@ -1938,7 +2275,7 @@ gate:
         );
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project:
   name: test
 dataset:
@@ -1998,7 +2335,7 @@ gate:
         );
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: field-hotspot}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2159,7 +2496,7 @@ analysis:
         write(&root.path().join("candidate.jsonl"), &output);
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: provider-privacy}
 storage: {retain_raw_outputs: false, retain_provider_responses: false}
 dataset: {path: data.jsonl}
@@ -2230,7 +2567,7 @@ analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95,
         write(
             &root.path().join("structtrace.yaml"),
             &format!(
-                r#"version: 2
+                r#"version: 3
 project: {{name: external-evaluator-test}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}
@@ -2299,7 +2636,7 @@ analysis:
         write(
             &root.path().join("structtrace.yaml"),
             &format!(
-                r#"version: 2
+                r#"version: 3
 project: {{name: evaluator-scale}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}
@@ -2356,7 +2693,7 @@ analysis: {{primary_outcome: correct, bootstrap: {{samples: 100, confidence: 0.9
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: duplicate-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2413,7 +2750,7 @@ gate:
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: metamorphic-evidence}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2504,7 +2841,7 @@ gate: {min_cases: 1, min_unique_cases: 1, max_duplicate_case_rate: 1, max_primar
             write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
             write(
                 &root.path().join("structtrace.yaml"),
-                r#"version: 2
+                r#"version: 3
 project: {name: conflict-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2564,7 +2901,7 @@ gate:
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: metadata-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}

@@ -154,7 +154,9 @@ explicit opt-in selectors.
 
 Manage retained runs with `structtrace runs list`, `runs show`, `runs latest --kind production`,
 `runs archive`, and confirmed inactive-run deletion. Archives include a BLAKE3 receipt for every
-copied file.
+manifest-bound copied file; unbound debug files and secrets are excluded from verified archives.
+Verified archives preserve the run's retained evidence and are owner-only on Unix; they are not a
+substitute for the aggregate-only `report --export-share` derivative.
 
 ## Execution sources
 
@@ -231,10 +233,11 @@ gate:
   max_primary_component_error_rate: 0.01
   max_primary_component_not_applicable_rate: 0.0
   max_primary_component_unscored_rate: 0.0
-  max_primary_regression_pp: 1.0
-  min_candidate_primary_success_rate: 0.95
-  max_valid_but_wrong_increase_pp: 0.5
+  max_deployment_regression_pp: 1.0
+  min_candidate_deployment_success_rate: 0.95
+  min_candidate_parse_validity: 1.0
   min_candidate_schema_validity: 1.0
+  max_candidate_valid_but_wrong_rate: 0.02
   max_error_rate: 0.0
   max_timeout_rate: 0.0
   latency:
@@ -244,6 +247,9 @@ gate:
     max_average_increase_percent: 20
     min_coverage: 1.0
 ```
+
+Deployment automation must call `structtrace gate latest --require-release-authorization`.
+Advisory and regression passes remain useful analysis results but can never authorize release.
 
 ```bash
 structtrace gate latest                 # human output
@@ -394,6 +400,9 @@ interleaved live-provider scheduling and case-level paid-call resume remain expl
 
 ## Contributing and security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development contract and [SECURITY.md](SECURITY.md) for the local security boundary and responsible disclosure process.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development contract and [SECURITY.md](SECURITY.md)
+for responsible disclosure. Product expectations are explicit in the [support](SUPPORT.md),
+[compatibility](COMPATIBILITY.md), [deprecation](DEPRECATION.md), and [roadmap](ROADMAP.md)
+policies. Format upgrades are documented in the [migration guide](docs/src/migrations.md).
 
 StructTrace is licensed under the [MIT License](LICENSE).

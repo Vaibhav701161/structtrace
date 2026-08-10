@@ -771,16 +771,22 @@ pub struct GateConfig {
     pub max_primary_component_unscored_rate: Option<f64>,
     /// Maximum allowed primary-outcome decline in percentage points.
     pub max_primary_regression_pp: Option<f64>,
+    /// Maximum allowed complete-denominator deployment-success decline.
+    pub max_deployment_regression_pp: Option<f64>,
     /// Maximum allowed increase in valid-but-wrong rate.
     pub max_valid_but_wrong_increase_pp: Option<f64>,
     /// Minimum absolute candidate semantic success rate.
     pub min_candidate_primary_success_rate: Option<f64>,
+    /// Minimum absolute candidate deployment-success rate.
+    pub min_candidate_deployment_success_rate: Option<f64>,
     /// Maximum absolute candidate known-valid-but-wrong rate.
     pub max_candidate_valid_but_wrong_rate: Option<f64>,
     /// Minimum absolute candidate strict-parse validity.
     pub min_candidate_parse_validity: Option<f64>,
     /// Maximum upper confidence bound on regression, in percentage points.
     pub max_upper_confidence_bound_regression_pp: Option<f64>,
+    /// Maximum upper confidence bound on deployment-success regression.
+    pub max_upper_confidence_bound_deployment_regression_pp: Option<f64>,
     /// Minimum number of primary discordant pairs, treated as evidence sufficiency.
     pub min_discordant_pairs: Option<usize>,
     /// Required candidate schema-validity fraction.
@@ -806,11 +812,16 @@ impl GateConfig {
             || self.max_primary_component_not_applicable_rate.is_some()
             || self.max_primary_component_unscored_rate.is_some()
             || self.max_primary_regression_pp.is_some()
+            || self.max_deployment_regression_pp.is_some()
             || self.max_valid_but_wrong_increase_pp.is_some()
             || self.min_candidate_primary_success_rate.is_some()
+            || self.min_candidate_deployment_success_rate.is_some()
             || self.max_candidate_valid_but_wrong_rate.is_some()
             || self.min_candidate_parse_validity.is_some()
             || self.max_upper_confidence_bound_regression_pp.is_some()
+            || self
+                .max_upper_confidence_bound_deployment_regression_pp
+                .is_some()
             || self.min_discordant_pairs.is_some()
             || self.min_candidate_schema_validity.is_some()
             || self.max_error_rate.is_some()
@@ -1587,12 +1598,20 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
     for (name, value) in [
         ("max_primary_regression_pp", gate.max_primary_regression_pp),
         (
+            "max_deployment_regression_pp",
+            gate.max_deployment_regression_pp,
+        ),
+        (
             "max_valid_but_wrong_increase_pp",
             gate.max_valid_but_wrong_increase_pp,
         ),
         (
             "max_upper_confidence_bound_regression_pp",
             gate.max_upper_confidence_bound_regression_pp,
+        ),
+        (
+            "max_upper_confidence_bound_deployment_regression_pp",
+            gate.max_upper_confidence_bound_deployment_regression_pp,
         ),
     ] {
         if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
@@ -1621,6 +1640,10 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
         (
             "min_candidate_primary_success_rate",
             gate.min_candidate_primary_success_rate,
+        ),
+        (
+            "min_candidate_deployment_success_rate",
+            gate.min_candidate_deployment_success_rate,
         ),
         (
             "max_candidate_valid_but_wrong_rate",
@@ -1660,21 +1683,56 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
             ));
         }
         if gate.max_primary_regression_pp.is_none()
+            && gate.max_deployment_regression_pp.is_none()
             && gate.max_valid_but_wrong_increase_pp.is_none()
             && gate.max_upper_confidence_bound_regression_pp.is_none()
+            && gate
+                .max_upper_confidence_bound_deployment_regression_pp
+                .is_none()
         {
             return Err(CoreError::Configuration(
                 "gate regression/release mode requires at least one relative primary semantic quality rule".to_owned(),
             ));
         }
     }
-    if gate.mode == GateMode::Release
-        && gate.min_candidate_primary_success_rate.is_none()
-        && gate.max_candidate_valid_but_wrong_rate.is_none()
-    {
-        return Err(CoreError::Configuration(
-            "gate release mode requires an absolute semantic quality floor: min_candidate_primary_success_rate or max_candidate_valid_but_wrong_rate".to_owned(),
-        ));
+    if gate.mode == GateMode::Release {
+        let meaningful = gate.min_cases.is_some_and(|value| value >= 100)
+            && gate.min_unique_cases.is_some_and(|value| value >= 100)
+            && gate
+                .max_duplicate_case_rate
+                .is_some_and(|value| value <= 0.01)
+            && gate
+                .min_primary_fully_evaluated_rate
+                .is_some_and(|value| value >= 0.99)
+            && gate
+                .max_primary_component_error_rate
+                .is_some_and(|value| value <= 0.01)
+            && gate
+                .max_primary_component_not_applicable_rate
+                .is_some_and(|value| value == 0.0)
+            && gate
+                .max_primary_component_unscored_rate
+                .is_some_and(|value| value == 0.0)
+            && gate
+                .max_deployment_regression_pp
+                .is_some_and(|value| value <= 1.0)
+            && gate
+                .min_candidate_deployment_success_rate
+                .is_some_and(|value| value >= 0.95)
+            && gate
+                .min_candidate_parse_validity
+                .is_some_and(|value| value >= 0.99)
+            && gate
+                .min_candidate_schema_validity
+                .is_some_and(|value| value >= 0.99)
+            && gate
+                .max_candidate_valid_but_wrong_rate
+                .is_some_and(|value| value <= 0.02);
+        if !meaningful {
+            return Err(CoreError::Configuration(
+                "gate release mode requires the safe release profile: at least 100 cases and unique cases, <=1% duplicates/errors, >=99% fully evaluated/parse/schema validity, zero N/A/unscored components, <=1 pp deployment regression, >=95% candidate deployment success, and <=2% valid-but-wrong".to_owned(),
+            ));
+        }
     }
     for (name, value) in [
         (
@@ -2185,7 +2243,7 @@ mod tests {
             max_primary_component_error_rate: Some(0.01),
             max_primary_component_not_applicable_rate: Some(0.0),
             max_primary_component_unscored_rate: Some(0.0),
-            max_primary_regression_pp: Some(1.0),
+            max_deployment_regression_pp: Some(1.0),
             ..GateConfig::default()
         }
     }
@@ -2203,14 +2261,40 @@ mod tests {
         let mut config = minimal();
         config.gate = regression_gate(GateMode::Release);
         let error = Config::validate(config).unwrap_err().to_string();
-        assert!(error.contains("absolute semantic quality floor"));
+        assert!(error.contains("safe release profile"));
+    }
+
+    #[test]
+    fn vacuous_release_gate_is_rejected() {
+        let mut config = minimal();
+        config.gate = GateConfig {
+            mode: GateMode::Release,
+            min_cases: Some(1),
+            min_unique_cases: Some(1),
+            max_duplicate_case_rate: Some(1.0),
+            min_primary_fully_evaluated_rate: Some(0.0),
+            max_primary_component_error_rate: Some(1.0),
+            max_primary_component_not_applicable_rate: Some(1.0),
+            max_primary_component_unscored_rate: Some(1.0),
+            max_deployment_regression_pp: Some(100.0),
+            min_candidate_deployment_success_rate: Some(0.0),
+            min_candidate_parse_validity: Some(0.0),
+            min_candidate_schema_validity: Some(0.0),
+            max_candidate_valid_but_wrong_rate: Some(1.0),
+            ..GateConfig::default()
+        };
+        let error = Config::validate(config).unwrap_err().to_string();
+        assert!(error.contains("safe release profile"));
     }
 
     #[test]
     fn complete_release_gate_is_accepted() {
         let mut config = minimal();
         config.gate = regression_gate(GateMode::Release);
-        config.gate.min_candidate_primary_success_rate = Some(0.95);
+        config.gate.min_candidate_deployment_success_rate = Some(0.95);
+        config.gate.min_candidate_parse_validity = Some(1.0);
+        config.gate.min_candidate_schema_validity = Some(1.0);
+        config.gate.max_candidate_valid_but_wrong_rate = Some(0.02);
         Config::validate(config).unwrap();
     }
 }

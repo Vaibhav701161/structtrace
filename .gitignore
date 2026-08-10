@@ -8,3 +8,7 @@
 *.swp
 .DS_Store
 /demo/video/generated/
+/fuzz/Cargo.lock
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/

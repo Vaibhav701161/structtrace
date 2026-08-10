@@ -1,6 +1,7 @@
 # Security policy
 
-Report security issues privately to the repository owner. Do not include API
+Report security issues through a [private GitHub security advisory](https://github.com/Vaibhav701161/structtrace/security/advisories/new).
+Do not include API
 keys, private datasets, raw customer outputs, or other sensitive material in a
 public issue.
 

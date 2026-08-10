@@ -12,8 +12,12 @@ structtrace runs delete <run-id> --yes
 
 Deletion refuses active lifecycle states, validates that the target is an immediate child of the
 resolved storage root, and refuses any symlink in the run tree. Without `--yes`, confirmation is
-required. Archive first verifies every manifest-bound artifact, copies only regular entries, and
-writes `archive-verification.json` with a BLAKE3 hash for every copied file.
+required. Archive first verifies every manifest-bound artifact, copies only the manifest allowlist
+plus `manifest.json`, rejects symlinks, excludes unbound regular files, and writes
+`archive-verification.json` with a BLAKE3 hash for every copied file. On Unix, archive directories
+and files are created with owner-only permissions. A verified archive is complete evidence, not a
+share-safe derivative, and may contain retained inputs or raw outputs. Use `report --export-share`
+when only aggregate public material is required.
 
 Local state defaults to `.structtrace`. Each ULID-named run contains a versioned SQLite database and portable files. SQLite tables store runs, cases, variants, outputs, evaluator results, outcomes, paired results, events, and artifact hashes.
 

@@ -5,6 +5,19 @@ here.
 
 ## Unreleased
 
+- Advance configuration to version 3, portable artifacts to version 9, reports to version 4, and
+  SQLite metadata to version 5. Version 2 runs are never silently reinterpreted.
+- Make scoring retention-invariant: strict parsing, external evaluation, outcomes, statistics, and
+  gates are frozen from an immutable capture before raw/provider/prompt retention is applied.
+  Raw-disabled artifacts retain a versioned strict-parse receipt and do not claim raw replay.
+- Separate structural, semantic, and deployment success. Complete-denominator comparisons and
+  release rules now use deployment success; semantic-only inference requires both outcomes to be
+  fully evaluated.
+- Calculate paired evaluation coverage as the case-level intersection, reject vacuous release
+  profiles, expose gate mode in machine output, and add `--require-release-authorization` for CI.
+- Use strict duplicate-key schema parsing in direct comparison, archive only manifest-bound files,
+  and discover onboarding pointers across schema, expected, baseline, and candidate evidence.
+
 - Advance configuration to version 2, portable artifacts to version 8, reports to version 3,
   SQLite to version 4, and command/Python/evaluator protocols to version 3.
 - Add explicit advisory, regression, and release gate modes. Only a complete release gate with an

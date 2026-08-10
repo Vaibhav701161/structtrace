@@ -20,7 +20,7 @@ this file is not treated as machine evidence.
 | CI gate output | real-binary GitHub mode appended a Markdown metrics table to `$GITHUB_STEP_SUMMARY` and emitted rule annotations |
 | Artifact tamper detection | modifying a finalized report caused replay to return artifact-failure exit code 4 |
 | Gate integrity | default gate rejects a manifest hash mismatch; high-assurance `--verify replay` is available |
-| Label isolation | ID pointers join all overlap checks; live adapters receive stimulus-derived opaque tokens; Python callables and OpenAI templates receive no dataset ID; strict doctor fails model-visible expected-value leakage while treating original IDs as opaque |
+| Label isolation | ID pointers join all overlap checks; live adapters receive run-scoped, ordinal-specific opaque tokens; repeated stimuli have distinct tokens and unrelated runs cannot correlate them; Python callables and OpenAI templates receive no dataset ID |
 | Evaluator semantics | adversarial tests cover missing pointers, externally supplied field facts, the four-valued `any_of` truth table, evaluator errors, not-applicable results, and nonzero exits |
 | Independent replay | replay reconstructs rows from retained dataset plus baseline/candidate inputs and detects cross-artifact tampering even after ordinary hashes are updated |
 | External evaluator receipts | replay verifies definition-, request-, and response-bound facts without re-executing side-effecting programs |
@@ -31,16 +31,16 @@ this file is not treated as machine evidence.
 | Custom evaluators | command protocol test and end-to-end Python evaluator scoring/replay passed |
 | Forced resume | process killed during candidate; resumed ULID reused baseline exactly once and replayed with zero mismatches |
 | Failed lifecycle | an error after run allocation records a failure event and leaves durable state `failed`, never `complete` |
-| Multi-state gate | empty gates are not configured; evaluator errors, low coverage, not-applicable rows, unscored rows, and small samples cannot authorize deployment |
-| Gate intent | advisory never authorizes; regression requires complete evidence safeguards and a relative semantic rule; release additionally requires an absolute semantic floor and is the only authorizing mode |
+| Multi-state gate | empty gates are not configured; evaluator errors, low joint coverage, not-applicable rows, unscored rows, small samples, schema failure, parse failure, and vacuous thresholds cannot authorize deployment |
+| Gate intent | advisory never authorizes; regression requires complete evidence safeguards and a relative quality rule; release requires the safe deployment, parse, schema, valid-but-wrong, and evidence profile and is the only authorizing mode; CI can require authorization explicitly |
 | Outcome health | composed logical truth and required-component health are stored separately; mixed failure plus error/not-applicable states remain visible and block fully evaluated evidence |
-| Strict JSON | one recursive parser rejects duplicate keys in datasets, recorded and raw outputs, worker protocols, evaluator responses, provider envelopes, and replayed artifacts |
+| Strict JSON | one recursive parser rejects duplicate keys in schemas, datasets, recorded and raw outputs, worker protocols, evaluator responses, provider envelopes, and replayed artifacts across compare, run, doctor, and replay |
 | Process logs | default retention is off; sanitized logs redact configured literals and header-shaped values under one total budget; truncation is marked and share exports omit logs |
-| Run management | kind-aware list/show/latest, inactive-run deletion with confirmation and symlink confinement, and hash-receipted directory archives are available |
-| Guided recorded onboarding | `init --from-outputs` validates and snapshots all four inputs, requires explicit exact-object or JSON-Pointer correctness semantics, emits a complete gate mode, and produces a runtime-valid project |
+| Run management | kind-aware list/show/latest, inactive-run deletion with confirmation and symlink confinement, and manifest-allowlisted verified archives that exclude unbound files are available |
+| Guided recorded onboarding | `init --from-outputs` validates and snapshots all four inputs, discovers pointers from schema, expected, baseline, and candidate evidence so omitted candidate fields remain selectable, requires explicit semantics, and produces a runtime-valid project |
 | Example projects | recorded, Python, command, document extraction, and tool-selection/argument fixtures ran through the shared scoring path |
 | Invoice hero workflow | 12 nested invoices produced 9/12 versus 9/12 with six discordances, schema validity 10/12 versus 12/12, valid-but-wrong 1 versus 3, and an insufficient-evidence gate |
-| Evidence independence | singleton, exact-duplicate, repeated-trial and label-conflict groups are explicit; raw formatting and retention do not define scored equality; repeated trials cannot select an arbitrary representative and block independent inference |
+| Evidence independence | singleton, exact-duplicate, repeated-trial and label-conflict groups are explicit; scoring occurs before retention; strict parse receipts preserve raw-disabled results; paired coverage is the true fully evaluated intersection; repeated trials block independent inference |
 | Report denominators | descriptive all-row totals are separated from independent evidence-unit results; headline cards, paired matrix, evaluator counts, hotspots, and gate use the same non-conflicting evidence-unit population |
 | Golden-answer routing | equal, root, and parent/child overlaps across ID, input, expected, model-visible metadata, and evaluation-only metadata are rejected |
 | Bootstrap safety | samples are capped at 1,000,000 and samples × evidence units at 100,000,000 before result allocation or resampling |
@@ -90,7 +90,7 @@ this file is not treated as machine evidence.
   containment is still an explicit public-release blocker.
 - Replay uses hash-bound custom-evaluator receipts rather than re-executing
   potentially side-effecting evaluator code.
-- Disabling raw-output retention limits reconstruction of malformed original
-  text.
+- Disabling raw-output retention records a hash-bound strict parse receipt but intentionally
+  prevents raw-byte reconstruction of malformed original text.
 - Historical research matrices are separate studies and are not pooled into a
   universal effect.

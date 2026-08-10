@@ -198,6 +198,15 @@ pub struct VariantSummary {
     pub schema_valid: usize,
     /// Primary semantic or executable successes.
     pub primary_pass: usize,
+    /// Adapter, strict parsing, and caller-facing schema successes.
+    #[serde(default)]
+    pub structured_success: usize,
+    /// Explicit primary semantic successes, independent of structure.
+    #[serde(default)]
+    pub semantic_success: usize,
+    /// Complete deployable successes: structural, semantic, and fully evaluated.
+    #[serde(default)]
+    pub deployment_success: usize,
     /// Primary outcomes that ran and explicitly failed.
     #[serde(default)]
     pub primary_failed: usize,
@@ -312,9 +321,11 @@ pub struct RunSummary {
     pub primary_jointly_scored: usize,
     /// Dataset independence audit used by inferential statistics and gates.
     pub evidence: EvidenceSummary,
-    /// Paired effect over one representative per semantic evidence unit.
+    /// Backward-compatible alias for the deployment-success effect over independent evidence units.
     pub independent_paired: PairedMetrics,
-    /// Bootstrap interval over independent semantic evidence units.
+    /// Complete-denominator paired deployment effect.
+    pub deployment_paired: PairedMetrics,
+    /// Deployment-success bootstrap interval over independent evidence units.
     pub independent_bootstrap: BootstrapInterval,
     /// Paired semantic effect restricted to explicitly scored pass/fail pairs.
     pub jointly_scored_semantic: SemanticEffectSummary,
@@ -323,9 +334,9 @@ pub struct RunSummary {
     pub matched_operational: MatchedOperationalSummary,
     /// Operational measurements over every captured row, for description only.
     pub descriptive_matched_operational: MatchedOperationalSummary,
-    /// Paired primary transition matrix and effect.
+    /// Backward-compatible alias for the complete-denominator deployment transition matrix.
     pub paired: PairedMetrics,
-    /// Seeded paired bootstrap interval.
+    /// Seeded deployment-success paired bootstrap interval.
     pub bootstrap: BootstrapInterval,
     /// Release-gate decision.
     pub gate: GateDecision,

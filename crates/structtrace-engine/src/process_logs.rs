@@ -83,7 +83,7 @@ mod tests {
 
     fn config() -> Config {
         serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "log-test"},
             "dataset": {"path": "data.jsonl"},
             "schema": {"path": "schema.json"},

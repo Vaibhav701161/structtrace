@@ -54,11 +54,11 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
     let schema = structtrace_core::strict_json::value_from_slice(&schema_bytes)?;
     compile_schema(&schema)?;
 
-    let discovered = candidate_pointers(&candidate)?;
+    let discovered = selectable_pointer_union(&schema, &dataset, &baseline, &candidate)?;
     for pointer in options.correctness_pointers {
         anyhow::ensure!(
             discovered.contains(pointer),
-            "correctness pointer `{pointer}` was not present in any successful candidate output; available pointers: {}",
+            "correctness pointer `{pointer}` was not present in the schema, expected values, baseline outputs, or candidate outputs; available pointers: {}",
             discovered.iter().cloned().collect::<Vec<_>>().join(", ")
         );
     }
@@ -92,16 +92,19 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
                 "max_primary_component_error_rate": 0.01,
                 "max_primary_component_not_applicable_rate": 0.0,
                 "max_primary_component_unscored_rate": 0.0,
-                "max_primary_regression_pp": 0.0
+                "max_deployment_regression_pp": 0.0
             });
             if options.gate_mode == GateMode::Release {
-                gate["min_candidate_primary_success_rate"] = json!(0.95);
+                gate["min_candidate_deployment_success_rate"] = json!(0.95);
+                gate["min_candidate_parse_validity"] = json!(1.0);
+                gate["min_candidate_schema_validity"] = json!(1.0);
+                gate["max_candidate_valid_but_wrong_rate"] = json!(0.02);
             }
             gate
         }
     };
     let value = json!({
-        "version": 2,
+        "version": 3,
         "project": {"name": project_name, "description": "Recorded baseline and candidate comparison with user-selected correctness semantics"},
         "storage": {"root": ".structtrace", "process_logs": {"mode": "off"}},
         "dataset": {"path": "data/golden.jsonl", "format": "jsonl"},
@@ -167,8 +170,11 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
     })
 }
 
-fn candidate_pointers(
-    outputs: &RecordedOutputs,
+fn selectable_pointer_union(
+    schema: &serde_json::Value,
+    dataset: &Dataset,
+    baseline: &RecordedOutputs,
+    candidate: &RecordedOutputs,
 ) -> anyhow::Result<std::collections::BTreeSet<String>> {
     fn visit(
         value: &serde_json::Value,
@@ -193,10 +199,36 @@ fn candidate_pointers(
         }
     }
     let mut pointers = std::collections::BTreeSet::new();
-    for row in &outputs.rows {
-        if let Some(source) = row.parse_source() {
-            let value = structtrace_core::strict_json::value_from_str(&source)?;
-            visit(&value, "", &mut pointers);
+    fn visit_schema(
+        schema: &serde_json::Value,
+        path: &str,
+        output: &mut std::collections::BTreeSet<String>,
+    ) {
+        if let Some(properties) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (key, child) in properties {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                let pointer = format!("{path}/{key}");
+                output.insert(pointer.clone());
+                visit_schema(child, &pointer, output);
+            }
+        }
+    }
+    visit_schema(schema, "", &mut pointers);
+    for case in &dataset.cases {
+        if let Some(expected) = &case.expected {
+            visit(expected, "", &mut pointers);
+        }
+    }
+    for outputs in [baseline, candidate] {
+        for row in &outputs.rows {
+            if let Some(source) = row.parse_source() {
+                if let Ok(value) = structtrace_core::strict_json::value_from_str(&source) {
+                    visit(&value, "", &mut pointers);
+                }
+            }
         }
     }
     Ok(pointers)
@@ -414,7 +446,7 @@ fn configuration(project_name: &str, template: InitTemplate) -> String {
             .to_owned(),
     };
     format!(
-        r#"version: 2
+        r#"version: 3
 
 project:
   name: {project_name}
@@ -654,6 +686,45 @@ mod tests {
             run.summary.gate.status,
             structtrace_core::gate::GateStatus::InsufficientEvidence
         );
+    }
+
+    #[test]
+    fn candidate_missing_field_remains_selectable() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("data.jsonl"),
+            "{\"id\":\"one\",\"input\":{},\"expected\":{\"tax\":\"10.00\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("baseline.jsonl"),
+            "{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{\\\"tax\\\":\\\"10.00\\\"}\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("candidate.jsonl"),
+            "{\"case_id\":\"one\",\"status\":\"ok\",\"raw_output\":\"{}\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("schema.json"),
+            r#"{"type":"object","properties":{"tax":{"type":"string"}}}"#,
+        )
+        .unwrap();
+        initialize_from_outputs(FromOutputsOptions {
+            destination: &root.path().join("guided"),
+            dataset: &source.join("data.jsonl"),
+            baseline: &source.join("baseline.jsonl"),
+            candidate: &source.join("candidate.jsonl"),
+            schema: &source.join("schema.json"),
+            correctness_pointers: &["/tax".to_owned()],
+            exact_json: false,
+            gate_mode: GateMode::Regression,
+            min_cases: 100,
+        })
+        .unwrap();
     }
 
     #[test]

@@ -626,7 +626,7 @@ mod tests {
         }
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: replay-adversarial}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}

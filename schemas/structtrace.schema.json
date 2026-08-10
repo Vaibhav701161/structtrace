@@ -6,7 +6,7 @@
   "required": ["version", "project", "dataset", "schema", "variants", "outcomes", "analysis"],
   "additionalProperties": false,
   "properties": {
-    "version": {"const": 2},
+    "version": {"const": 3},
     "project": {
       "type": "object",
       "required": ["name"],
@@ -131,18 +131,17 @@
             "required": ["min_cases", "min_unique_cases", "max_duplicate_case_rate", "min_primary_fully_evaluated_rate", "max_primary_component_error_rate", "max_primary_component_not_applicable_rate", "max_primary_component_unscored_rate"],
             "anyOf": [
               {"required": ["max_primary_regression_pp"]},
+              {"required": ["max_deployment_regression_pp"]},
               {"required": ["max_valid_but_wrong_increase_pp"]},
-              {"required": ["max_upper_confidence_bound_regression_pp"]}
+              {"required": ["max_upper_confidence_bound_regression_pp"]},
+              {"required": ["max_upper_confidence_bound_deployment_regression_pp"]}
             ]
           }
         },
         {
           "if": {"properties": {"mode": {"const": "release"}}, "required": ["mode"]},
           "then": {
-            "anyOf": [
-              {"required": ["min_candidate_primary_success_rate"]},
-              {"required": ["max_candidate_valid_but_wrong_rate"]}
-            ]
+            "required": ["max_deployment_regression_pp", "min_candidate_deployment_success_rate", "min_candidate_parse_validity", "min_candidate_schema_validity", "max_candidate_valid_but_wrong_rate"]
           }
         }
       ],
@@ -156,11 +155,14 @@
         "max_primary_component_not_applicable_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_primary_component_unscored_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_primary_regression_pp": {"type": ["number", "null"], "minimum": 0},
+        "max_deployment_regression_pp": {"type": ["number", "null"], "minimum": 0},
         "max_valid_but_wrong_increase_pp": {"type": ["number", "null"], "minimum": 0},
         "min_candidate_primary_success_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "min_candidate_deployment_success_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_candidate_valid_but_wrong_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "min_candidate_parse_validity": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_upper_confidence_bound_regression_pp": {"type": ["number", "null"], "minimum": 0},
+        "max_upper_confidence_bound_deployment_regression_pp": {"type": ["number", "null"], "minimum": 0},
         "min_discordant_pairs": {"type": ["integer", "null"], "minimum": 1},
         "min_candidate_schema_validity": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_error_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},

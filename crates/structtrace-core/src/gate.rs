@@ -30,16 +30,22 @@ pub struct GateInputs<'a> {
     pub primary_component_unscored_rate: f64,
     /// Primary paired metrics.
     pub primary: &'a PairedMetrics,
+    /// Complete-denominator deployment-success paired metrics.
+    pub deployment: &'a PairedMetrics,
     /// Baseline valid-but-wrong fraction.
     pub baseline_valid_but_wrong_rate: f64,
     /// Candidate valid-but-wrong fraction.
     pub candidate_valid_but_wrong_rate: f64,
     /// Candidate primary semantic success fraction.
     pub candidate_primary_success_rate: f64,
+    /// Candidate complete-denominator deployment-success fraction.
+    pub candidate_deployment_success_rate: f64,
     /// Candidate strict-parse validity fraction.
     pub candidate_parse_validity: f64,
     /// Lower bound of the paired candidate-minus-baseline interval.
     pub primary_lower_confidence_bound_pp: Option<f64>,
+    /// Lower bound of candidate-minus-baseline deployment-success effect.
+    pub deployment_lower_confidence_bound_pp: Option<f64>,
     /// Candidate schema-validity fraction.
     pub candidate_schema_validity: f64,
     /// Candidate adapter-error fraction.
@@ -119,7 +125,7 @@ impl GateStatus {
         }
     }
 
-    /// Whether this state authorizes deployment.
+    /// Whether all configured rules passed, independent of gate authority.
     pub const fn is_passed(self) -> bool {
         matches!(self, Self::Passed)
     }
@@ -128,9 +134,11 @@ impl GateStatus {
 /// Complete release-gate decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateDecision {
+    /// Authority of the gate that produced this decision.
+    pub gate_mode: GateMode,
     /// Explicit deployment-decision state.
     pub status: GateStatus,
-    /// True only when every configured quality and evidence rule passed.
+    /// True only when every configured rule passed in `release` mode.
     pub deployment_authorized: bool,
     /// Configured quality rules that failed.
     pub quality_failures: Vec<String>,
@@ -146,6 +154,7 @@ pub struct GateDecision {
 pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecision {
     if !config.is_configured() {
         return GateDecision {
+            gate_mode: config.mode,
             status: GateStatus::NotConfigured,
             deployment_authorized: false,
             quality_failures: Vec::new(),
@@ -206,6 +215,12 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
             "primary outcome regression",
         ),
         maximum_rule(
+            "max_deployment_regression_pp",
+            config.max_deployment_regression_pp,
+            (-inputs.deployment.difference_pp).max(0.0),
+            "deployment-success regression",
+        ),
+        maximum_rule(
             "max_valid_but_wrong_increase_pp",
             config.max_valid_but_wrong_increase_pp,
             100.0
@@ -218,6 +233,12 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
             config.min_candidate_primary_success_rate,
             inputs.candidate_primary_success_rate,
             "candidate primary success rate",
+        ),
+        minimum_rule(
+            "min_candidate_deployment_success_rate",
+            config.min_candidate_deployment_success_rate,
+            inputs.candidate_deployment_success_rate,
+            "candidate deployment-success rate",
         ),
         maximum_rule(
             "max_candidate_valid_but_wrong_rate",
@@ -238,6 +259,14 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
                 .primary_lower_confidence_bound_pp
                 .map(|lower| (-lower).max(0.0)),
             "upper confidence bound on primary regression",
+        ),
+        optional_maximum_rule(
+            "max_upper_confidence_bound_deployment_regression_pp",
+            config.max_upper_confidence_bound_deployment_regression_pp,
+            inputs
+                .deployment_lower_confidence_bound_pp
+                .map(|lower| (-lower).max(0.0)),
+            "upper confidence bound on deployment-success regression",
         ),
         minimum_rule(
             "min_discordant_pairs",
@@ -334,6 +363,7 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         .map(|rule| rule.rule.clone())
         .collect();
     GateDecision {
+        gate_mode: config.mode,
         status,
         deployment_authorized: status == GateStatus::Passed && config.mode == GateMode::Release,
         quality_failures,
@@ -579,11 +609,14 @@ mod tests {
             primary_component_not_applicable_rate: 0.0,
             primary_component_unscored_rate: 0.0,
             primary,
+            deployment: primary,
             baseline_valid_but_wrong_rate: 0.0,
             candidate_valid_but_wrong_rate: 0.0,
             candidate_primary_success_rate: 1.0,
+            candidate_deployment_success_rate: 1.0,
             candidate_parse_validity: 1.0,
             primary_lower_confidence_bound_pp: Some(0.0),
+            deployment_lower_confidence_bound_pp: Some(0.0),
             candidate_schema_validity: 1.0,
             candidate_error_rate: 0.0,
             candidate_timeout_rate: 0.0,

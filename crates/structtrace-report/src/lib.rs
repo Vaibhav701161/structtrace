@@ -29,7 +29,7 @@ use structtrace_core::{
 use tempfile::NamedTempFile;
 
 /// The report asset format is versioned independently from stored scores.
-pub const REPORT_FORMAT_VERSION: u32 = 3;
+pub const REPORT_FORMAT_VERSION: u32 = 4;
 
 const CASE_CHUNK_SIZE: usize = 50;
 
@@ -46,6 +46,8 @@ struct ReportView {
     run_id: String,
     gate_label: String,
     gate_class: String,
+    release_gate: bool,
+    regression_gate: bool,
     deployment_authorized: bool,
     has_quality_failures: bool,
     has_evidence_failures: bool,
@@ -1056,13 +1058,30 @@ fn build_view(
             .clone()
             .unwrap_or_else(|| manifest.project_name.clone()),
         run_id: summary.run_id.clone(),
-        gate_label: summary.gate.status.label().to_owned(),
+        gate_label: match summary.gate.gate_mode {
+            structtrace_core::config::GateMode::Advisory => format!(
+                "ANALYSIS {}: NO RELEASE DECISION",
+                summary.gate.status.label()
+            ),
+            structtrace_core::config::GateMode::Regression => format!(
+                "REGRESSION {}: NOT RELEASE AUTHORIZATION",
+                summary.gate.status.label()
+            ),
+            structtrace_core::config::GateMode::Release if summary.gate.deployment_authorized => {
+                "DEPLOYMENT AUTHORIZED".to_owned()
+            }
+            structtrace_core::config::GateMode::Release => {
+                format!("RELEASE {}: DO NOT DEPLOY", summary.gate.status.label())
+            }
+        },
         gate_class: match summary.gate.status {
             GateStatus::Passed => "pass",
             GateStatus::Failed | GateStatus::Error => "fail",
             GateStatus::NotConfigured | GateStatus::InsufficientEvidence => "warn",
         }
         .to_owned(),
+        release_gate: summary.gate.gate_mode == structtrace_core::config::GateMode::Release,
+        regression_gate: summary.gate.gate_mode == structtrace_core::config::GateMode::Regression,
         deployment_authorized: summary.gate.deployment_authorized,
         has_quality_failures: !summary.gate.quality_failures.is_empty(),
         has_evidence_failures: !summary.gate.evidence_failures.is_empty(),
@@ -1102,8 +1121,11 @@ fn build_view(
             "{:+.2} pp",
             summary.jointly_scored_semantic.paired.difference_pp
         ),
-        baseline_primary: metric(summary.baseline.primary_pass, summary.baseline.total),
-        candidate_primary: metric(summary.candidate.primary_pass, summary.candidate.total),
+        baseline_primary: metric(summary.baseline.deployment_success, summary.baseline.total),
+        candidate_primary: metric(
+            summary.candidate.deployment_success,
+            summary.candidate.total,
+        ),
         structural_rows,
         descriptive_rows,
         transition: TransitionView {
@@ -1304,9 +1326,21 @@ fn summary_rows(baseline: &VariantSummary, candidate: &VariantSummary) -> Vec<Co
             baseline.total,
         ),
         comparison(
-            "Primary outcome pass",
-            baseline.primary_pass,
-            candidate.primary_pass,
+            "Structured success",
+            baseline.structured_success,
+            candidate.structured_success,
+            baseline.total,
+        ),
+        comparison(
+            "Semantic success",
+            baseline.semantic_success,
+            candidate.semantic_success,
+            baseline.total,
+        ),
+        comparison(
+            "Deployment success",
+            baseline.deployment_success,
+            candidate.deployment_success,
             baseline.total,
         ),
         comparison(
@@ -1894,9 +1928,9 @@ const TEMPLATE: &str = r##"<!doctype html>
   <section class="hero"><div><div class="eyebrow">Structured-output release evidence</div><h1>{{ project_name }}</h1><p class="muted">Run {{ run_id }}</p></div><div class="gate {{ gate_class }}">{{ gate_label }}</div></section>
   {% if share_derivative %}<div class="panel"><strong>Aggregate-only share derivative</strong><p class="muted">Case inputs, expected values, outputs, prompts, adapter metadata, and evaluation metadata were deliberately omitted. Use the hash-bound local run for case-level audit.</p></div>{% endif %}
   <section class="metrics" aria-label="Executive summary">
-    <div class="metric"><span>Baseline primary outcome · evidence units</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
-    <div class="metric"><span>Candidate primary outcome · evidence units</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
-    <div class="metric"><span>Independent paired difference</span><strong>{{ difference }}</strong>candidate minus baseline</div>
+    <div class="metric"><span>Baseline deployment success · evidence units</span><strong>{{ baseline_primary.percent }}</strong>{{ baseline_primary.count }}/{{ baseline_primary.total }}</div>
+    <div class="metric"><span>Candidate deployment success · evidence units</span><strong>{{ candidate_primary.percent }}</strong>{{ candidate_primary.count }}/{{ candidate_primary.total }}</div>
+    <div class="metric"><span>Deployment-success difference</span><strong>{{ difference }}</strong>candidate minus baseline</div>
     <div class="metric"><span>Independent bootstrap interval</span><strong>{{ interval }}</strong>one configured evidence unit per pair</div>
   </section>
 
@@ -1906,11 +1940,11 @@ const TEMPLATE: &str = r##"<!doctype html>
   <p class="muted">Inference policy: <code>{{ inference_unit }}</code></p>
 
   <h3>Descriptive execution totals</h3>
-  <p class="muted">All captured rows, including repeats. These values make no independence claim and are not used by the release gate.</p>
+  <p class="muted">All captured rows, including repeats. These values make no independence claim and are not used by gate rules.</p>
   <table><thead><tr><th>Metric across all captured rows</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody>{% for row in descriptive_rows %}<tr><td>{{ row.label }}</td><td class="num">{{ row.baseline.count }}/{{ row.baseline.total }} · {{ row.baseline.percent }}</td><td class="num">{{ row.candidate.count }}/{{ row.candidate.total }} · {{ row.candidate.percent }}</td></tr>{% endfor %}</tbody></table>
 
   <h2>Deployment success versus semantic effect</h2>
-  <p class="muted">The release gate uses complete-denominator deployment success. The semantic-only estimate includes only independent pairs where both primary outcomes explicitly resolved to true or false; operational failures are not relabeled as semantic errors.</p>
+  <p class="muted">Gate rules use complete-denominator deployment success. The semantic-only estimate includes only independent pairs where both primary outcomes explicitly resolved to true or false; operational failures are not relabeled as semantic errors.</p>
   <table><thead><tr><th>Estimate</th><th>Included pairs</th><th>Excluded operational/error pairs</th><th>Candidate minus baseline</th></tr></thead><tbody><tr><td>Jointly scored semantic effect</td><td class="num">{{ semantic_jointly_scored }}</td><td class="num">{{ semantic_excluded }}</td><td class="num">{{ semantic_difference }}</td></tr></tbody></table>
 
   {% if research_studies %}<section><h2>Accepted research matrices</h2><p class="muted">The same class of contract-preserving change had different effects across evaluated systems. These are compact normalized outcomes, not universal model rankings.</p><table><thead><tr><th>Study</th><th>Baseline correct</th><th>Candidate correct</th><th>Candidate-only</th><th>Baseline-only</th></tr></thead><tbody>{% for study in research_studies %}<tr><td>{{ study.label }}</td><td class="num">{{ study.baseline.count }}/{{ study.baseline.total }}</td><td class="num">{{ study.candidate.count }}/{{ study.candidate.total }}</td><td class="num">{{ study.candidate_only }}</td><td class="num">{{ study.baseline_only }}</td></tr>{% endfor %}</tbody></table></section>{% endif %}
@@ -1922,7 +1956,7 @@ const TEMPLATE: &str = r##"<!doctype html>
   <h2>Independent deployment-success transition matrix</h2>
   <div class="matrix" aria-label="Paired transition matrix"><div class="cell"><span>Both pass</span><strong>{{ transition.both_pass }}</strong></div><div class="cell loss"><span>Baseline-only pass</span><strong>{{ transition.baseline_only }}</strong></div><div class="cell win"><span>Candidate-only pass</span><strong>{{ transition.candidate_only }}</strong></div><div class="cell"><span>Both fail</span><strong>{{ transition.both_fail }}</strong></div></div>
 
-  <h2>Release gate</h2><div class="panel"><strong>{% if deployment_authorized %}DEPLOYMENT AUTHORIZED{% else %}DO NOT DEPLOY{% endif %}</strong>{% if has_quality_failures %}<p>Quality threshold failed.</p>{% endif %}{% if has_evidence_failures %}<p>Evidence requirements are also insufficient.</p>{% endif %}{% if has_runtime_errors %}<p>One or more rules could not be evaluated safely.</p>{% endif %}{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
+  <h2>{% if release_gate %}Release gate{% elif regression_gate %}Regression check{% else %}Advisory analysis{% endif %}</h2><div class="panel"><strong>{% if release_gate %}{% if deployment_authorized %}DEPLOYMENT AUTHORIZED{% else %}DO NOT DEPLOY{% endif %}{% elif regression_gate %}THIS IS NOT RELEASE AUTHORIZATION{% else %}NO RELEASE DECISION WAS MADE{% endif %}</strong>{% if has_quality_failures %}<p>Quality threshold failed.</p>{% endif %}{% if has_evidence_failures %}<p>Evidence requirements are also insufficient.</p>{% endif %}{% if has_runtime_errors %}<p>One or more rules could not be evaluated safely.</p>{% endif %}{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
 
   <h2>Evaluator results</h2><p class="muted">Every evaluator state remains explicit; errors, not-applicable results, and missing scores are never folded into semantic failure.</p><table><thead><tr><th rowspan="2">Evaluator</th><th colspan="5">Baseline</th><th colspan="5">Candidate</th></tr><tr><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th></tr></thead><tbody>{% for row in evaluator_rows %}<tr><td><code>{{ row.id }}</code></td><td class="num">{{ row.baseline.pass }}</td><td class="num">{{ row.baseline.fail }}</td><td class="num">{{ row.baseline.error }}</td><td class="num">{{ row.baseline.not_applicable }}</td><td class="num">{{ row.baseline.unscored }}</td><td class="num">{{ row.candidate.pass }}</td><td class="num">{{ row.candidate.fail }}</td><td class="num">{{ row.candidate.error }}</td><td class="num">{{ row.candidate.not_applicable }}</td><td class="num">{{ row.candidate.unscored }}</td></tr>{% endfor %}</tbody></table>
 
@@ -1976,7 +2010,7 @@ mod tests {
 
     fn report_config(title: &str) -> Config {
         serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "report-test"},
             "dataset": {"path": "data.jsonl", "format": "jsonl"},
             "schema": {"path": "schema.json"},
@@ -2066,6 +2100,9 @@ mod tests {
             parse_valid: total,
             schema_valid: total,
             primary_pass: total,
+            structured_success: total,
+            semantic_success: total,
+            deployment_success: total,
             valid_but_wrong: 0,
             errors: 0,
             timeouts: 0,
@@ -2095,6 +2132,7 @@ mod tests {
                 groups: Vec::new(),
             },
             independent_paired: paired.clone(),
+            deployment_paired: paired.clone(),
             independent_bootstrap: BootstrapInterval {
                 lower_pp: 0.0,
                 upper_pp: 0.0,
@@ -2120,6 +2158,7 @@ mod tests {
                 seed: 17,
             },
             gate: GateDecision {
+                gate_mode: structtrace_core::config::GateMode::Release,
                 status: GateStatus::Passed,
                 deployment_authorized: true,
                 quality_failures: Vec::new(),
@@ -2179,6 +2218,31 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("The primary outcome has no field-level facts."));
         assert!(html.contains("No field-level evaluator diagnostics are available."));
+    }
+
+    #[test]
+    fn regression_report_cannot_be_mistaken_for_release_authorization() {
+        let config = report_config("regression only");
+        let records = vec![passing_record("case-1".to_owned(), json!({"ok": true}))];
+        let mut summary = summary_for(records.len());
+        summary.gate.gate_mode = structtrace_core::config::GateMode::Regression;
+        summary.gate.deployment_authorized = false;
+        let manifest = RunManifest::new("report-run".to_owned(), "report-test".to_owned());
+        let mut view = build_view(&summary, &manifest, &records, &config).unwrap();
+        let cases = std::mem::take(&mut view.cases);
+        view.embedded_cases_json = Some(serde_json::to_string(&cases).unwrap());
+        let mut environment = Environment::new();
+        environment.set_auto_escape_callback(|_| AutoEscape::Html);
+        environment.add_template("report.html", TEMPLATE).unwrap();
+        let html = environment
+            .get_template("report.html")
+            .unwrap()
+            .render(view)
+            .unwrap();
+
+        assert!(html.contains("Regression check"));
+        assert!(html.contains("THIS IS NOT RELEASE AUTHORIZATION"));
+        assert!(!html.contains("DEPLOYMENT AUTHORIZED"));
     }
 
     #[test]
@@ -2370,7 +2434,7 @@ mod tests {
     #[test]
     fn case_view_redacts_input_secrets_and_their_output_echoes() {
         let config: Config = serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "privacy"},
             "storage": {
                 "root": ".structtrace",
@@ -2455,7 +2519,7 @@ mod tests {
     #[test]
     fn redaction_never_falls_back_for_typed_or_reserved_values() {
         let config: Config = serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "privacy-adversarial"},
             "storage": {
                 "redaction": {"json_pointers": ["/input/secret"]}

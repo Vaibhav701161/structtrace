@@ -27,10 +27,7 @@ use tempfile::NamedTempFile;
 use ulid::Ulid;
 
 use crate::{
-    recorded::{
-        CompletedRun, PreparedVariant, apply_storage_retention, finalize_prepared_for_run,
-        outputs_jsonl,
-    },
+    recorded::{CompletedRun, PreparedVariant, finalize_prepared_for_run, outputs_jsonl},
     storage::RunStore,
 };
 
@@ -604,7 +601,7 @@ async fn prepare_or_restore(
             )?,
         });
     }
-    let mut prepared = prepare_variant(
+    let prepared = prepare_variant(
         project_root,
         name,
         variant,
@@ -612,6 +609,10 @@ async fn prepare_or_restore(
         model_facing_schema,
         bridge_path,
         limits,
+        run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .context("run directory has no valid run nonce")?,
     )
     .await?;
     let retained_config_bytes = structtrace_core::hashing::read_bounded(
@@ -621,12 +622,8 @@ async fn prepare_or_restore(
     )?;
     let retained_config: Config =
         structtrace_core::strict_json::from_slice(&retained_config_bytes)?;
-    apply_storage_retention(
-        &mut prepared,
-        retained_config.storage.retain_raw_outputs,
-        retained_config.storage.retain_provider_responses,
-        retained_config.report.include_prompts,
-    )?;
+    // Keep the immutable capture through analysis. The finalizer applies retention only after
+    // strict parsing, validation, and external evaluator execution are frozen.
     atomic_write(output_path, &prepared.source_bytes)?;
     let retained_log_bytes = std::fs::read_dir(run_dir.join("logs"))?
         .filter_map(|entry| entry.ok())
@@ -672,6 +669,7 @@ async fn prepare_or_restore(
     Ok(prepared)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_variant(
     project_root: &Path,
     name: &str,
@@ -680,12 +678,9 @@ async fn prepare_variant(
     model_facing_schema: Option<&Value>,
     bridge_path: &Path,
     limits: &structtrace_core::config::LimitsConfig,
+    run_nonce: &str,
 ) -> anyhow::Result<PreparedVariant> {
-    let variant_cases = dataset
-        .cases
-        .iter()
-        .map(VariantCase::from)
-        .collect::<Vec<_>>();
+    let variant_cases = variant_cases_for_run(dataset, run_nonce)?;
     match variant {
         VariantConfig::Recorded { path } => {
             let path = resolve(project_root, path);
@@ -720,7 +715,7 @@ async fn prepare_variant(
             .await;
             from_adapter(
                 format!("command:{name}:{}", command.program),
-                remap_adapter_outputs(run, dataset)?,
+                remap_adapter_outputs(run, dataset, &variant_cases)?,
             )
         }
         VariantConfig::Python {
@@ -744,7 +739,7 @@ async fn prepare_variant(
             .await;
             from_adapter(
                 format!("python:{name}:{callable}"),
-                remap_adapter_outputs(run, dataset)?,
+                remap_adapter_outputs(run, dataset, &variant_cases)?,
             )
         }
         VariantConfig::OpenaiCompatible(adapter) => {
@@ -761,23 +756,52 @@ async fn prepare_variant(
             .await;
             from_adapter(
                 format!("openai_compatible:{name}:{}", adapter.model),
-                remap_adapter_outputs(run, dataset)?,
+                remap_adapter_outputs(run, dataset, &variant_cases)?,
             )
         }
     }
 }
 
-fn remap_adapter_outputs(mut run: AdapterRun, dataset: &Dataset) -> anyhow::Result<AdapterRun> {
+fn variant_cases_for_run(dataset: &Dataset, run_nonce: &str) -> anyhow::Result<Vec<VariantCase>> {
+    dataset
+        .cases
+        .iter()
+        .enumerate()
+        .map(|(ordinal, case)| {
+            let digest = hash_canonical_json(&serde_json::json!({
+                "run_nonce": run_nonce,
+                "ordinal": ordinal,
+            }))?;
+            Ok(VariantCase {
+                id: format!("stx-{}", &digest[..32]),
+                input: case.input.clone(),
+                metadata: case.model_visible_metadata.clone(),
+            })
+        })
+        .collect()
+}
+
+fn remap_adapter_outputs(
+    mut run: AdapterRun,
+    dataset: &Dataset,
+    variant_cases: &[VariantCase],
+) -> anyhow::Result<AdapterRun> {
     anyhow::ensure!(
         run.rows.len() == dataset.cases.len(),
         "adapter returned {} rows for {} dataset cases",
         run.rows.len(),
         dataset.cases.len()
     );
-    for (ordinal, (row, case)) in run.rows.iter_mut().zip(&dataset.cases).enumerate() {
-        let expected_token = VariantCase::from(case).id;
+    for (ordinal, ((row, case), variant_case)) in run
+        .rows
+        .iter_mut()
+        .zip(&dataset.cases)
+        .zip(variant_cases)
+        .enumerate()
+    {
+        let expected_token = &variant_case.id;
         anyhow::ensure!(
-            row.case_id == expected_token,
+            &row.case_id == expected_token,
             "adapter row {} returned an unexpected opaque execution token",
             ordinal + 1
         );
@@ -986,7 +1010,7 @@ mod tests {
     fn recorded_run_does_not_scan_unrelated_python_tree() {
         let root = tempdir().unwrap();
         let config: Config = serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "recorded-only"},
             "dataset": {"path": "data.jsonl"},
             "schema": {"path": "schema.json"},
@@ -1011,7 +1035,7 @@ mod tests {
 
     fn openai_schema_config() -> Config {
         serde_json::from_value(json!({
-            "version": 2,
+            "version": 3,
             "project": {"name": "schema-snapshot"},
             "dataset": {"path": "data.jsonl"},
             "schema": {"path": "external.json"},
@@ -1085,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_adapter_token_maps_back_without_exposing_dataset_id() {
+    fn opaque_adapter_tokens_are_run_scoped_unique_and_map_back() {
         let case = Case {
             id: "gold-positive-001".to_owned(),
             input: json!({"text": "hello"}),
@@ -1094,35 +1118,44 @@ mod tests {
             metadata: None,
             source_line: 1,
         };
+        let mut repeated = case.clone();
+        repeated.id = "gold-positive-002".to_owned();
         let dataset = Dataset {
-            cases: vec![case.clone()],
+            cases: vec![case.clone(), repeated],
             source_hash: String::new(),
             source_bytes: Vec::new(),
         };
-        let token = VariantCase::from(&case).id;
+        let variant_cases = variant_cases_for_run(&dataset, "run-a").unwrap();
+        let token = variant_cases[0].id.clone();
         assert_ne!(token, case.id);
         assert!(!token.contains("positive"));
-        let mut renamed = case.clone();
-        renamed.id = "completely-different-id".to_owned();
-        assert_eq!(VariantCase::from(&renamed).id, token);
+        assert_ne!(variant_cases[0].id, variant_cases[1].id);
+        assert_ne!(
+            variant_cases[0].id,
+            variant_cases_for_run(&dataset, "run-b").unwrap()[0].id
+        );
         let run = AdapterRun {
-            rows: vec![structtrace_core::output::VariantOutput {
-                case_id: token,
-                status: structtrace_core::output::OutputStatus::Ok,
-                raw_output: Some("{}".to_owned()),
-                parsed_output: None,
-                error: None,
-                latency_ms: None,
-                usage: None,
-                cost: None,
-                metadata: Value::Null,
-                retries: Vec::new(),
-            }],
+            rows: variant_cases
+                .iter()
+                .map(|variant_case| structtrace_core::output::VariantOutput {
+                    case_id: variant_case.id.clone(),
+                    status: structtrace_core::output::OutputStatus::Ok,
+                    raw_output: Some("{}".to_owned()),
+                    parsed_output: None,
+                    error: None,
+                    latency_ms: None,
+                    usage: None,
+                    cost: None,
+                    metadata: Value::Null,
+                    retries: Vec::new(),
+                })
+                .collect(),
             stderr: Vec::new(),
             protocol_errors: Vec::new(),
         };
-        let remapped = remap_adapter_outputs(run, &dataset).unwrap();
+        let remapped = remap_adapter_outputs(run, &dataset, &variant_cases).unwrap();
         assert_eq!(remapped.rows[0].case_id, case.id);
+        assert_eq!(remapped.rows[1].case_id, "gold-positive-002");
     }
 
     #[tokio::test]
@@ -1136,7 +1169,7 @@ mod tests {
         std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(
             root.path().join("structtrace.yaml"),
-            r#"version: 2
+            r#"version: 3
 project: {name: lifecycle-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -1190,7 +1223,7 @@ analysis: {primary_outcome: correct}
         std::fs::write(
             root.path().join("structtrace.yaml"),
             format!(
-                r#"version: 2
+                r#"version: 3
 project: {{name: immutable-source}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}

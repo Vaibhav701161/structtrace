@@ -214,6 +214,15 @@ pub struct CaseEvaluation {
     pub outcomes: BTreeMap<String, OutcomeResult>,
     /// Whether the primary semantic outcome passed.
     pub primary_pass: bool,
+    /// Whether adapter execution, strict parsing, and caller-facing schema validation succeeded.
+    #[serde(default)]
+    pub structured_success: bool,
+    /// Whether the named primary semantic outcome passed, independent of structural validity.
+    #[serde(default)]
+    pub semantic_success: bool,
+    /// Whether this row is safe to count as a complete deployable success.
+    #[serde(default)]
+    pub deployment_success: bool,
     /// Strict parse plus schema validity plus primary failure.
     pub valid_but_wrong: bool,
     /// Structurally valid, semantically false, and evaluated by every required component.
@@ -325,6 +334,8 @@ pub fn evaluate_case_with_external(
     let primary_status = primary_result.map(|result| result.truth);
     let primary_pass = primary_status.is_some_and(OutcomeStatus::is_pass);
     let primary_fully_evaluated = primary_result.is_some_and(|result| result.fully_evaluated);
+    let structured_success = output.status == OutputStatus::Ok && schema_valid;
+    let deployment_success = structured_success && primary_pass && primary_fully_evaluated;
     CaseEvaluation {
         case_id: case.id.clone(),
         adapter_status: output.status,
@@ -336,6 +347,9 @@ pub fn evaluate_case_with_external(
         evaluators: evaluator_results,
         outcomes: outcome_results,
         primary_pass,
+        structured_success,
+        semantic_success: primary_pass,
+        deployment_success,
         valid_but_wrong: schema_valid && primary_status == Some(OutcomeStatus::False),
         fully_evaluated_valid_but_wrong: schema_valid
             && primary_status == Some(OutcomeStatus::False)
@@ -2023,6 +2037,64 @@ mod tests {
         assert!(result.schema_valid);
         assert!(!result.primary_pass);
         assert!(result.valid_but_wrong);
+        assert!(result.structured_success);
+        assert!(!result.semantic_success);
+        assert!(!result.deployment_success);
+    }
+
+    #[test]
+    fn schema_invalid_semantic_pass_is_not_deployment_success() {
+        let schema = compile_schema(&json!({
+            "type": "object",
+            "required": ["label"],
+            "properties": {"label": {"type": "string"}},
+            "additionalProperties": false
+        }))
+        .unwrap();
+        let case = Case {
+            id: "schema-invalid".to_owned(),
+            input: Value::Null,
+            expected: Some(json!({"label": "accepted"})),
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let evaluators = vec![EvaluatorConfig {
+            id: "label".to_owned(),
+            implementation_version: None,
+            implementation: Default::default(),
+            kind: EvaluatorKind::JsonPointerExact {
+                pointer: "/label".to_owned(),
+                expected_pointer: "/label".to_owned(),
+            },
+        }];
+        let outcomes = BTreeMap::from([(
+            "semantic".to_owned(),
+            OutcomeConfig {
+                all_of: vec!["label".to_owned()],
+                any_of: vec![],
+            },
+        )]);
+        let result = evaluate_case(
+            &case,
+            &output(r#"{"label":"accepted","extra":true}"#),
+            &schema,
+            &evaluators,
+            &outcomes,
+            "semantic",
+        );
+        assert!(result.semantic_success);
+        assert!(!result.schema_valid);
+        assert!(!result.structured_success);
+        assert!(!result.deployment_success);
+    }
+
+    #[test]
+    fn incomplete_primary_outcome_cannot_be_deployment_success() {
+        let result = valid_output_with_primary_status(EvaluationStatus::Error);
+        assert!(result.structured_success);
+        assert!(!result.semantic_success);
+        assert!(!result.deployment_success);
     }
 
     fn pointer_pairs() -> Vec<PointerPair> {

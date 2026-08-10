@@ -2,7 +2,7 @@
 
 The top-level fields are `version`, `project`, `storage`, `limits`, `dataset`, `schema`, `variants`, `evaluators`, `outcomes`, `analysis`, `gate`, and `report`.
 
-Version `2` is the only accepted configuration version. `variants.baseline` and
+Version `3` is the only accepted configuration version. `variants.baseline` and
 `variants.candidate` are required and are the only accepted variant keys. Evaluator IDs
 must be unique. Every outcome must define exactly one non-empty `all_of` or `any_of` list, and
 every referenced evaluator must exist. `analysis.primary_outcome` must name a configured outcome.

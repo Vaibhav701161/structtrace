@@ -195,6 +195,9 @@ enum Commands {
         /// Integrity verification performed before applying the stored gate.
         #[arg(long, value_enum, default_value = "hash")]
         verify: GateVerification,
+        /// Return success only for an authorizing release-mode decision.
+        #[arg(long)]
+        require_release_authorization: bool,
     },
     /// Recompute retained scores, summaries, intervals, and gate results.
     Replay {
@@ -556,7 +559,16 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             }
             Ok(0)
         }
-        Commands::Gate { run, verify } => gate(cli, &resolve_run(cli, run)?, *verify),
+        Commands::Gate {
+            run,
+            verify,
+            require_release_authorization,
+        } => gate(
+            cli,
+            &resolve_run(cli, run)?,
+            *verify,
+            *require_release_authorization,
+        ),
         Commands::Replay {
             run,
             research_fixture,
@@ -757,7 +769,7 @@ fn manage_runs(cli: &Cli, command: &RunsCommand) -> anyhow::Result<u8> {
             let run_dir = resolve_run(cli, run)?;
             ensure_complete(&run_dir)?;
             ensure_safe_run_tree(cli, &run_dir)?;
-            verify_complete_manifest(&run_dir)?;
+            let manifest = verify_complete_manifest(&run_dir)?;
             let destination = if destination.is_absolute() {
                 destination.clone()
             } else {
@@ -765,20 +777,21 @@ fn manage_runs(cli: &Cli, command: &RunsCommand) -> anyhow::Result<u8> {
             };
             anyhow::ensure!(!destination.exists(), "archive destination already exists");
             std::fs::create_dir(&destination)?;
+            harden_archive_directory(&destination)?;
             let copied_root = destination.join("run");
             std::fs::create_dir(&copied_root)?;
+            harden_archive_directory(&copied_root)?;
             let mut hashes = std::collections::BTreeMap::new();
-            copy_verified_tree(&run_dir, &run_dir, &copied_root, &mut hashes)?;
+            copy_manifest_allowlist(&run_dir, &copied_root, &manifest, &mut hashes)?;
             let receipt = serde_json::json!({
                 "format_version": 1,
-                "run_id": run,
+                "run_id": manifest.run_id,
                 "hash_algorithm": "blake3",
                 "files": hashes,
             });
-            std::fs::write(
-                destination.join("archive-verification.json"),
-                serde_json::to_vec_pretty(&receipt)?,
-            )?;
+            let receipt_path = destination.join("archive-verification.json");
+            std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+            harden_archive_file(&receipt_path)?;
             if !cli.quiet {
                 println!("Archived verified run to {}", destination.display());
             }
@@ -840,47 +853,74 @@ fn ensure_safe_run_tree(cli: &Cli, run_dir: &Path) -> anyhow::Result<()> {
     check(&canonical)
 }
 
-fn verify_complete_manifest(run_dir: &Path) -> anyhow::Result<()> {
+fn verify_complete_manifest(run_dir: &Path) -> anyhow::Result<RunManifest> {
     let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
     for relative in manifest.artifacts.keys() {
         verify_manifest_artifact(run_dir, relative)?;
     }
+    Ok(manifest)
+}
+
+fn copy_manifest_allowlist(
+    source_root: &Path,
+    destination_root: &Path,
+    manifest: &RunManifest,
+    hashes: &mut std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let mut allowlist = manifest.artifacts.keys().cloned().collect::<Vec<_>>();
+    allowlist.push("manifest.json".to_owned());
+    allowlist.sort();
+    allowlist.dedup();
+    for relative in allowlist {
+        let source = source_root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&source)
+            .with_context(|| format!("verified archive artifact `{relative}` is missing"))?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "archive source contains a symbolic link"
+        );
+        anyhow::ensure!(
+            metadata.is_file(),
+            "archive source contains a non-regular entry"
+        );
+        let destination = destination_root.join(&relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+            harden_archive_directory(parent)?;
+        }
+        std::fs::copy(&source, &destination)?;
+        harden_archive_file(&destination)?;
+        let source_hash = hash_file(&source)?;
+        anyhow::ensure!(
+            source_hash == hash_file(&destination)?,
+            "archive copy mismatch"
+        );
+        hashes.insert(relative, source_hash);
+    }
     Ok(())
 }
 
-fn copy_verified_tree(
-    source_root: &Path,
-    source: &Path,
-    destination_root: &Path,
-    hashes: &mut std::collections::BTreeMap<String, String>,
-) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        anyhow::ensure!(
-            !file_type.is_symlink(),
-            "archive source contains a symbolic link"
-        );
-        let relative = entry.path().strip_prefix(source_root)?.to_owned();
-        let destination = destination_root.join(&relative);
-        if file_type.is_dir() {
-            std::fs::create_dir(&destination)?;
-            copy_verified_tree(source_root, &entry.path(), destination_root, hashes)?;
-        } else {
-            anyhow::ensure!(
-                file_type.is_file(),
-                "archive source contains a non-regular entry"
-            );
-            std::fs::copy(entry.path(), &destination)?;
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            let source_hash = hash_file(&entry.path())?;
-            anyhow::ensure!(
-                source_hash == hash_file(&destination)?,
-                "archive copy mismatch"
-            );
-            hashes.insert(relative, source_hash);
-        }
-    }
+#[cfg(unix)]
+fn harden_archive_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_archive_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_archive_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_archive_file(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -965,13 +1005,22 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
         OutputFormat::Github => {
             println!("## StructTrace run `{}`", run.run_id);
             println!();
+            println!(
+                "- Gate mode: `{}`",
+                gate_mode_label(run.summary.gate.gate_mode)
+            );
+            println!(
+                "- Deployment authorized: `{}`",
+                run.summary.gate.deployment_authorized
+            );
+            println!();
             println!("| Metric | Baseline | Candidate |");
             println!("|---|---:|---:|");
             println!(
-                "| Primary outcome | {}/{} | {}/{} |",
-                run.summary.baseline.primary_pass,
+                "| Deployment success | {}/{} | {}/{} |",
+                run.summary.baseline.deployment_success,
                 run.summary.baseline.total,
-                run.summary.candidate.primary_pass,
+                run.summary.candidate.deployment_success,
                 run.summary.candidate.total
             );
             println!(
@@ -990,19 +1039,19 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
             println!("Run:          {}", run.run_id);
             println!(
                 "Baseline:     {}/{} ({:.1}%)",
-                run.summary.baseline.primary_pass,
+                run.summary.baseline.deployment_success,
                 run.summary.baseline.total,
                 percent(
-                    run.summary.baseline.primary_pass,
+                    run.summary.baseline.deployment_success,
                     run.summary.baseline.total
                 )
             );
             println!(
                 "Candidate:    {}/{} ({:.1}%)",
-                run.summary.candidate.primary_pass,
+                run.summary.candidate.deployment_success,
                 run.summary.candidate.total,
                 percent(
-                    run.summary.candidate.primary_pass,
+                    run.summary.candidate.deployment_success,
                     run.summary.candidate.total
                 )
             );
@@ -1014,7 +1063,16 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
                 "Transitions:  {} candidate-only, {} baseline-only",
                 run.summary.paired.candidate_only_pass, run.summary.paired.baseline_only_pass
             );
-            println!("Gate:         {}", run.summary.gate.status.label());
+            println!(
+                "Gate:         {} {}",
+                gate_mode_label(run.summary.gate.gate_mode),
+                run.summary.gate.status.label()
+            );
+            if !run.summary.gate.deployment_authorized {
+                println!("Authorization: NO DEPLOYMENT AUTHORIZATION");
+            } else {
+                println!("Authorization: DEPLOYMENT AUTHORIZED");
+            }
             println!("Report:       {}/report/index.html", run.run_dir.display());
             println!("Open with:    structtrace report {} --open", run.run_id);
             println!("              (chunked reports may not work through file://)");
@@ -1023,7 +1081,12 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
     Ok(())
 }
 
-fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u8> {
+fn gate(
+    cli: &Cli,
+    run_dir: &Path,
+    verify: GateVerification,
+    require_release_authorization: bool,
+) -> anyhow::Result<u8> {
     ensure_complete(run_dir)?;
     verify_manifest_artifact(run_dir, "summary.json")?;
     if matches!(verify, GateVerification::Replay) {
@@ -1038,19 +1101,26 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
         );
     }
     let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
+    let exit_code = if require_release_authorization && !summary.gate.deployment_authorized {
+        EXIT_GATE_FAILED
+    } else {
+        gate_exit_code(summary.gate.status)
+    };
     if !cli.quiet {
         match cli.format {
             OutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "run_id": summary.run_id,
-                    "status": summary.gate.status,
+                    "gate_mode": summary.gate.gate_mode,
+                    "gate_status": summary.gate.status,
                     "deployment_authorized": summary.gate.deployment_authorized,
                     "quality_failures": summary.gate.quality_failures,
                     "evidence_failures": summary.gate.evidence_failures,
                     "runtime_errors": summary.gate.runtime_errors,
-                    "exit_code": gate_exit_code(summary.gate.status),
-                    "primary": summary.paired,
+                    "exit_code": exit_code,
+                    "deployment_paired": summary.deployment_paired,
+                    "semantic_fully_evaluated": summary.jointly_scored_semantic,
                     "rules": summary.gate.rules,
                 }))?
             ),
@@ -1058,19 +1128,38 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
             OutputFormat::Human => print_human_gate(&summary, run_dir),
         }
     }
-    Ok(gate_exit_code(summary.gate.status))
+    Ok(exit_code)
 }
 
 fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
-    println!("STRUCTTRACE RELEASE GATE: {}", gate_headline(summary));
-    println!(
-        "{}",
-        if summary.gate.deployment_authorized {
-            "DEPLOYMENT AUTHORIZED"
-        } else {
-            "DO NOT DEPLOY"
+    use structtrace_core::config::GateMode;
+    match summary.gate.gate_mode {
+        GateMode::Advisory => {
+            println!("STRUCTTRACE ADVISORY: {}", gate_headline(summary));
+            println!("ANALYSIS COMPLETE");
+            println!("NO RELEASE DECISION WAS MADE");
         }
-    );
+        GateMode::Regression => {
+            println!("STRUCTTRACE REGRESSION CHECK: {}", gate_headline(summary));
+            if summary.gate.status == GateStatus::Passed {
+                println!("REGRESSION CHECK PASSED");
+            } else {
+                println!("REGRESSION CHECK DID NOT PASS");
+            }
+            println!("THIS IS NOT RELEASE AUTHORIZATION");
+        }
+        GateMode::Release => {
+            println!("STRUCTTRACE RELEASE GATE: {}", gate_headline(summary));
+            println!(
+                "{}",
+                if summary.gate.deployment_authorized {
+                    "DEPLOYMENT AUTHORIZED"
+                } else {
+                    "DO NOT DEPLOY"
+                }
+            );
+        }
+    }
     if !summary.gate.quality_failures.is_empty() {
         println!("Quality threshold failed.");
     }
@@ -1081,14 +1170,17 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
         println!("One or more gate rules could not be evaluated safely.");
     }
     println!();
-    println!("Primary outcome");
+    println!("Deployment success (adapter + strict JSON + schema + fully evaluated semantics)");
     println!(
         "  Baseline:   {:.1}%",
-        percent(summary.baseline.primary_pass, summary.baseline.total)
+        percent(summary.baseline.deployment_success, summary.baseline.total)
     );
     println!(
         "  Candidate:  {:.1}%",
-        percent(summary.candidate.primary_pass, summary.candidate.total)
+        percent(
+            summary.candidate.deployment_success,
+            summary.candidate.total
+        )
     );
     println!(
         "  Difference: {:+.2} percentage points",
@@ -1126,7 +1218,19 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
 }
 
 fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
-    let mut markdown = format!("## StructTrace release gate: {}", gate_headline(summary));
+    let mut markdown = match summary.gate.gate_mode {
+        structtrace_core::config::GateMode::Advisory => format!(
+            "## StructTrace advisory analysis: {}\n\n**NO RELEASE DECISION WAS MADE.**",
+            summary.gate.status.label()
+        ),
+        structtrace_core::config::GateMode::Regression => format!(
+            "## StructTrace regression check: {}\n\n**THIS IS NOT RELEASE AUTHORIZATION.**",
+            summary.gate.status.label()
+        ),
+        structtrace_core::config::GateMode::Release => {
+            format!("## StructTrace release gate: {}", gate_headline(summary))
+        }
+    };
     if !summary.gate.quality_failures.is_empty() {
         markdown.push_str("\n\n**Quality thresholds failed.**");
     }
@@ -1135,9 +1239,12 @@ fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
     }
     markdown.push_str("\n\n| Metric | Baseline | Candidate |\n|---|---:|---:|\n");
     markdown.push_str(&format!(
-        "| Primary outcome | {:.1}% | {:.1}% |\n",
-        percent(summary.baseline.primary_pass, summary.baseline.total),
-        percent(summary.candidate.primary_pass, summary.candidate.total)
+        "| Deployment success | {:.1}% | {:.1}% |\n",
+        percent(summary.baseline.deployment_success, summary.baseline.total),
+        percent(
+            summary.candidate.deployment_success,
+            summary.candidate.total
+        )
     ));
     markdown.push_str(&format!(
         "| Schema validity | {:.1}% | {:.1}% |\n",
@@ -1201,6 +1308,14 @@ fn gate_headline(summary: &RunSummary) -> String {
         "DO NOT DEPLOY: quality failed and evidence is insufficient".to_owned()
     } else {
         summary.gate.status.label().to_ascii_lowercase()
+    }
+}
+
+const fn gate_mode_label(mode: structtrace_core::config::GateMode) -> &'static str {
+    match mode {
+        structtrace_core::config::GateMode::Advisory => "advisory",
+        structtrace_core::config::GateMode::Regression => "regression",
+        structtrace_core::config::GateMode::Release => "release",
     }
 }
 
@@ -1283,13 +1398,16 @@ async fn doctor(
                             }
                         }
                         let duplicate_rows = dataset.cases.len().saturating_sub(fingerprints.len());
-                        let duplicate_passed = duplicate_rows == 0;
-                        passed &= !strict || duplicate_passed;
                         checks.push(serde_json::json!({
-                            "check": "independent_evidence",
-                            "passed": duplicate_passed,
-                            "required": strict,
-                            "detail": {"total_rows": dataset.cases.len(), "unique_semantic_cases": fingerprints.len(), "duplicate_rows": duplicate_rows}
+                            "check": "potential_evidence_collisions",
+                            "passed": true,
+                            "required": false,
+                            "detail": {
+                                "total_rows": dataset.cases.len(),
+                                "potential_unique_evidence_units": fingerprints.len(),
+                                "potential_colliding_rows": duplicate_rows,
+                                "policy": "Final singleton, exact-duplicate, repeated-trial, and label-conflict classification is performed by the shared execution analysis after both variant observations exist. Static doctor does not guess or fail a stricter policy."
+                            }
                         }));
                         let leakage_passed = visible_gold_matches == 0;
                         passed &= !strict || leakage_passed;

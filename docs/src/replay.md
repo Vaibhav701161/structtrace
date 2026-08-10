@@ -8,10 +8,12 @@ structtrace replay --research-fixture
 
 Replay first verifies every manifest-bound artifact hash and refuses unsafe paths. It independently
 reads the retained dataset and baseline and candidate output JSONL, reconstructs each paired case,
-and checks the reconstruction against the derived case artifact. It then recomputes strict
+and checks the reconstruction against the derived case artifact. For raw-disabled runs it verifies
+the retained strict-parse receipts and replays the canonical parsed view; it does not claim raw-byte
+replay. It then recomputes strict
 parsing, schema errors, built-in deterministic evaluator results, outcomes, primary passes,
 valid-but-wrong flags, paired transitions, effect estimates, exact McNemar, paired bootstrap
-interval, and release rules.
+intervals, structural success, semantic success, deployment success, and release rules.
 
 Side-effecting custom command and Python evaluators are deliberately not re-executed. StructTrace
 instead verifies receipts bound to the evaluator definition, exact request, parsed response fact,

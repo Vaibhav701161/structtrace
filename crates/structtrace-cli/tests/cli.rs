@@ -28,7 +28,7 @@ fn strict_doctor_fails_expected_leaf_leakage() {
     std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
     std::fs::write(
         root.path().join("structtrace.yaml"),
-        r#"version: 2
+        r#"version: 3
 project: {name: leakage-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -93,7 +93,7 @@ fn strict_doctor_requires_a_project_but_opaque_case_ids_are_allowed() {
     std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
     std::fs::write(
         root.path().join("structtrace.yaml"),
-        r#"version: 2
+        r#"version: 3
 project: {name: opaque-id-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -218,6 +218,9 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .unwrap()
         .unwrap()
         .path();
+    let summary_markdown = std::fs::read_to_string(run_dir.join("summary.md")).unwrap();
+    assert!(summary_markdown.contains("This is not release authorization."));
+    assert!(!summary_markdown.contains("**Release gate:"));
     let incomplete_dir = project.join(".structtrace/runs/ZZZZ-INCOMPLETE");
     std::fs::create_dir_all(&incomplete_dir).unwrap();
     let mut incomplete_manifest: serde_json::Value =
@@ -338,13 +341,39 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .unwrap();
     assert_eq!(status.code(), Some(12));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
-    assert!(github_summary.contains(
-        "## StructTrace release gate: DO NOT DEPLOY: quality failed and evidence is insufficient"
-    ));
+    assert!(github_summary.contains("## StructTrace regression check: INSUFFICIENT EVIDENCE"));
+    assert!(github_summary.contains("THIS IS NOT RELEASE AUTHORIZATION"));
+    assert!(!github_summary.contains("DEPLOYMENT AUTHORIZED"));
     assert!(github_summary.contains("Quality thresholds failed"));
     assert!(github_summary.contains("Evidence requirements are also insufficient"));
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
-    assert!(github_summary.contains("| Primary outcome |"));
+    assert!(github_summary.contains("| Deployment success |"));
+    let authorization = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            project.to_str().unwrap(),
+            "gate",
+            "latest",
+            "--require-release-authorization",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(authorization.code(), Some(10));
+    let json_gate = binary()
+        .args([
+            "--format",
+            "json",
+            "--project-root",
+            project.to_str().unwrap(),
+            "gate",
+            "latest",
+        ])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json_gate.stdout).unwrap();
+    assert_eq!(json["gate_mode"], "regression");
+    assert_eq!(json["deployment_authorized"], false);
 
     let summary_path = run_dir.join("summary.json");
     let original_summary = std::fs::read(&summary_path).unwrap();
@@ -627,6 +656,7 @@ fn run_management_archives_and_deletes_only_an_inactive_run() {
         );
     }
     let archive = root.path().join("archive");
+    std::fs::write(run_dir.join("private-debug.txt"), "DO_NOT_ARCHIVE_SECRET").unwrap();
     assert!(
         binary()
             .args([
@@ -635,7 +665,7 @@ fn run_management_archives_and_deletes_only_an_inactive_run() {
                 project.to_str().unwrap(),
                 "runs",
                 "archive",
-                &run_id,
+                "latest",
                 archive.to_str().unwrap(),
             ])
             .status()
@@ -644,6 +674,27 @@ fn run_management_archives_and_deletes_only_an_inactive_run() {
     );
     assert!(archive.join("archive-verification.json").is_file());
     assert!(archive.join("run/manifest.json").is_file());
+    assert!(!archive.join("run/private-debug.txt").exists());
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(archive.join("archive-verification.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["run_id"], run_id);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(archive.join("archive-verification.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     assert!(
         binary()
             .args([

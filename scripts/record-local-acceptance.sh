@@ -51,7 +51,7 @@ record_check fmt 'cargo fmt --all -- --check'
 record_check clippy 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
 record_check tests 'cargo test --workspace --all-features --locked'
 record_check release_build 'cargo build --release --workspace --locked' 'target/release/structtrace'
-record_check documentation 'mdbook build docs' 'docs/book/index.html'
+record_check documentation 'mdbook build' 'docs/book/index.html'
 record_check release_cli_help 'target/release/structtrace --help' 'target/release/structtrace'
 
 mkdir -p "$(dirname "$audit_output")"

@@ -19,10 +19,10 @@ pub mod strict_json;
 pub use error::{CoreError, Result};
 
 /// Current on-disk artifact format.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 8;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 9;
 
 /// Current project configuration schema.
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 /// Current command and evaluator JSONL protocol.
 pub const PROTOCOL_VERSION: u32 = 3;

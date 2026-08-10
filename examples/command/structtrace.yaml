@@ -1,4 +1,4 @@
-version: 2
+version: 3
 project: {name: command-example}
 dataset: {path: data/golden.jsonl, format: jsonl}
 schema: {path: schemas/output.schema.json}

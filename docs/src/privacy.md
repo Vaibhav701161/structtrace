@@ -42,15 +42,18 @@ storage:
     custom_patterns: [tenant-secret-prefix]
 ```
 
-Raw retention changes persisted presentation and forensic detail only. Stable parse facts and
-retention-independent evaluator requests preserve scores, evidence classification, and gates. Full
+Raw retention is applied only after analysis and changes persisted presentation and forensic detail
+only. Stable parse receipts and retention-independent evaluator requests preserve scores, evidence
+classification, and gates. Full
 provider-response retention defaults to false. Report redaction fails closed: if a safe report
 view cannot be constructed, report creation returns an error rather than falling back to the
 original value. The redaction source includes input, expected values, model-visible metadata, and
 evaluation-only metadata. Selected values and their echoes in output, evaluator evidence, provider
 response bodies, retry records, search indexes, and filters are replaced with `[REDACTED]`.
-Provider HTTP error bodies are never copied into user-facing error messages when response retention
-is disabled. Disabling raw retention reduces case-level debugging.
+Provider HTTP error bodies are never copied into scoring or user-facing error messages. Disabling
+raw retention records the original raw hash, strict parse status, canonical parsed-value hash when
+available, parser version, and parse error, but reduces case-level debugging and prevents raw-byte
+replay.
 
 `exact_structured` redacts typed values exactly and replaces distinctive text echoes while avoiding
 destructive replacement of every `0`, `1`, `true`, or short number. Select `aggressive_textual` to

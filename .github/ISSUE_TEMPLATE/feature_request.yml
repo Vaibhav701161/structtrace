@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a focused improvement to the supported StructTrace workflow
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Release-decision problem
+      description: Describe the workflow problem, not only a desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Concrete example and desired acceptance test
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Intended support level
+      options: [Stable recorded-output surface, Beta adapter surface, Experimental provider surface]
+    validations:
+      required: true

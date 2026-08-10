@@ -13,7 +13,7 @@ use structtrace_core::{
 };
 
 /// Current SQLite schema migration version.
-pub const DATABASE_VERSION: i64 = 4;
+pub const DATABASE_VERSION: i64 = 5;
 
 /// Durable local run store.
 pub struct RunStore {
@@ -386,7 +386,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 blake3 TEXT NOT NULL,
                 byte_length INTEGER NOT NULL
             );
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             COMMIT;
             "#,
         )?;
@@ -398,7 +398,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             ALTER TABLE cases ADD COLUMN source_line INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
             ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             COMMIT;
             "#,
         )?;
@@ -408,7 +408,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             BEGIN;
             ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
             ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             COMMIT;
             "#,
         )?;
@@ -417,10 +417,14 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             r#"
             BEGIN;
             ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             COMMIT;
             "#,
         )?;
+    } else if version == 4 {
+        // Version 5 binds the database to artifact v9 deployment-success semantics. The stored
+        // evaluation JSON is self-describing, so no table rewrite is required.
+        connection.pragma_update(None, "user_version", DATABASE_VERSION)?;
     }
     Ok(())
 }

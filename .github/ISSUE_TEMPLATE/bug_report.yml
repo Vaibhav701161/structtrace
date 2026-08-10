@@ -1,0 +1,41 @@
+name: Bug report
+description: Report incorrect evaluation, replay, gate, or CLI behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove secrets and customer data before attaching artifacts.
+  - type: input
+    id: version
+    attributes:
+      label: StructTrace version and platform
+      placeholder: structtrace 0.1.0, Linux x86-64
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Product surface
+      options: [Recorded JSONL, Report, Replay, Gate, Command adapter, Python adapter, Custom evaluator, OpenAI-compatible adapter, Installer]
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and reproduction
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed credentials, personal data, prompts, and private model outputs.
+          required: true
