@@ -14,9 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
+csv.workspace = true
 open.workspace = true
 minijinja.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -27,6 +30,7 @@ structtrace-report = { path = "../structtrace-report", version = "0.1.0" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -29,6 +29,7 @@ use structtrace_core::{
 
 mod bundled_demo;
 mod initialize;
+mod local_app;
 
 const EXIT_INVALID_INPUT: u8 = 2;
 const EXIT_RUN_FAILED: u8 = 3;
@@ -85,6 +86,12 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Open the local-first StructTrace browser product.
+    Open {
+        /// Start the server without opening the default browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Create a complete StructTrace project without overwriting existing files.
     Init {
         /// New project directory. Defaults to the current project root.
@@ -396,6 +403,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     match &cli.command {
+        Commands::Open { no_browser } => {
+            local_app::serve(&cli.project_root, !no_browser).await?;
+            Ok(0)
+        }
         Commands::Init {
             path,
             template,

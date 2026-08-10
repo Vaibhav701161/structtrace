@@ -1,0 +1,56 @@
+{
+  "$schema": "https://design-tokens.github.io/community-group/format/",
+  "color": {
+    "light": {
+      "canvas": "#F6F8FB",
+      "surface": "#FFFFFF",
+      "raised": "#FFFFFF",
+      "text": "#101827",
+      "textMuted": "#5D6878",
+      "border": "#DDE3EC",
+      "brand": "#3568F5",
+      "brandHover": "#2856D6",
+      "pass": "#087A55",
+      "regression": "#C83E3E",
+      "warning": "#A66300",
+      "info": "#2F65D5",
+      "neutral": "#6A7280"
+    },
+    "dark": {
+      "canvas": "#0B1018",
+      "surface": "#111925",
+      "raised": "#162131",
+      "text": "#F5F7FB",
+      "textMuted": "#A6B1C0",
+      "border": "#28364A",
+      "brand": "#6F95FF",
+      "brandHover": "#8AA9FF",
+      "pass": "#53D4A7",
+      "regression": "#FF8A84",
+      "warning": "#FFC46B",
+      "info": "#78A0FF",
+      "neutral": "#9AA6B5"
+    }
+  },
+  "radius": {
+    "control": "8px",
+    "panel": "12px",
+    "pill": "999px"
+  },
+  "space": {
+    "1": "4px",
+    "2": "8px",
+    "3": "12px",
+    "4": "16px",
+    "5": "20px",
+    "6": "24px",
+    "8": "32px",
+    "10": "40px",
+    "12": "48px"
+  },
+  "motion": {
+    "fast": "120ms",
+    "normal": "180ms",
+    "drawer": "220ms"
+  }
+}

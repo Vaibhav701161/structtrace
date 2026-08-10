@@ -12,6 +12,18 @@ evaluates the same golden cases against a baseline and candidate while a caller-
 remains fixed. It separates structural validity from deterministic task correctness, preserves
 every failure in the denominator, and produces local evidence plus a multi-state CI release gate.
 
+The primary human workflow is now a local browser product backed by that same Rust engine:
+
+```bash
+structtrace open
+```
+
+Drop golden, baseline, and candidate JSONL, JSON, or CSV files; confirm mappings visually; select
+deterministic correctness rules; choose the authority of the evidence; and inspect the exact paired
+regressions. StructTrace generates the reproducible project and CI check after the visual setup.
+The UI is capability-protected, loopback-only, offline after installation, and has no login,
+telemetry, CDN, or Node.js runtime. See the [local UI guide](docs/src/local-ui.md).
+
 **Release status:** private release candidate. Core local engineering checks are passing; public
 binary installation, clean-browser performance across the OS matrix, and independent-user
 validation are still open release gates. The repository does not claim public readiness.

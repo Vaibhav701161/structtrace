@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">StructTrace logo mark</title>
+  <desc id="desc">An S-shaped trace path with three evidence nodes.</desc>
+  <path d="M47 14H27C19.5 14 15 18.2 15 24c0 5.8 4.5 10 12 10h10c7.5 0 12 4.2 12 10s-4.5 10-12 10H17" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="47" cy="14" r="4.5" fill="currentColor"/>
+  <circle cx="32" cy="34" r="4.5" fill="currentColor"/>
+  <circle cx="17" cy="54" r="4.5" fill="currentColor"/>
+</svg>

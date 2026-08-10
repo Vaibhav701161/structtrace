@@ -20,6 +20,7 @@ repository = "https://github.com/Vaibhav701161/structtrace"
 anyhow = "1.0.100"
 axum = "0.8.6"
 blake3 = "1.8.2"
+csv = "1.4.0"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 futures = "0.3.31"
 jsonschema = { version = "0.49.7", default-features = false, features = ["arbitrary-precision"] }

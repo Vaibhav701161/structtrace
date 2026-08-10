@@ -39,6 +39,9 @@ this file is not treated as machine evidence.
 | Process logs | default retention is off; sanitized logs redact configured literals and header-shaped values under one total budget; truncation is marked and share exports omit logs |
 | Run management | kind-aware list/show/latest, inactive-run deletion with confirmation and symlink confinement, and manifest-allowlisted verified archives that exclude unbound files are available |
 | Guided recorded onboarding | `init --from-outputs` accepts canonical or ordinary JSONL, supports nondefault dataset/output mappings, validates and snapshots all four inputs, reports schema/expected/baseline/candidate field coverage and types so omitted candidate fields remain selectable, generates built-in evaluator semantics only when explicitly selected, and produces a strict-doctor/run/replay-valid project |
+| Local browser product | `structtrace open` serves an embedded offline UI through a random loopback capability; the visual invoice demo and a separately mapped recorded-output comparison completed through the real engine, produced immutable artifacts, and retained insufficient-evidence authority honestly |
+| Local UI security | Missing capabilities return 404, foreign Host returns 421, API responses are no-store with CSP/frame/referrer/MIME protections, browser requests carry bounded content rather than arbitrary file paths, and inactivity never stops an active run |
+| Local UI accessibility | TypeScript and component tests pass; Chromium and Firefox Playwright plus axe find no WCAG A/AA violations on first launch or the real invoice decision screen; WebKit remains defined in CI and awaits a runner with its required system libraries |
 | Example projects | recorded, Python, command, document extraction, and tool-selection/argument fixtures ran through the shared scoring path |
 | Invoice hero workflow | 12 nested invoices produced 9/12 versus 9/12 with six discordances, schema validity 10/12 versus 12/12, valid-but-wrong 1 versus 3, and an insufficient-evidence gate |
 | Evidence independence | singleton, exact-duplicate, repeated-trial and label-conflict groups are explicit; scoring occurs before retention; strict parse receipts preserve raw-disabled results; paired coverage is the true fully evaluated intersection; repeated trials block independent inference |
@@ -59,7 +62,7 @@ this file is not treated as machine evidence.
 | Release archive validation | The Linux release binary was archived, extracted into a clean temporary directory, then passed `--version`, doctor, invoice demo, and full replay; the same validator is mandatory for every target in the release workflow |
 | Parser and artifact fuzzing | strict JSON, adapter protocol JSON, and imported manifest/paired-case artifact targets completed local smoke runs without a crash |
 | Configuration safety | runtime validation enforces paths, pointers, callables, timeouts, concurrency, retries, token limits, tolerances, pricing, gates, and report-filter constraints independently of editor tooling |
-| Documentation | mdBook built 43 HTML pages locally, including the explicit scale envelope and release-candidate user protocol |
+| Documentation | mdBook built successfully locally, including the browser workflow, explicit scale envelope, and release-candidate user protocol |
 | Formatting and linting | `cargo fmt --all --check` and warnings-denied Clippy passed |
 | Test suite | `cargo test --workspace --all-features` passes without a provider credential, external model, GPU, or network service; generated local evidence and CI output tied to the commit are authoritative |
 
@@ -80,7 +83,7 @@ this file is not treated as machine evidence.
 | Repeat run after a real candidate change | **PENDING** |
 | Real deployment decision | **PENDING** |
 | Misleading gates / privacy incidents | **PENDING external observation**; no claim can be made before the alpha |
-| Browser performance matrix | clean-browser open/filter measurements remain unrecorded across release operating systems |
+| Browser performance matrix | Chromium and Firefox functional/accessibility checks now pass locally; clean-browser 1,000/10,000-row open/filter measurements and WebKit evidence remain unrecorded across release operating systems |
 | Windows descendant containment | command/Python execution remains beta until Job Object tests pass on a real Windows runner |
 | Interleaved live-provider execution | OpenAI-compatible execution remains experimental; paired-interleaved scheduling and per-case paid-run resume are not complete |
 

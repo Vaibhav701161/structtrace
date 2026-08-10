@@ -5,6 +5,13 @@ here.
 
 ## Unreleased
 
+- Add `structtrace open`, a capability-protected local browser product with visual recorded-output
+  import, field mapping, deterministic correctness setup, evidence authority, real Rust-engine
+  execution, paired results, virtualized case inspection, local drafts, and safe CI generation.
+- Embed the offline React/TypeScript build in the Rust binary; add bounded JSON/JSONL/CSV ingestion,
+  optional explicitly labeled schema-shape inference, host/origin checks, strict browser security
+  headers, inactivity shutdown, WCAG checks, frontend dependency audit, and cross-browser CI.
+
 - Add an authorization-only `release-check` command that always replays evidence and succeeds only
   for an authorized Release gate; synchronize deployment documentation and editor-schema Release
   constraints with runtime policy.

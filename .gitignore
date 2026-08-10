@@ -12,3 +12,10 @@
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
+/ui/node_modules/
+/ui/test-results/
+/ui/playwright-report/
+/ui/*.tsbuildinfo
+/StructTrace_UI_UX_Bundle.zip
+/product/design/StructTrace_Codex_UI_Build_Prompt.md
+/product/design/StructTrace_UI_UX_Product_Spec.md
