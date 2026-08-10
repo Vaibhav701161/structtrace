@@ -64,7 +64,17 @@ jobs:
           toolchain: "1.87.0"
       - run: cargo install cargo-audit --version 0.22.1 --locked
       - run: cargo install cargo-deny --version 0.18.3 --locked
-      - run: cargo audit
+      - name: Verify ignored advisory is unreachable
+        shell: bash
+        run: |
+          if cargo tree --workspace --all-features --target all -i rkyv | grep -q '^rkyv '; then
+            echo 'rkyv unexpectedly entered the compiled dependency graph' >&2
+            exit 1
+          fi
+      # RUSTSEC-2026-0235 affects rkyv 0.7.46. Cargo.lock records it as an
+      # unactivated rust_decimal option, while the reachability check above
+      # ensures no workspace target compiles it.
+      - run: cargo audit --ignore RUSTSEC-2026-0235
       - run: cargo deny check
 
   parser-fuzz-smoke:
