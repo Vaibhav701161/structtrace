@@ -20,9 +20,10 @@ use structtrace_adapters::{
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{
-        EvaluatorComparison, EvaluatorStateCounts, EvidenceSummary, ExternalEvaluatorReceipt,
-        FieldHotspot, MatchedOperationalSummary, PairedCaseRecord, RunManifest, RunStatus,
-        RunSummary, SemanticEffectSummary, VariantSummary,
+        EvaluatorComparison, EvaluatorStateCounts, EvidenceGroupDiagnostic, EvidenceGroupKind,
+        EvidenceSummary, ExternalEvaluatorReceipt, FieldHotspot, MatchedOperationalSummary,
+        PairedCaseRecord, RunKind, RunManifest, RunStatus, RunSummary, SemanticEffectSummary,
+        VariantSummary,
     },
     config::{Config, EvaluatorKind, EvidenceUnitConfig, VariantConfig},
     dataset::Dataset,
@@ -84,7 +85,12 @@ pub fn run_recorded(project_root: &Path, config_path: &Path) -> anyhow::Result<C
         "configuration",
     )?;
     let config = Config::from_bytes(&config_path, &config_source_bytes)?;
-    run_recorded_with_snapshot(&project_root, config, config_source_bytes)
+    run_recorded_with_snapshot(
+        &project_root,
+        config,
+        config_source_bytes,
+        RunKind::Production,
+    )
 }
 
 /// Run a comparison with validated CLI overrides while retaining the source config hash.
@@ -102,13 +108,38 @@ pub fn run_recorded_with_config(
         structtrace_core::config::HARD_MAX_CONFIG_BYTES,
         "configuration",
     )?;
-    run_recorded_with_snapshot(&project_root, config, config_source_bytes)
+    run_recorded_with_snapshot(
+        &project_root,
+        config,
+        config_source_bytes,
+        RunKind::Production,
+    )
+}
+
+/// Run a comparison under an explicit history kind.
+pub fn run_recorded_with_config_kind(
+    project_root: &Path,
+    config_path: &Path,
+    config: Config,
+    run_kind: RunKind,
+) -> anyhow::Result<CompletedRun> {
+    let project_root = project_root
+        .canonicalize()
+        .with_context(|| format!("project root {} does not exist", project_root.display()))?;
+    let config_path = resolve(&project_root, config_path);
+    let config_source_bytes = structtrace_core::hashing::read_bounded(
+        &config_path,
+        structtrace_core::config::HARD_MAX_CONFIG_BYTES,
+        "configuration",
+    )?;
+    run_recorded_with_snapshot(&project_root, config, config_source_bytes, run_kind)
 }
 
 fn run_recorded_with_snapshot(
     project_root: &Path,
     config: Config,
     config_source_bytes: Vec<u8>,
+    run_kind: RunKind,
 ) -> anyhow::Result<CompletedRun> {
     let config = Config::validate(config)?;
     anyhow::ensure!(
@@ -142,7 +173,7 @@ fn run_recorded_with_snapshot(
         &config.limits,
     )?;
 
-    finalize_prepared(
+    finalize_prepared_kind(
         project_root,
         config_source_bytes,
         config,
@@ -150,6 +181,7 @@ fn run_recorded_with_snapshot(
         schema_bytes,
         baseline,
         candidate,
+        run_kind,
     )
 }
 
@@ -161,8 +193,31 @@ pub fn finalize_prepared(
     config: Config,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
+    baseline: PreparedVariant,
+    candidate: PreparedVariant,
+) -> anyhow::Result<CompletedRun> {
+    finalize_prepared_kind(
+        project_root,
+        config_source_bytes,
+        config,
+        dataset,
+        schema_bytes,
+        baseline,
+        candidate,
+        RunKind::Production,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_prepared_kind(
+    project_root: &Path,
+    config_source_bytes: Vec<u8>,
+    config: Config,
+    dataset: Dataset,
+    schema_bytes: Vec<u8>,
     mut baseline: PreparedVariant,
     mut candidate: PreparedVariant,
+    run_kind: RunKind,
 ) -> anyhow::Result<CompletedRun> {
     apply_storage_retention(
         &mut baseline,
@@ -186,6 +241,7 @@ pub fn finalize_prepared(
         candidate,
         None,
         None,
+        run_kind,
     )
 }
 
@@ -201,6 +257,7 @@ pub fn finalize_prepared_for_run(
     candidate: PreparedVariant,
     existing_run_id: Option<String>,
     implementation_fingerprint: Option<String>,
+    run_kind: RunKind,
 ) -> anyhow::Result<CompletedRun> {
     if baseline.rows.len() != dataset.cases.len() || candidate.rows.len() != dataset.cases.len() {
         anyhow::bail!("prepared variants must contain exactly one row per dataset case");
@@ -226,7 +283,7 @@ pub fn finalize_prepared_for_run(
         (run_id, store)
     } else {
         let run_id = Ulid::new().to_string();
-        let store = RunStore::create(&storage_root, &run_id)?;
+        let store = RunStore::create(&storage_root, &run_id, run_kind)?;
         (run_id, store)
     };
     let mut failure_guard = store.failure_guard(&run_id);
@@ -375,6 +432,7 @@ pub fn finalize_prepared_for_run(
     )?;
 
     let mut manifest = RunManifest::new(run_id.clone(), config.project.name.clone());
+    manifest.run_kind = run_kind;
     manifest.configuration_file_hash = hash_bytes(&config_source_bytes);
     manifest.normalized_configuration_hash = hash_canonical_json(&config)?;
     manifest.dataset_path = config.dataset.path.display().to_string();
@@ -400,6 +458,26 @@ pub fn finalize_prepared_for_run(
             hash_bytes(&candidate.source_bytes),
         ),
     ]);
+    let variant_schema_root = run_dir.join("inputs/variants");
+    let mut captured_variant_schemas = Vec::new();
+    if variant_schema_root.is_dir() {
+        collect_files(&variant_schema_root, &mut captured_variant_schemas)?;
+        captured_variant_schemas.sort();
+    }
+    for path in captured_variant_schemas {
+        let relative = path
+            .strip_prefix(&run_dir)
+            .context("captured model-facing schema escaped the run directory")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let digest = hash_file(&path)?;
+        let length = std::fs::metadata(&path)?.len();
+        manifest
+            .input_artifacts
+            .insert(relative.clone(), digest.clone());
+        manifest.artifacts.insert(relative.clone(), digest.clone());
+        store.record_artifact(&relative, &digest, length)?;
+    }
     for variant in config.variants.values() {
         if let VariantConfig::OpenaiCompatible(adapter) = variant {
             if let Some(name) = &adapter.api_key_env {
@@ -593,7 +671,14 @@ fn execute_external_evaluator_matrix(
                 );
                 retained_stderr.extend_from_slice(stderr);
             }
-            for (index, run) in runs.into_iter().enumerate() {
+            for (index, mut run) in runs.into_iter().enumerate() {
+                let definition =
+                    structtrace_adapters::evaluator::evaluator_definition_with_implementation(
+                        &evaluator.kind,
+                        evaluator.implementation_version.as_deref(),
+                        &evaluator.implementation,
+                    );
+                run.receipt.definition_hash = hash_canonical_json(&definition).unwrap_or_default();
                 retained_receipts.push(run.receipt);
                 target[index].insert(evaluator.id.clone(), run.result);
             }
@@ -605,7 +690,7 @@ fn execute_external_evaluator_matrix(
 fn materialize_evaluator_bridge(storage_root: &Path) -> anyhow::Result<PathBuf> {
     let path = storage_root
         .join("runtime")
-        .join("python-evaluator-bridge-v1.py");
+        .join("python-evaluator-bridge-v2.py");
     let parent = path
         .parent()
         .context("evaluator bridge path has no parent")?;
@@ -668,10 +753,33 @@ pub fn apply_storage_retention(
     for row in &mut prepared.rows {
         if !retain_raw_outputs {
             if row.parsed_output.is_none() {
-                row.parsed_output = row
-                    .raw_output
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok());
+                if let Some(raw) = row.raw_output.as_deref() {
+                    match serde_json::from_str(raw) {
+                        Ok(parsed) => row.parsed_output = Some(parsed),
+                        Err(error) => {
+                            let metadata = if row.metadata.is_object() {
+                                row.metadata.as_object_mut().expect("checked object")
+                            } else {
+                                let original = std::mem::replace(
+                                    &mut row.metadata,
+                                    Value::Object(Default::default()),
+                                );
+                                let metadata = row.metadata.as_object_mut().expect("set object");
+                                if !original.is_null() {
+                                    metadata.insert(
+                                        "_structtrace_original_metadata".to_owned(),
+                                        original,
+                                    );
+                                }
+                                metadata
+                            };
+                            metadata.insert(
+                                "_structtrace_retained_parse_error".to_owned(),
+                                Value::String(error.to_string()),
+                            );
+                        }
+                    }
+                }
             }
             row.raw_output = None;
         }
@@ -714,25 +822,66 @@ pub(crate) fn build_summary(
         variant_summary(&all_records, false, &config.analysis.primary_outcome);
     let descriptive_matched_operational = matched_operational_summary(&all_records);
     let evidence_groups = semantic_evidence_groups(records, &config.dataset.evidence_unit)?;
-    let mut representative_records = Vec::new();
-    let mut conflicting_repeated_groups = 0usize;
-    for indices in evidence_groups.values() {
-        let signatures = indices
-            .iter()
-            .map(|index| analysis_signature(&records[*index]))
-            .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
-        if signatures.len() > 1 {
-            conflicting_repeated_groups += 1;
-            continue;
-        }
-        representative_records.push(
+    let label_conflict_groups = label_conflict_count(records)?;
+    let mut inference_records = Vec::new();
+    let mut singleton_evidence_units = 0usize;
+    let mut exact_duplicate_groups = 0usize;
+    let mut exact_duplicate_rows = 0usize;
+    let mut repeated_trial_groups = 0usize;
+    let mut group_diagnostics = Vec::new();
+    for (evidence_unit_hash, indices) in &evidence_groups {
+        let kind = if indices.len() == 1 {
+            singleton_evidence_units += 1;
+            EvidenceGroupKind::Singleton
+        } else {
+            let complete_signatures = indices
+                .iter()
+                .map(|index| complete_observation_signature(&records[*index]))
+                .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+            if complete_signatures.len() == 1 {
+                exact_duplicate_groups += 1;
+                exact_duplicate_rows += indices.len().saturating_sub(1);
+                EvidenceGroupKind::ExactDuplicate
+            } else {
+                repeated_trial_groups += 1;
+                EvidenceGroupKind::RepeatedTrial
+            }
+        };
+        let distinct_hashes = |value: fn(&PairedCaseRecord) -> Value| {
             indices
                 .iter()
-                .map(|index| &records[*index])
-                .min_by(|left, right| left.case.id.cmp(&right.case.id))
-                .expect("evidence group is non-empty"),
-        );
+                .map(|index| {
+                    hash_canonical_json(&value(&records[*index])).map_err(anyhow::Error::from)
+                })
+                .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()
+                .map(|set| set.into_iter().collect::<Vec<_>>())
+        };
+        group_diagnostics.push(EvidenceGroupDiagnostic {
+            evidence_unit_hash: evidence_unit_hash.clone(),
+            stimulus_hashes: distinct_hashes(stimulus_value)?,
+            reference_hashes: indices
+                .iter()
+                .map(|index| {
+                    hash_canonical_json(&records[*index].case.expected).map_err(anyhow::Error::from)
+                })
+                .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?
+                .into_iter()
+                .collect(),
+            scored_observation_hashes: distinct_hashes(scored_observation)?,
+            operational_observation_hashes: distinct_hashes(operational_observation)?,
+            kind,
+            rows: indices.len(),
+        });
+        if matches!(
+            kind,
+            EvidenceGroupKind::Singleton | EvidenceGroupKind::ExactDuplicate
+        ) {
+            let synthetic_id = format!("evidence-{}", &evidence_unit_hash[..24]);
+            let normalized = normalized_inference_record(&records[indices[0]], &synthetic_id);
+            inference_records.push(normalized);
+        }
     }
+    let representative_records = inference_records.iter().collect::<Vec<_>>();
     let baseline = variant_summary(
         &representative_records,
         true,
@@ -789,19 +938,16 @@ pub(crate) fn build_summary(
     };
     let evidence = EvidenceSummary {
         total_rows: records.len(),
-        unique_semantic_cases: evidence_groups.len(),
-        exact_duplicate_groups: evidence_groups
-            .values()
-            .filter(|group| group.len() > 1)
-            .count(),
-        largest_duplicate_group: evidence_groups.values().map(Vec::len).max().unwrap_or(0),
-        duplicate_case_rate: rate(
-            records.len().saturating_sub(evidence_groups.len()),
-            records.len(),
-        ),
-        effective_gate_denominator: representative_records.len(),
-        conflicting_repeated_groups,
-        inference_unit: evidence_unit_label(&config.dataset.evidence_unit),
+        singleton_evidence_units,
+        exact_duplicate_groups,
+        repeated_trial_groups,
+        label_conflict_groups,
+        exact_duplicate_rows,
+        largest_group: evidence_groups.values().map(Vec::len).max().unwrap_or(0),
+        exact_duplicate_row_rate: rate(exact_duplicate_rows, records.len()),
+        effective_inference_units: representative_records.len(),
+        inference_policy: evidence_unit_label(&config.dataset.evidence_unit),
+        groups: group_diagnostics,
     };
     let jointly_scored = count_jointly_scored(representative_records.iter().map(|record| {
         (
@@ -823,27 +969,28 @@ pub(crate) fn build_summary(
     let gate = evaluate_gate(
         &config.gate,
         &GateInputs {
-            total_cases: evidence.effective_gate_denominator,
-            unique_cases: evidence.unique_semantic_cases,
-            duplicate_case_rate: evidence.duplicate_case_rate,
-            conflicting_repeated_groups: evidence.conflicting_repeated_groups,
+            total_cases: evidence.effective_inference_units,
+            unique_cases: evidence.effective_inference_units,
+            duplicate_case_rate: evidence.exact_duplicate_row_rate,
+            repeated_trial_groups: evidence.repeated_trial_groups,
+            label_conflict_groups: evidence.label_conflict_groups,
             primary_scored_rate: rate(
                 jointly_scored_semantic.jointly_scored_cases,
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
             primary_evaluator_error_rate: rate(
                 baseline.primary_error.max(candidate.primary_error),
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
             primary_not_applicable_rate: rate(
                 baseline
                     .primary_not_applicable
                     .max(candidate.primary_not_applicable),
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
             primary_unscored_rate: rate(
                 baseline.primary_unscored.max(candidate.primary_unscored),
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
             primary: &independent_paired,
             baseline_valid_but_wrong_rate: rate(baseline.valid_but_wrong, baseline.total),
@@ -855,7 +1002,7 @@ pub(crate) fn build_summary(
             candidate_p95_latency_ms: matched_operational.candidate_p95_latency_ms,
             latency_coverage: rate(
                 matched_operational.latency_pairs,
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
             baseline_average_cost: matched_operational
                 .baseline_average_cost
@@ -867,10 +1014,25 @@ pub(crate) fn build_summary(
                 .and_then(|value| value.parse().ok()),
             cost_coverage: rate(
                 matched_operational.cost_pairs,
-                evidence.effective_gate_denominator,
+                evidence.effective_inference_units,
             ),
         },
     );
+    let all_evaluator_ids = config
+        .evaluators
+        .iter()
+        .map(|evaluator| evaluator.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let primary_evaluator_ids = config
+        .outcomes
+        .get(&config.analysis.primary_outcome)
+        .into_iter()
+        .flat_map(|outcome| outcome.all_of.iter().chain(&outcome.any_of))
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let primary_field_hotspots = field_hotspots(&representative_records, &primary_evaluator_ids);
+    let all_evaluator_field_diagnostics =
+        field_hotspots(&representative_records, &all_evaluator_ids);
     Ok(RunSummary {
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
         run_id: run_id.to_owned(),
@@ -890,8 +1052,54 @@ pub(crate) fn build_summary(
         bootstrap: independent_bootstrap.clone(),
         gate,
         evaluator_passes,
-        field_hotspots: field_hotspots(config, &representative_records),
+        field_hotspots: primary_field_hotspots.clone(),
+        primary_field_hotspots,
+        all_evaluator_field_diagnostics,
     })
+}
+
+fn normalized_inference_record(record: &PairedCaseRecord, synthetic_id: &str) -> PairedCaseRecord {
+    let mut normalized = record.clone();
+    normalized.case.id = synthetic_id.to_owned();
+    normalized.case.metadata = None;
+    for output in [
+        &mut normalized.baseline_output,
+        &mut normalized.candidate_output,
+    ] {
+        output.case_id = synthetic_id.to_owned();
+        output.raw_output = None;
+        output.parsed_output = None;
+        output.metadata = Value::Object(Default::default());
+        if let Some(error) = &mut output.error {
+            error.message.clear();
+            error.fingerprint = None;
+        }
+        for retry in &mut output.retries {
+            if let Some(object) = retry.as_object_mut() {
+                object.remove("response");
+            }
+        }
+    }
+    for evaluation in [
+        &mut normalized.baseline_evaluation,
+        &mut normalized.candidate_evaluation,
+    ] {
+        evaluation.case_id = synthetic_id.to_owned();
+        evaluation.parse_error = evaluation
+            .parse_error
+            .as_ref()
+            .map(|_| "parse_error".to_owned());
+        evaluation.parsed_output = None;
+        evaluation.schema_errors.clear();
+        for result in evaluation.evaluators.values_mut() {
+            result.message.clear();
+            result.details = Value::Object(Default::default());
+            for field in &mut result.fields {
+                field.message.clear();
+            }
+        }
+    }
+    normalized
 }
 
 fn semantic_evidence_groups(
@@ -951,28 +1159,112 @@ fn evidence_unit_label(config: &EvidenceUnitConfig) -> String {
     }
 }
 
-fn analysis_signature(record: &PairedCaseRecord) -> anyhow::Result<String> {
-    let mut baseline_evaluation = serde_json::to_value(&record.baseline_evaluation)?;
-    let mut candidate_evaluation = serde_json::to_value(&record.candidate_evaluation)?;
-    for evaluation in [&mut baseline_evaluation, &mut candidate_evaluation] {
-        if let Some(object) = evaluation.as_object_mut() {
-            object.remove("case_id");
-        }
-    }
-    let output_signature = |output: &structtrace_core::output::VariantOutput| {
+fn complete_observation_signature(record: &PairedCaseRecord) -> anyhow::Result<String> {
+    Ok(hash_canonical_json(&serde_json::json!({
+        "stimulus": stimulus_value(record),
+        "reference": record.case.expected,
+        "scored": scored_observation(record),
+        "operational": operational_observation(record),
+    }))?)
+}
+
+fn stimulus_value(record: &PairedCaseRecord) -> Value {
+    serde_json::json!({
+        "input": record.case.input,
+        "model_visible_metadata": record.case.model_visible_metadata,
+    })
+}
+
+fn scored_observation(record: &PairedCaseRecord) -> Value {
+    let evaluation = |value: &structtrace_core::evaluation::CaseEvaluation,
+                      output: &structtrace_core::output::VariantOutput| {
+        let evaluators = value
+            .evaluators
+            .iter()
+            .map(|(id, result)| {
+                let fields = result
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "pointer": field.pointer,
+                            "expected_pointer": field.expected_pointer,
+                            "status": field.status,
+                            "expected": field.expected,
+                            "actual": field.actual,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "status": result.status,
+                        "passed": result.passed,
+                        "score": result.score,
+                        "fields": fields,
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         serde_json::json!({
-            "status": output.status,
-            "raw_output": output.raw_output,
-            "parsed_output": output.parsed_output,
-            "error": output.error,
+            "adapter_status": value.adapter_status,
+            "adapter_error_kind": output.error.as_ref().map(|error| &error.kind),
+            "parse_valid": value.parse_valid,
+            "schema_valid": value.schema_valid,
+            "evaluators": evaluators,
+            "outcomes": value.outcomes,
+            "primary_pass": value.primary_pass,
+            "valid_but_wrong": value.valid_but_wrong,
         })
     };
-    Ok(hash_canonical_json(&serde_json::json!({
-        "baseline_output": output_signature(&record.baseline_output),
-        "candidate_output": output_signature(&record.candidate_output),
-        "baseline_evaluation": baseline_evaluation,
-        "candidate_evaluation": candidate_evaluation,
-    }))?)
+    serde_json::json!({
+        "baseline": evaluation(&record.baseline_evaluation, &record.baseline_output),
+        "candidate": evaluation(&record.candidate_evaluation, &record.candidate_output),
+    })
+}
+
+fn operational_observation(record: &PairedCaseRecord) -> Value {
+    let output = |value: &structtrace_core::output::VariantOutput| {
+        let retries = value
+            .retries
+            .iter()
+            .map(|retry| {
+                let mut retry = retry.clone();
+                if let Some(object) = retry.as_object_mut() {
+                    object.remove("response");
+                }
+                retry
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "latency_ms": value.latency_ms,
+            "usage": value.usage,
+            "cost": value.cost,
+            "retries": retries,
+            "request_model": value.metadata.pointer("/request_model"),
+            "provider_model": value.metadata.pointer("/provider_model"),
+            "provider_request_id": value.metadata.pointer("/provider_request_id"),
+            "system_fingerprint": value.metadata.pointer("/system_fingerprint"),
+        })
+    };
+    serde_json::json!({
+        "baseline": output(&record.baseline_output),
+        "candidate": output(&record.candidate_output),
+    })
+}
+
+fn label_conflict_count(records: &[PairedCaseRecord]) -> anyhow::Result<usize> {
+    let mut by_stimulus = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for record in records {
+        by_stimulus
+            .entry(hash_canonical_json(&stimulus_value(record))?)
+            .or_default()
+            .insert(hash_canonical_json(&record.case.expected)?);
+    }
+    Ok(by_stimulus
+        .values()
+        .filter(|references| references.len() > 1)
+        .count())
 }
 
 fn semantic_effect(
@@ -1196,78 +1488,115 @@ fn variant_summary(
     summary
 }
 
-fn field_hotspots(config: &Config, records: &[&PairedCaseRecord]) -> Vec<FieldHotspot> {
-    let evaluator_ids = config
-        .evaluators
-        .iter()
-        .map(|evaluator| evaluator.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut hotspots = BTreeMap::<String, FieldHotspot>::new();
+fn field_hotspots(
+    records: &[&PairedCaseRecord],
+    evaluator_ids: &std::collections::BTreeSet<&str>,
+) -> Vec<FieldHotspot> {
+    let mut keys = std::collections::BTreeSet::<(String, String)>::new();
     for record in records {
-        let baseline = field_statuses(&record.baseline_evaluation.evaluators, &evaluator_ids);
-        let candidate = field_statuses(&record.candidate_evaluation.evaluators, &evaluator_ids);
-        let pointers = baseline
-            .keys()
-            .chain(candidate.keys())
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        for pointer in pointers {
-            let hotspot = hotspots
-                .entry(pointer.clone())
-                .or_insert_with(|| FieldHotspot {
-                    pointer: pointer.clone(),
-                    regressions: 0,
-                    improvements: 0,
-                    candidate_failures: 0,
-                });
-            let baseline_pass = baseline.get(&pointer).copied();
-            let candidate_pass = candidate.get(&pointer).copied();
-            hotspot.regressions +=
-                usize::from(baseline_pass == Some(true) && candidate_pass == Some(false));
-            hotspot.improvements +=
-                usize::from(baseline_pass == Some(false) && candidate_pass == Some(true));
-            hotspot.candidate_failures += usize::from(candidate_pass == Some(false));
+        for evaluations in [
+            &record.baseline_evaluation.evaluators,
+            &record.candidate_evaluation.evaluators,
+        ] {
+            for (evaluator_id, result) in evaluations {
+                if evaluator_ids.contains(evaluator_id.as_str()) {
+                    for field in &result.fields {
+                        keys.insert((
+                            evaluator_id.clone(),
+                            normalize_hotspot_pointer(&field.pointer),
+                        ));
+                    }
+                }
+            }
         }
     }
-    let mut hotspots = hotspots
-        .into_values()
-        .filter(|hotspot| {
-            hotspot.regressions > 0 || hotspot.improvements > 0 || hotspot.candidate_failures > 0
-        })
-        .collect::<Vec<_>>();
+    let mut hotspots = Vec::new();
+    for (evaluator_id, pointer) in keys {
+        let mut hotspot = FieldHotspot {
+            evaluator_id: evaluator_id.clone(),
+            pointer: pointer.clone(),
+            regressions: 0,
+            improvements: 0,
+            candidate_failures: 0,
+            baseline: EvaluatorStateCounts {
+                total: records.len(),
+                ..EvaluatorStateCounts::default()
+            },
+            candidate: EvaluatorStateCounts {
+                total: records.len(),
+                ..EvaluatorStateCounts::default()
+            },
+        };
+        for record in records {
+            let baseline = field_status(
+                &record.baseline_evaluation.evaluators,
+                &evaluator_id,
+                &pointer,
+            );
+            let candidate = field_status(
+                &record.candidate_evaluation.evaluators,
+                &evaluator_id,
+                &pointer,
+            );
+            increment_field_state(&mut hotspot.baseline, baseline);
+            increment_field_state(&mut hotspot.candidate, candidate);
+            hotspot.regressions += usize::from(
+                baseline == Some(EvaluationStatus::Passed)
+                    && candidate == Some(EvaluationStatus::Failed),
+            );
+            hotspot.improvements += usize::from(
+                baseline == Some(EvaluationStatus::Failed)
+                    && candidate == Some(EvaluationStatus::Passed),
+            );
+            hotspot.candidate_failures += usize::from(candidate == Some(EvaluationStatus::Failed));
+        }
+        hotspots.push(hotspot);
+    }
     hotspots.sort_by(|left, right| {
         right
             .regressions
             .cmp(&left.regressions)
             .then_with(|| right.candidate_failures.cmp(&left.candidate_failures))
+            .then_with(|| left.evaluator_id.cmp(&right.evaluator_id))
             .then_with(|| left.pointer.cmp(&right.pointer))
     });
     hotspots
 }
 
-fn field_statuses(
+fn field_status(
     results: &BTreeMap<String, EvaluatorResult>,
-    evaluator_ids: &std::collections::BTreeSet<&str>,
-) -> BTreeMap<String, bool> {
-    let mut statuses = BTreeMap::<String, bool>::new();
-    for (evaluator_id, result) in results {
-        if !evaluator_ids.contains(evaluator_id.as_str()) {
-            continue;
+    evaluator_id: &str,
+    pointer: &str,
+) -> Option<EvaluationStatus> {
+    results.get(evaluator_id).and_then(|result| {
+        let statuses = result
+            .fields
+            .iter()
+            .filter(|field| normalize_hotspot_pointer(&field.pointer) == pointer)
+            .map(|field| field.status)
+            .collect::<Vec<_>>();
+        if statuses.contains(&EvaluationStatus::Error) {
+            Some(EvaluationStatus::Error)
+        } else if statuses.contains(&EvaluationStatus::Failed) {
+            Some(EvaluationStatus::Failed)
+        } else if statuses.contains(&EvaluationStatus::Passed) {
+            Some(EvaluationStatus::Passed)
+        } else if statuses.contains(&EvaluationStatus::NotApplicable) {
+            Some(EvaluationStatus::NotApplicable)
+        } else {
+            None
         }
-        for field in &result.fields {
-            let pointer = normalize_hotspot_pointer(&field.pointer);
-            match field.status {
-                EvaluationStatus::Passed => {
-                    statuses.entry(pointer).or_insert(true);
-                }
-                EvaluationStatus::Failed => {
-                    statuses.insert(pointer, false);
-                }
-                EvaluationStatus::Error | EvaluationStatus::NotApplicable => {}
-            }
-        }
+    })
+}
+
+fn increment_field_state(counts: &mut EvaluatorStateCounts, status: Option<EvaluationStatus>) {
+    match status {
+        Some(EvaluationStatus::Passed) => counts.passed += 1,
+        Some(EvaluationStatus::Failed) => counts.failed += 1,
+        Some(EvaluationStatus::Error) => counts.error += 1,
+        Some(EvaluationStatus::NotApplicable) => counts.not_applicable += 1,
+        None => counts.unscored += 1,
     }
-    statuses
 }
 
 fn normalize_hotspot_pointer(pointer: &str) -> String {
@@ -1372,11 +1701,12 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
          | Schema valid | {}/{} | {}/{} |\n\
          | Valid but wrong | {}/{} | {}/{} |\n\n\
          Total rows: **{}**  \n\
-         Configured evidence units: **{}**  \n\
+         Singleton evidence units: **{}**  \n\
          Exact duplicate groups: **{}**  \n\
-         Conflicting repeated groups: **{}**  \n\
+         Repeated-trial groups: **{}**  \n\
+         Label-conflict groups: **{}**  \n\
          Effective inference denominator: **{}**  \n\
-         Inference unit: **{}**  \n\
+         Inference policy: **{}**  \n\
          Descriptive all-row primary results: baseline **{}/{}**, candidate **{}/{}** (no independence claim)  \n\
          Independent paired difference: **{:+.2} percentage points**  \n\
          Candidate-only wins: **{}**  \n\
@@ -1402,11 +1732,12 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
         summary.candidate.valid_but_wrong,
         summary.candidate.total,
         summary.evidence.total_rows,
-        summary.evidence.unique_semantic_cases,
+        summary.evidence.singleton_evidence_units,
         summary.evidence.exact_duplicate_groups,
-        summary.evidence.conflicting_repeated_groups,
-        summary.evidence.effective_gate_denominator,
-        summary.evidence.inference_unit,
+        summary.evidence.repeated_trial_groups,
+        summary.evidence.label_conflict_groups,
+        summary.evidence.effective_inference_units,
+        summary.evidence.inference_policy,
         summary.descriptive_baseline.primary_pass,
         summary.descriptive_baseline.total,
         summary.descriptive_candidate.primary_pass,
@@ -1560,7 +1891,7 @@ gate:
         let root = tempdir().unwrap();
         write(
             &root.path().join("data.jsonl"),
-            "{\"id\":\"a\",\"input\":{},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"b\",\"input\":{},\"expected\":{\"label\":\"no\"}}\n",
+            "{\"id\":\"a\",\"input\":{\"text\":\"positive\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"b\",\"input\":{\"text\":\"negative\"},\"expected\":{\"label\":\"no\"}}\n",
         );
         write(
             &root.path().join("schema.json"),
@@ -1700,11 +2031,11 @@ analysis:
         let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
         let actual = run
             .summary
-            .field_hotspots
+            .primary_field_hotspots
             .into_iter()
             .map(|hotspot| {
                 (
-                    hotspot.pointer,
+                    (hotspot.evaluator_id, hotspot.pointer),
                     (
                         hotspot.regressions,
                         hotspot.improvements,
@@ -1714,15 +2045,20 @@ analysis:
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            actual,
-            BTreeMap::from([
-                ("/currency".to_owned(), (0, 2, 0)),
-                ("/line_items".to_owned(), (1, 0, 1)),
-                ("/subtotal".to_owned(), (1, 0, 1)),
-                ("/tax".to_owned(), (1, 0, 1)),
-                ("/total".to_owned(), (2, 0, 2)),
-                ("/vendor_name".to_owned(), (0, 1, 0)),
-            ])
+            actual.get(&("currency".to_owned(), "/currency".to_owned())),
+            Some(&(0, 2, 0))
+        );
+        assert_eq!(
+            actual.get(&("financial_consistency".to_owned(), "/subtotal".to_owned())),
+            Some(&(1, 0, 1))
+        );
+        assert_eq!(
+            actual.get(&("subtotal".to_owned(), "/subtotal".to_owned())),
+            Some(&(0, 0, 0))
+        );
+        assert_eq!(
+            actual.get(&("vendor".to_owned(), "/vendor_name".to_owned())),
+            Some(&(0, 1, 0))
         );
     }
 
@@ -1741,6 +2077,7 @@ analysis:
                 error: Some(structtrace_core::output::OutputError {
                     kind: "provider_error".to_owned(),
                     message: "provider echoed SECRET_DOCUMENT_91f2".to_owned(),
+                    fingerprint: None,
                 }),
                 latency_ms: None,
                 usage: None,
@@ -2012,9 +2349,9 @@ gate:
         );
         let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
         assert_eq!(run.summary.evidence.total_rows, 2);
-        assert_eq!(run.summary.evidence.unique_semantic_cases, 1);
+        assert_eq!(run.summary.evidence.singleton_evidence_units, 0);
         assert_eq!(run.summary.evidence.exact_duplicate_groups, 1);
-        assert_eq!(run.summary.evidence.largest_duplicate_group, 2);
+        assert_eq!(run.summary.evidence.largest_group, 2);
         assert_eq!(run.summary.paired.total, 1);
         assert_eq!(run.summary.paired.baseline_only_pass, 1);
         assert_eq!(
@@ -2028,7 +2365,100 @@ gate:
     }
 
     #[test]
-    fn conflicting_duplicate_evidence_is_order_invariant_and_blocks_gate() {
+    fn retention_formatting_case_ids_and_order_do_not_change_summary_or_gate() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n",
+        );
+        write(
+            &root.path().join("baseline.jsonl"),
+            "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\"}\n{\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"yes\\\"}\"}\n",
+        );
+        write(
+            &root.path().join("candidate.jsonl"),
+            "{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"no\\\"}\"}\n{\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{\\\"label\\\":\\\"no\\\"}\"}\n",
+        );
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 1
+project: {name: metamorphic-evidence}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: label, kind: json_pointer_exact, pointer: /label, expected_pointer: /label}
+outcomes: {correct: {all_of: [label]}}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+gate: {min_cases: 1, min_unique_cases: 1, max_duplicate_case_rate: 1, max_primary_regression_pp: 100}
+"#,
+        );
+        let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
+        let config: Config = serde_json::from_slice(
+            &std::fs::read(run.run_dir.join("inputs/configuration.json")).unwrap(),
+        )
+        .unwrap();
+        let mut records = std::fs::read_to_string(run.run_dir.join("cases.jsonl"))
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str::<PairedCaseRecord>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for record in &mut records {
+            for output in [&mut record.baseline_output, &mut record.candidate_output] {
+                output.metadata = serde_json::json!({
+                    "provider_response": {"retained": true},
+                    "rendered_prompt": "retained prompt"
+                });
+                output.retries = vec![serde_json::json!({
+                    "attempt": 1,
+                    "response": {"retained": true}
+                })];
+            }
+        }
+        let expected = build_summary("metamorphic", &config, &records).unwrap();
+        for (index, record) in records.iter_mut().enumerate() {
+            record.case.id = format!("renamed-{index}");
+            for output in [&mut record.baseline_output, &mut record.candidate_output] {
+                output.case_id = record.case.id.clone();
+                output.raw_output = output
+                    .parsed_output
+                    .as_ref()
+                    .map(|value| format!("  {} \n", serde_json::to_string_pretty(value).unwrap()));
+                output.metadata = serde_json::json!({
+                    "provider_response": {"retention_only": index},
+                    "rendered_prompt": format!("prompt-{index}")
+                });
+                output.retries = vec![serde_json::json!({
+                    "attempt": 1,
+                    "response": {"retention_only": index}
+                })];
+            }
+            for evaluation in [
+                &mut record.baseline_evaluation,
+                &mut record.candidate_evaluation,
+            ] {
+                evaluation.case_id = record.case.id.clone();
+                for result in evaluation.evaluators.values_mut() {
+                    result.message = format!("display-only explanation {index}");
+                    result.details = serde_json::json!({"display_only": index});
+                    for field in &mut result.fields {
+                        field.message = format!("display-only field explanation {index}");
+                    }
+                }
+            }
+        }
+        records.reverse();
+        let observed = build_summary("metamorphic", &config, &records).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(observed.evidence.exact_duplicate_groups, 1);
+    }
+
+    #[test]
+    fn repeated_trial_evidence_is_order_invariant_and_blocks_gate() {
         fn execute(dataset_rows: &str) -> RunSummary {
             let root = tempdir().unwrap();
             write(&root.path().join("data.jsonl"), dataset_rows);
@@ -2077,8 +2507,8 @@ gate:
             "{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n",
         );
         for summary in [&a_first, &b_first] {
-            assert_eq!(summary.evidence.conflicting_repeated_groups, 1);
-            assert_eq!(summary.evidence.effective_gate_denominator, 0);
+            assert_eq!(summary.evidence.repeated_trial_groups, 1);
+            assert_eq!(summary.evidence.effective_inference_units, 0);
             assert_eq!(summary.paired.total, 0);
             assert_eq!(
                 summary.gate.status,
@@ -2091,7 +2521,7 @@ gate:
     }
 
     #[test]
-    fn operational_metadata_does_not_manufacture_independent_evidence() {
+    fn repeated_operational_observations_are_not_selected_by_case_id() {
         let root = tempdir().unwrap();
         write(
             &root.path().join("data.jsonl"),
@@ -2118,10 +2548,10 @@ analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95,
         );
         let run = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap();
         assert_eq!(run.summary.evidence.total_rows, 2);
-        assert_eq!(run.summary.evidence.unique_semantic_cases, 1);
-        assert_eq!(run.summary.evidence.conflicting_repeated_groups, 0);
-        assert_eq!(run.summary.paired.total, 1);
+        assert_eq!(run.summary.evidence.repeated_trial_groups, 1);
+        assert_eq!(run.summary.evidence.effective_inference_units, 0);
+        assert_eq!(run.summary.paired.total, 0);
         assert_eq!(run.summary.descriptive_baseline.total, 2);
-        assert_eq!(run.summary.baseline.total, 1);
+        assert_eq!(run.summary.baseline.total, 0);
     }
 }

@@ -24,4 +24,6 @@ The research command reproduces three accepted paired matrices as three separate
 non-inferential index. The corrected Qwen estimate is positive, while the canonical Llama and
 practical tool-call estimates are negative. No pooled effect or release gate is calculated.
 
-The generated report remains under `.structtrace/runs/<run-id>/report/index.html` after the loopback server is closed.
+Demo and research manifests are explicitly typed and never replace the default latest production
+run. Use `latest-demo` or `latest-research` to select them. The generated report remains under
+`.structtrace/runs/<run-id>/report/index.html` after the loopback server is closed.

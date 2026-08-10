@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use structtrace_core::{
-    artifact::RunStatus, dataset::Case, evaluation::CaseEvaluation, output::VariantOutput,
+    artifact::{RunKind, RunStatus},
+    dataset::Case,
+    evaluation::CaseEvaluation,
+    output::VariantOutput,
     statistics::PairedMetrics,
 };
 
 /// Current SQLite schema migration version.
-pub const DATABASE_VERSION: i64 = 2;
+pub const DATABASE_VERSION: i64 = 3;
 
 /// Durable local run store.
 pub struct RunStore {
@@ -46,7 +49,7 @@ impl Drop for FailureStatusGuard<'_> {
 
 impl RunStore {
     /// Create a new run directory and initialize all versioned tables.
-    pub fn create(root: &Path, run_id: &str) -> anyhow::Result<Self> {
+    pub fn create(root: &Path, run_id: &str, run_kind: RunKind) -> anyhow::Result<Self> {
         validate_run_id(run_id)?;
         let run_dir = root.join("runs").join(run_id);
         std::fs::create_dir_all(run_dir.join("logs"))?;
@@ -64,8 +67,12 @@ impl RunStore {
         connection.pragma_update(None, "foreign_keys", true)?;
         migrate(&connection)?;
         connection.execute(
-            "INSERT INTO runs (run_id, status, artifact_version) VALUES (?1, ?2, 1)",
-            params![run_id, status_name(RunStatus::Created)],
+            "INSERT INTO runs (run_id, status, artifact_version, run_kind) VALUES (?1, ?2, 1, ?3)",
+            params![
+                run_id,
+                status_name(RunStatus::Created),
+                run_kind_name(run_kind)
+            ],
         )?;
         Ok(Self {
             run_dir,
@@ -325,7 +332,8 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 status TEXT NOT NULL,
                 artifact_version INTEGER NOT NULL,
                 created_at_unix_ms INTEGER,
-                completed_at_unix_ms INTEGER
+                completed_at_unix_ms INTEGER,
+                run_kind TEXT NOT NULL DEFAULT 'production'
             );
             CREATE TABLE cases (
                 ordinal INTEGER NOT NULL,
@@ -377,7 +385,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 blake3 TEXT NOT NULL,
                 byte_length INTEGER NOT NULL
             );
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             COMMIT;
             "#,
         )?;
@@ -387,12 +395,31 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             BEGIN;
             ALTER TABLE cases ADD COLUMN model_visible_metadata_json TEXT;
             ALTER TABLE cases ADD COLUMN source_line INTEGER NOT NULL DEFAULT 0;
-            PRAGMA user_version = 2;
+            ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
+            PRAGMA user_version = 3;
+            COMMIT;
+            "#,
+        )?;
+    } else if version == 2 {
+        connection.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
+            PRAGMA user_version = 3;
             COMMIT;
             "#,
         )?;
     }
     Ok(())
+}
+
+fn run_kind_name(kind: RunKind) -> &'static str {
+    match kind {
+        RunKind::Production => "production",
+        RunKind::Demo => "demo",
+        RunKind::ResearchFixture => "research_fixture",
+        RunKind::Test => "test",
+    }
 }
 
 fn status_name(status: RunStatus) -> &'static str {
@@ -431,7 +458,7 @@ mod tests {
     #[test]
     fn creates_schema_and_tracks_lifecycle() {
         let directory = tempdir().unwrap();
-        let store = RunStore::create(directory.path(), "01ABC").unwrap();
+        let store = RunStore::create(directory.path(), "01ABC", RunKind::Test).unwrap();
         assert_eq!(store.status("01ABC").unwrap(), RunStatus::Created);
         store.set_status("01ABC", RunStatus::Validating).unwrap();
         assert_eq!(store.status("01ABC").unwrap(), RunStatus::Validating);
@@ -443,7 +470,7 @@ mod tests {
     fn creates_private_run_storage() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempdir().unwrap();
-        let store = RunStore::create(directory.path(), "01PRIVATE").unwrap();
+        let store = RunStore::create(directory.path(), "01PRIVATE", RunKind::Test).unwrap();
         assert_eq!(
             std::fs::metadata(store.run_dir())
                 .unwrap()
@@ -465,7 +492,7 @@ mod tests {
     #[test]
     fn refuses_path_traversal_run_ids() {
         let directory = tempdir().unwrap();
-        assert!(RunStore::create(directory.path(), "../outside").is_err());
+        assert!(RunStore::create(directory.path(), "../outside", RunKind::Test).is_err());
     }
 
     #[test]

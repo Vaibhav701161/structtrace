@@ -9,9 +9,17 @@ use std::{
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use structtrace_adapters::{
+    command::{CommandLimits, run_command},
+    evaluator::{
+        EVALUATOR_BRIDGE_SOURCE, EvaluatorInvocation, EvaluatorRuntime,
+        run_external_evaluator_batch,
+    },
+    python::{BRIDGE_SOURCE, run_python},
+};
 use structtrace_core::{
     CoreError,
-    artifact::{RunManifest, RunStatus, RunSummary},
+    artifact::{RunKind, RunManifest, RunStatus, RunSummary},
     config::{Config, VariantConfig},
     dataset::Dataset,
     evaluation::compile_schema,
@@ -121,7 +129,7 @@ enum Commands {
     },
     /// Generate, export, or serve a completed local report.
     Report {
-        /// Run ULID, `latest` complete, or `latest-any`.
+        /// Run ULID, `latest`, `latest-any`, `latest-demo`, or `latest-research`.
         #[arg(default_value = "latest")]
         run: String,
         /// Open the loopback report URL in the default browser.
@@ -139,7 +147,7 @@ enum Commands {
     },
     /// Apply configured deployment thresholds to a completed run.
     Gate {
-        /// Run ULID, `latest` complete, or `latest-any`.
+        /// Run ULID, `latest`, `latest-any`, `latest-demo`, or `latest-research`.
         #[arg(default_value = "latest")]
         run: String,
         /// Integrity verification performed before applying the stored gate.
@@ -148,7 +156,7 @@ enum Commands {
     },
     /// Recompute retained scores, summaries, intervals, and gate results.
     Replay {
-        /// Run ULID, `latest` complete, or `latest-any`.
+        /// Run ULID, `latest`, `latest-any`, `latest-demo`, or `latest-research`.
         #[arg(default_value = "latest")]
         run: String,
         /// Verify normalized transition matrices, not original model artifacts.
@@ -165,6 +173,9 @@ enum Commands {
         /// Fail on insecure storage, duplicate evidence, and leakage-risk values.
         #[arg(long)]
         strict: bool,
+        /// Preflight this many local cases without contacting network providers.
+        #[arg(long, value_name = "CASES", requires = "strict")]
+        dry_run: Option<usize>,
     },
 }
 
@@ -287,9 +298,12 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                         research.index_path.display()
                     );
                     if *open {
-                        println!(
-                            "Open one study report by its run ID; StructTrace deliberately does not serve a pooled research report."
-                        );
+                        if let Err(error) = open::that(&research.index_path) {
+                            eprintln!(
+                                "warning: could not open the research index ({error}); open {} manually",
+                                research.index_path.display()
+                            );
+                        }
                     }
                 }
                 return Ok(0);
@@ -510,7 +524,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             })
         }
         Commands::Inspect { schema } => inspect_schema(cli, schema),
-        Commands::Doctor { strict } => doctor(cli, *strict),
+        Commands::Doctor { strict, dry_run } => doctor(cli, *strict, *dry_run).await,
     }
 }
 
@@ -675,7 +689,10 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
                 serde_json::to_string_pretty(&serde_json::json!({
                     "run_id": summary.run_id,
                     "status": summary.gate.status,
-                    "deployment_authorized": summary.gate.status.is_passed(),
+                    "deployment_authorized": summary.gate.deployment_authorized,
+                    "quality_failures": summary.gate.quality_failures,
+                    "evidence_failures": summary.gate.evidence_failures,
+                    "runtime_errors": summary.gate.runtime_errors,
                     "exit_code": gate_exit_code(summary.gate.status),
                     "primary": summary.paired,
                     "rules": summary.gate.rules,
@@ -690,6 +707,23 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
 
 fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
     println!("STRUCTTRACE RELEASE GATE: {}", summary.gate.status.label());
+    println!(
+        "{}",
+        if summary.gate.deployment_authorized {
+            "DEPLOYMENT AUTHORIZED"
+        } else {
+            "DO NOT DEPLOY"
+        }
+    );
+    if !summary.gate.quality_failures.is_empty() {
+        println!("Quality threshold failed.");
+    }
+    if !summary.gate.evidence_failures.is_empty() {
+        println!("Evidence requirements are also insufficient.");
+    }
+    if !summary.gate.runtime_errors.is_empty() {
+        println!("One or more gate rules could not be evaluated safely.");
+    }
     println!();
     println!("Primary outcome");
     println!(
@@ -813,7 +847,7 @@ const fn gate_exit_code(status: GateStatus) -> u8 {
     }
 }
 
-fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
+async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Result<u8> {
     let root = cli
         .project_root
         .canonicalize()
@@ -826,13 +860,23 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
         "detail": root,
     })];
     let mut passed = true;
+    let mut loaded_dataset = None;
     if config_present {
         match Config::load(&config_path) {
             Ok(config) => {
                 checks.push(serde_json::json!({"check": "configuration", "passed": true, "detail": config_path}));
+                let gate_configured = config.gate.is_configured();
+                passed &= !strict || gate_configured;
+                checks.push(serde_json::json!({
+                    "check": "release_gate_configuration",
+                    "passed": gate_configured,
+                    "required": strict,
+                    "detail": if gate_configured { "at least one release criterion is configured" } else { "no release criteria are configured; analysis cannot authorize deployment" }
+                }));
                 let dataset_path = resolve(&root, &config.dataset.path);
                 match Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits) {
                     Ok(dataset) => {
+                        loaded_dataset = Some(dataset.clone());
                         checks.push(serde_json::json!({
                             "check": "dataset",
                             "passed": true,
@@ -876,14 +920,15 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                             "detail": {"total_rows": dataset.cases.len(), "unique_semantic_cases": fingerprints.len(), "duplicate_rows": duplicate_rows}
                         }));
                         let leakage_passed = visible_gold_matches == 0;
-                        passed &= !strict || (leakage_passed && suspicious_case_ids == 0);
+                        passed &= !strict || leakage_passed;
                         checks.push(serde_json::json!({
                             "check": "golden_value_isolation",
-                            "passed": leakage_passed && suspicious_case_ids == 0,
+                            "passed": leakage_passed,
                             "required": strict,
                             "detail": {
                                 "model_visible_expected_leaf_matches": visible_gold_matches,
-                                "suspicious_label_bearing_case_ids": suspicious_case_ids
+                                "opaque_case_ids_with_label_like_text": suspicious_case_ids,
+                                "case_id_note": "case IDs are never model-visible and do not create a strict leakage failure"
                             }
                         }));
                         let bootstrap_work = config
@@ -959,9 +1004,21 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                     match variant {
                         VariantConfig::Recorded { path } => {
                             let path = resolve(&root, path);
-                            let exists = path.is_file();
-                            passed &= exists;
-                            checks.push(serde_json::json!({"check": format!("variant.{name}.recorded_output"), "passed": exists, "detail": path}));
+                            let result = loaded_dataset.as_ref().map_or_else(
+                                || Err(anyhow::anyhow!("dataset preflight failed")),
+                                |dataset| {
+                                    structtrace_core::output::RecordedOutputs::read_bounded(
+                                        &path,
+                                        dataset,
+                                        &config.limits,
+                                    )
+                                    .map(|outputs| outputs.rows.len())
+                                    .map_err(anyhow::Error::from)
+                                },
+                            );
+                            let valid = result.is_ok();
+                            passed &= valid;
+                            checks.push(serde_json::json!({"check": format!("variant.{name}.recorded_output"), "passed": valid, "detail": {"path": path, "matched_rows": result.ok()}}));
                         }
                         VariantConfig::Command { command, .. } => {
                             let exists = executable_exists(&root, &command.program);
@@ -1000,9 +1057,30 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                                 .and_then(|structured| structured.schema.as_ref())
                             {
                                 let path = resolve(&root, path);
-                                let exists = path.is_file();
-                                passed &= exists;
-                                checks.push(serde_json::json!({"check": format!("variant.{name}.structured_schema"), "passed": exists, "detail": path}));
+                                let validation = std::fs::symlink_metadata(&path)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|metadata| {
+                                        anyhow::ensure!(
+                                            metadata.is_file()
+                                                && !metadata.file_type().is_symlink(),
+                                            "schema must be a regular non-symlink file"
+                                        );
+                                        structtrace_core::hashing::read_bounded(
+                                            &path,
+                                            config.limits.max_schema_bytes,
+                                            "model-facing schema",
+                                        )
+                                        .map_err(Into::into)
+                                    })
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice(&bytes).map_err(Into::into)
+                                    })
+                                    .and_then(|schema| {
+                                        compile_schema(&schema).map(|_| ()).map_err(Into::into)
+                                    });
+                                let valid = validation.is_ok();
+                                passed &= valid;
+                                checks.push(serde_json::json!({"check": format!("variant.{name}.structured_schema"), "passed": valid, "detail": {"path": path, "compiled": valid}}));
                             }
                         }
                     }
@@ -1043,13 +1121,25 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
                     "status": "not_checked",
                     "detail": "Browser launch is optional; reports can always be opened or exported by path."
                 }));
-                checks.push(serde_json::json!({
-                    "check": "one_case_adapter_handshake",
-                    "passed": null,
-                    "required": false,
-                    "status": "not_checked",
-                    "detail": "Doctor does not invoke user applications or network providers without an explicit run command."
-                }));
+                if let Some(case_count) = dry_run {
+                    anyhow::ensure!(case_count > 0, "--dry-run requires at least one case");
+                    if let Some(dataset) = loaded_dataset.as_ref() {
+                        let handshake =
+                            local_worker_handshake(&root, &config, dataset, case_count).await?;
+                        for check in handshake {
+                            passed &= check["passed"].as_bool() == Some(true);
+                            checks.push(check);
+                        }
+                    }
+                } else {
+                    checks.push(serde_json::json!({
+                        "check": "one_case_adapter_handshake",
+                        "passed": null,
+                        "required": false,
+                        "status": "not_checked",
+                        "detail": "Use --strict --dry-run 1 to execute local command, Python, and external-evaluator protocol handshakes. Network providers are never contacted by doctor."
+                    }));
+                }
             }
             Err(error) => {
                 passed = false;
@@ -1057,10 +1147,11 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
             }
         }
     } else {
+        passed &= !strict;
         checks.push(serde_json::json!({
             "check": "configuration",
             "passed": false,
-            "required": false,
+            "required": strict,
             "detail": format!("{} not found; run `structtrace init` before a project comparison", config_path.display()),
         }));
     }
@@ -1117,11 +1208,145 @@ fn doctor(cli: &Cli, strict: bool) -> anyhow::Result<u8> {
             }
         }
     }
-    Ok(if passed || !config_present {
-        0
-    } else {
-        EXIT_INVALID_INPUT
-    })
+    Ok(if passed { 0 } else { EXIT_INVALID_INPUT })
+}
+
+async fn local_worker_handshake(
+    root: &Path,
+    config: &Config,
+    dataset: &Dataset,
+    requested_cases: usize,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let count = requested_cases.min(dataset.cases.len());
+    let cases = dataset
+        .cases
+        .iter()
+        .take(count)
+        .map(structtrace_core::dataset::VariantCase::from)
+        .collect::<Vec<_>>();
+    let limits = CommandLimits {
+        max_output_bytes: config.limits.max_output_bytes_per_case,
+        max_stderr_bytes: config.limits.max_stderr_bytes_per_process,
+    };
+    let runtime_root = resolve(root, &config.storage.root).join("runtime");
+    std::fs::create_dir_all(&runtime_root)?;
+    let python_bridge = runtime_root.join("doctor-python-bridge-v2.py");
+    let evaluator_bridge = runtime_root.join("doctor-evaluator-bridge-v2.py");
+    std::fs::write(&python_bridge, BRIDGE_SOURCE)?;
+    std::fs::write(&evaluator_bridge, EVALUATOR_BRIDGE_SOURCE)?;
+    let mut checks = Vec::new();
+    for (name, variant) in &config.variants {
+        let run = match variant {
+            VariantConfig::Command {
+                command,
+                process_mode,
+                timeout_ms,
+                ..
+            } => {
+                Some(run_command(command, *process_mode, *timeout_ms, &cases, root, &limits).await)
+            }
+            VariantConfig::Python {
+                interpreter,
+                callable,
+                timeout_ms,
+                ..
+            } => Some(
+                run_python(
+                    interpreter,
+                    callable,
+                    *timeout_ms,
+                    &cases,
+                    root,
+                    &python_bridge,
+                    &limits,
+                )
+                .await,
+            ),
+            VariantConfig::Recorded { .. } | VariantConfig::OpenaiCompatible(_) => None,
+        };
+        if let Some(run) = run {
+            let successful = run.protocol_errors.is_empty()
+                && run.rows.len() == count
+                && run
+                    .rows
+                    .iter()
+                    .all(|row| row.status == structtrace_core::output::OutputStatus::Ok);
+            checks.push(serde_json::json!({
+                "check": format!("variant.{name}.local_handshake"),
+                "passed": successful,
+                "required": true,
+                "detail": {"cases": count, "protocol_errors": run.protocol_errors.len(), "network_checked": false}
+            }));
+        }
+    }
+
+    let outputs = dataset
+        .cases
+        .iter()
+        .take(count)
+        .map(|case| structtrace_core::output::VariantOutput {
+            case_id: case.id.clone(),
+            status: structtrace_core::output::OutputStatus::Ok,
+            raw_output: Some(
+                serde_json::to_string(case.expected.as_ref().unwrap_or(&serde_json::Value::Null))
+                    .unwrap_or_else(|_| "null".to_owned()),
+            ),
+            parsed_output: case.expected.clone(),
+            error: None,
+            latency_ms: None,
+            usage: None,
+            cost: None,
+            metadata: serde_json::Value::Object(Default::default()),
+            retries: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    for evaluator in &config.evaluators {
+        if !matches!(
+            evaluator.kind,
+            structtrace_core::config::EvaluatorKind::Command { .. }
+                | structtrace_core::config::EvaluatorKind::Python { .. }
+        ) {
+            continue;
+        }
+        let invocations = dataset
+            .cases
+            .iter()
+            .take(count)
+            .zip(&outputs)
+            .map(|(case, output)| EvaluatorInvocation { case, output })
+            .collect::<Vec<_>>();
+        let runs = run_external_evaluator_batch(
+            &evaluator.id,
+            &evaluator.kind,
+            evaluator.implementation_version.as_deref(),
+            &invocations,
+            EvaluatorRuntime {
+                variant_id: "doctor",
+                working_directory: root,
+                python_bridge: &evaluator_bridge,
+                limits: &limits,
+            },
+        );
+        let successful = runs.len() == count
+            && runs.iter().all(|run| {
+                run.result.status != structtrace_core::evaluation::EvaluationStatus::Error
+            });
+        checks.push(serde_json::json!({
+            "check": format!("evaluator.{}.local_handshake", evaluator.id),
+            "passed": successful,
+            "required": true,
+            "detail": {"cases": count, "network_checked": false}
+        }));
+    }
+    if checks.is_empty() {
+        checks.push(serde_json::json!({
+            "check": "one_case_adapter_handshake",
+            "passed": true,
+            "required": true,
+            "detail": "recorded inputs were fully parsed; no local workers are configured and network providers were not contacted"
+        }));
+    }
+    Ok(checks)
 }
 
 fn python_callable_imports(root: &Path, interpreter: &str, callable: &str) -> bool {
@@ -1278,16 +1503,27 @@ fn resolve_run(cli: &Cli, selector: &str) -> anyhow::Result<PathBuf> {
         root.join(".structtrace")
     };
     let runs = storage.join("runs");
-    if selector == "latest" || selector == "latest-any" {
-        let require_complete = selector == "latest";
+    if matches!(
+        selector,
+        "latest" | "latest-any" | "latest-demo" | "latest-research"
+    ) {
+        let required_kind = match selector {
+            "latest" => Some(RunKind::Production),
+            "latest-demo" => Some(RunKind::Demo),
+            "latest-research" => Some(RunKind::ResearchFixture),
+            _ => None,
+        };
+        let require_complete = selector != "latest-any";
         let mut candidates = std::fs::read_dir(&runs)
             .with_context(|| format!("no StructTrace runs found under {}", runs.display()))?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .filter(|entry| {
-                !require_complete
-                    || read_json::<RunManifest>(&entry.path().join("manifest.json"))
-                        .is_ok_and(|manifest| manifest.status == RunStatus::Complete)
+                let manifest = read_json::<RunManifest>(&entry.path().join("manifest.json"));
+                manifest.is_ok_and(|manifest| {
+                    (!require_complete || manifest.status == RunStatus::Complete)
+                        && required_kind.is_none_or(|kind| manifest.run_kind == kind)
+                })
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(std::fs::DirEntry::file_name);

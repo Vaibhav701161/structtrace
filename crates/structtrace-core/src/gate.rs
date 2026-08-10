@@ -13,8 +13,10 @@ pub struct GateInputs<'a> {
     pub unique_cases: usize,
     /// Fraction of rows beyond the first member of each semantic group.
     pub duplicate_case_rate: f64,
-    /// Repeated evidence groups with contradictory retained observations.
-    pub conflicting_repeated_groups: usize,
+    /// Repeated evidence groups unsupported by the independent v1 analysis.
+    pub repeated_trial_groups: usize,
+    /// Stimuli with incompatible expected references.
+    pub label_conflict_groups: usize,
     /// Minimum explicit pass-or-fail scoring rate across both variants.
     pub primary_scored_rate: f64,
     /// Maximum primary evaluator-error rate across both variants.
@@ -119,34 +121,33 @@ impl GateStatus {
 pub struct GateDecision {
     /// Explicit deployment-decision state.
     pub status: GateStatus,
+    /// True only when every configured quality and evidence rule passed.
+    pub deployment_authorized: bool,
+    /// Configured quality rules that failed.
+    pub quality_failures: Vec<String>,
+    /// Evidence requirements that were insufficient.
+    pub evidence_failures: Vec<String>,
+    /// Rules that could not be evaluated safely.
+    pub runtime_errors: Vec<String>,
     /// Independent rule results.
     pub rules: Vec<GateRuleResult>,
 }
 
 /// Evaluate all configured rules without allowing one metric to hide another.
 pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecision {
-    let gate_configured = config.min_cases.is_some()
-        || config.min_unique_cases.is_some()
-        || config.max_duplicate_case_rate.is_some()
-        || config.min_primary_scored_rate.is_some()
-        || config.max_primary_evaluator_error_rate.is_some()
-        || config.max_primary_not_applicable_rate.is_some()
-        || config.max_primary_unscored_rate.is_some()
-        || config.max_primary_regression_pp.is_some()
-        || config.max_valid_but_wrong_increase_pp.is_some()
-        || config.min_candidate_schema_validity.is_some()
-        || config.max_error_rate.is_some()
-        || config.max_timeout_rate.is_some()
-        || config.latency.is_some()
-        || config.cost.is_some();
-    if !gate_configured {
+    if !config.is_configured() {
         return GateDecision {
             status: GateStatus::NotConfigured,
+            deployment_authorized: false,
+            quality_failures: Vec::new(),
+            evidence_failures: Vec::new(),
+            runtime_errors: Vec::new(),
             rules: Vec::new(),
         };
     }
     let mut rules = vec![
-        conflict_free_rule(inputs.conflicting_repeated_groups),
+        repeated_trials_rule(inputs.repeated_trial_groups),
+        label_conflicts_rule(inputs.label_conflict_groups),
         required_minimum_rule(
             "min_cases",
             config.min_cases.map(|value| value as f64),
@@ -276,25 +277,65 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
     } else {
         GateStatus::Passed
     };
-    GateDecision { status, rules }
+    let quality_failures = rules
+        .iter()
+        .filter(|rule| rule.status == GateRuleStatus::Failed)
+        .map(|rule| rule.rule.clone())
+        .collect();
+    let evidence_failures = rules
+        .iter()
+        .filter(|rule| rule.status == GateRuleStatus::InsufficientEvidence)
+        .map(|rule| rule.rule.clone())
+        .collect();
+    let runtime_errors = rules
+        .iter()
+        .filter(|rule| rule.status == GateRuleStatus::Error)
+        .map(|rule| rule.rule.clone())
+        .collect();
+    GateDecision {
+        status,
+        deployment_authorized: status == GateStatus::Passed,
+        quality_failures,
+        evidence_failures,
+        runtime_errors,
+        rules,
+    }
 }
 
-fn conflict_free_rule(conflicts: usize) -> GateRuleResult {
+fn repeated_trials_rule(groups: usize) -> GateRuleResult {
     GateRuleResult {
-        rule: "conflicting_repeated_evidence".to_owned(),
-        status: if conflicts == 0 {
+        rule: "repeated_trial_model".to_owned(),
+        status: if groups == 0 {
             GateRuleStatus::Passed
         } else {
             GateRuleStatus::InsufficientEvidence
         },
-        observed: Some(conflicts as f64),
+        observed: Some(groups as f64),
         threshold: Some(0.0),
-        message: if conflicts == 0 {
-            "No repeated evidence unit had conflicting retained outcomes.".to_owned()
+        message: if groups == 0 {
+            "No evidence unit contains unsupported repeated trials.".to_owned()
         } else {
             format!(
-                "{conflicts} repeated evidence unit(s) contain conflicting observations; no row was selected arbitrarily."
+                "{groups} evidence unit(s) contain repeated trials; no row was selected arbitrarily and v1 independent inference is unavailable for those groups."
             )
+        },
+    }
+}
+
+fn label_conflicts_rule(groups: usize) -> GateRuleResult {
+    GateRuleResult {
+        rule: "dataset_label_conflicts".to_owned(),
+        status: if groups == 0 {
+            GateRuleStatus::Passed
+        } else {
+            GateRuleStatus::Error
+        },
+        observed: Some(groups as f64),
+        threshold: Some(0.0),
+        message: if groups == 0 {
+            "No model-visible stimulus maps to incompatible expected references.".to_owned()
+        } else {
+            format!("{groups} stimulus group(s) have incompatible expected references.")
         },
     }
 }
@@ -464,7 +505,8 @@ mod tests {
             total_cases: primary.total,
             unique_cases: primary.total,
             duplicate_case_rate: 0.0,
-            conflicting_repeated_groups: 0,
+            repeated_trial_groups: 0,
+            label_conflict_groups: 0,
             primary_scored_rate: 1.0,
             primary_evaluator_error_rate: 0.0,
             primary_not_applicable_rate: 0.0,

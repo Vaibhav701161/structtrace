@@ -1,7 +1,9 @@
 # Privacy and redaction
 
 StructTrace has no telemetry and no automatic upload path. The offline report server binds only to
-a random `127.0.0.1` port.
+a random `127.0.0.1` port and requires a fresh 256-bit capability path for every asset. It rejects
+foreign Host, Origin, and Referer values and sends no-store, no-sniff, CSP, no-referrer, and
+same-origin resource-policy headers.
 
 On Unix, the storage root and run directories are hardened to `0700`; SQLite and finalized artifact
 files are hardened to `0600`. `structtrace doctor --strict` checks existing storage permissions.
@@ -23,7 +25,8 @@ storage:
     custom_patterns: [tenant-secret-prefix]
 ```
 
-Raw retention is enforced before output JSONL and paired case artifacts are finalized. Full
+Raw retention changes persisted presentation and forensic detail only. Stable parse facts and
+retention-independent evaluator requests preserve scores, evidence classification, and gates. Full
 provider-response retention defaults to false. Report redaction fails closed: if a safe report
 view cannot be constructed, report creation returns an error rather than falling back to the
 original value. The redaction source includes input, expected values, model-visible metadata, and

@@ -480,6 +480,7 @@ fn error_output(
         error: Some(OutputError {
             kind: kind.to_owned(),
             message: message.to_owned(),
+            fingerprint: None,
         }),
         latency_ms,
         usage: None,
@@ -509,6 +510,7 @@ fn provider_error_output(
         error: Some(OutputError {
             kind: "provider_error".to_owned(),
             message: format!("Provider rejected the request with HTTP status {http_status}."),
+            fingerprint: None,
         }),
         latency_ms,
         usage: None,

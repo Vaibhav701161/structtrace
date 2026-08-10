@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use structtrace_core::{
     artifact::ExternalEvaluatorReceipt,
-    config::{CommandSpec, EvaluatorKind, ProcessMode},
+    config::{CommandSpec, EvaluatorKind, ImplementationConfig, ProcessMode},
     dataset::Case,
     evaluation::{EvaluationStatus, EvaluatorResult, FieldEvaluationFact},
     hashing::hash_canonical_json,
@@ -30,6 +30,11 @@ pub const EVALUATOR_PROTOCOL: &str = "structtrace.evaluator";
 /// Bundled Python evaluator bridge source.
 pub const EVALUATOR_BRIDGE_SOURCE: &str =
     include_str!("../../../python/structtrace_evaluator_bridge.py");
+
+const MAX_EVALUATOR_FIELDS: usize = 10_000;
+const MAX_EVALUATOR_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_EVALUATOR_DETAILS_BYTES: usize = 1024 * 1024;
+const MAX_EVALUATOR_FIELD_VALUE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -483,6 +488,7 @@ pub fn evaluator_request(
     output: &VariantOutput,
     variant_id: &str,
 ) -> Value {
+    let output = stable_evaluator_output(output);
     json!({
         "protocol": EVALUATOR_PROTOCOL,
         "protocol_version": structtrace_core::PROTOCOL_VERSION,
@@ -492,6 +498,39 @@ pub fn evaluator_request(
         "model_output": output,
         "variant_metadata": {"variant_id": variant_id},
     })
+}
+
+/// Build the retention-independent model-output view supplied to custom evaluators.
+/// Valid JSON is canonicalized; provider envelopes, prompts, and raw formatting are excluded.
+fn stable_evaluator_output(output: &VariantOutput) -> VariantOutput {
+    let mut stable = output.clone();
+    let parsed = stable.parsed_output.clone().or_else(|| {
+        stable
+            .raw_output
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+    });
+    stable.parsed_output.clone_from(&parsed);
+    stable.raw_output = parsed
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok());
+    if let Some(metadata) = stable.metadata.as_object_mut() {
+        metadata.remove("provider_response");
+        metadata.remove("rendered_prompt");
+    }
+    for retry in &mut stable.retries {
+        if let Some(object) = retry.as_object_mut() {
+            object.remove("response");
+        }
+    }
+    if let Some(error) = stable
+        .error
+        .as_mut()
+        .filter(|error| error.kind == "provider_error")
+    {
+        error.message = "Provider rejected the request.".to_owned();
+    }
+    stable
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,9 +564,23 @@ fn receipt_run(
 
 /// Canonical external-evaluator definition bound into replay receipts.
 pub fn evaluator_definition(kind: &EvaluatorKind, implementation_version: Option<&str>) -> Value {
+    evaluator_definition_with_implementation(
+        kind,
+        implementation_version,
+        &ImplementationConfig::default(),
+    )
+}
+
+/// Canonical evaluator definition including explicitly declared implementation inputs.
+pub fn evaluator_definition_with_implementation(
+    kind: &EvaluatorKind,
+    implementation_version: Option<&str>,
+    implementation: &ImplementationConfig,
+) -> Value {
     json!({
         "kind": kind,
         "implementation_version": implementation_version,
+        "implementation": implementation,
     })
 }
 
@@ -709,16 +762,73 @@ fn parse_response_inner(
         return error(evaluator_id, "evaluator score must be between zero and one");
     }
     let fields = response.fields;
+    if fields.len() > MAX_EVALUATOR_FIELDS {
+        return error(
+            evaluator_id,
+            "evaluator response contains too many field facts",
+        );
+    }
     if !fields.iter().all(|field| {
-        (field.pointer.is_empty() || field.pointer.starts_with('/'))
+        valid_json_pointer(&field.pointer)
             && field
                 .expected_pointer
                 .as_ref()
-                .is_none_or(|pointer| pointer.is_empty() || pointer.starts_with('/'))
+                .is_none_or(|pointer| valid_json_pointer(pointer))
     }) {
         return error(
             evaluator_id,
             "evaluator field facts contain invalid JSON Pointers",
+        );
+    }
+    if response
+        .message
+        .as_ref()
+        .is_some_and(|message| message.len() > MAX_EVALUATOR_MESSAGE_BYTES)
+        || response.details.as_ref().is_some_and(|details| {
+            serde_json::to_vec(details)
+                .map_or(true, |bytes| bytes.len() > MAX_EVALUATOR_DETAILS_BYTES)
+        })
+        || fields.iter().any(|field| {
+            field.message.len() > MAX_EVALUATOR_MESSAGE_BYTES
+                || [&field.expected, &field.actual].into_iter().any(|value| {
+                    serde_json::to_vec(value)
+                        .map_or(true, |bytes| bytes.len() > MAX_EVALUATOR_FIELD_VALUE_BYTES)
+                })
+        })
+    {
+        return error(
+            evaluator_id,
+            "evaluator response exceeds a semantic field limit",
+        );
+    }
+    let has_failed = fields
+        .iter()
+        .any(|field| field.status == EvaluationStatus::Failed);
+    let has_error = fields
+        .iter()
+        .any(|field| field.status == EvaluationStatus::Error);
+    let has_resolved = fields.iter().any(|field| {
+        matches!(
+            field.status,
+            EvaluationStatus::Passed | EvaluationStatus::Failed
+        )
+    });
+    let consistent = match status {
+        EvaluationStatus::Passed => !has_failed && !has_error,
+        EvaluationStatus::Failed => {
+            has_failed
+                || response
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+        }
+        EvaluationStatus::Error => score != Some(1.0) && !has_resolved,
+        EvaluationStatus::NotApplicable => !has_resolved,
+    };
+    if !consistent {
+        return error(
+            evaluator_id,
+            "evaluator status, score, message, and field facts are contradictory",
         );
     }
     EvaluatorResult {
@@ -734,6 +844,25 @@ fn parse_response_inner(
         details: response.details.unwrap_or(Value::Null),
         fields,
     }
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return false;
+    }
+    let bytes = pointer.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                return false;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 fn read_capped(mut stream: impl Read, limit: usize) -> Vec<u8> {
@@ -812,6 +941,39 @@ mod tests {
         assert!(result.message.contains("unknown field"));
     }
 
+    #[test]
+    fn contradictory_field_facts_and_invalid_pointer_escapes_are_rejected() {
+        for fields in [
+            serde_json::json!([{
+                "pointer": "/tax",
+                "status": "failed",
+                "expected": 18,
+                "actual": 8,
+                "message": "mismatch"
+            }]),
+            serde_json::json!([{
+                "pointer": "/bad~escape",
+                "status": "passed",
+                "message": "invalid pointer"
+            }]),
+        ] {
+            let response = serde_json::json!({
+                "protocol": EVALUATOR_PROTOCOL,
+                "protocol_version": structtrace_core::PROTOCOL_VERSION,
+                "evaluator_id": "business",
+                "case_id": "one",
+                "status": "passed",
+                "fields": fields
+            });
+            let result = parse_response_for_case(
+                "business",
+                "one",
+                serde_json::to_string(&response).unwrap().as_bytes(),
+            );
+            assert_eq!(result.status, EvaluationStatus::Error);
+        }
+    }
+
     #[cfg(unix)]
     use tempfile::tempdir;
 
@@ -829,7 +991,7 @@ mod tests {
         let script = root.path().join("evaluator.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":1,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1,\"message\":\"receipt verified\"}'\n",
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":2,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1,\"message\":\"receipt verified\"}'\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -873,7 +1035,7 @@ mod tests {
         let script = root.path().join("evaluator.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":1,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1}'\nexit 9\n",
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":2,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1}'\nexit 9\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -925,7 +1087,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             root.path().join("worker.py"),
-            "import json,sys,time\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':1,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\ntime.sleep(0.1); print('extra',flush=True)\n",
+            "import json,sys,time\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':2,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\ntime.sleep(0.1); print('extra',flush=True)\n",
         )
         .unwrap();
         let cases = [fixture_case("one"), fixture_case("two")];
@@ -976,7 +1138,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             root.path().join("worker.py"),
-            "import json,subprocess,sys\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':1,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n",
+            "import json,subprocess,sys\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':2,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n",
         )
         .unwrap();
         let cases = [fixture_case("one")];

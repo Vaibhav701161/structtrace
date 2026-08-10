@@ -690,6 +690,7 @@ fn parse_response(line: &str, case_id: &str, latency_ms: u64) -> anyhow::Result<
     let error = response.error.map(|error| OutputError {
         kind: error.kind,
         message: error.message,
+        fingerprint: error.fingerprint,
     });
     Ok(VariantOutput {
         case_id: case_id.to_owned(),
@@ -719,6 +720,7 @@ fn error_output(
         error: Some(OutputError {
             kind: kind.to_owned(),
             message: message.to_owned(),
+            fingerprint: None,
         }),
         latency_ms,
         usage: None,
@@ -822,7 +824,7 @@ for line in sys.stdin:
         continue
     response = {
         "protocol": "structtrace.variant",
-        "protocol_version": 1,
+        "protocol_version": 2,
         "case_id": "wrong" if args.mode == "wrong-id" else case_id,
         "status": "ok",
         "output": {"label": "accepted"},

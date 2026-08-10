@@ -78,6 +78,8 @@ pub const HARD_MAX_REPLAY_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const HARD_MAX_BOOTSTRAP_SAMPLES: usize = 1_000_000;
 /// Hard ceiling for the product of bootstrap replicates and evidence units.
 pub const HARD_MAX_BOOTSTRAP_WORK_UNITS: usize = 100_000_000;
+/// Hard ceiling for explicitly bound implementation source files.
+pub const HARD_MAX_IMPLEMENTATION_SOURCES: usize = 256;
 
 /// Configurable resource limits with conservative defaults and enforced hard ceilings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +314,12 @@ pub struct ImplementationConfig {
     pub sources: Vec<PathBuf>,
 }
 
+impl ImplementationConfig {
+    fn is_empty(&self) -> bool {
+        self.digest.is_none() && self.sources.is_empty()
+    }
+}
+
 /// Executable and argument array. No shell is involved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,6 +445,9 @@ pub struct EvaluatorConfig {
     /// Immutable implementation version or digest for external evaluators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementation_version: Option<String>,
+    /// Explicit source files or digest that define an external evaluator implementation.
+    #[serde(default, skip_serializing_if = "ImplementationConfig::is_empty")]
+    pub implementation: ImplementationConfig,
     /// Evaluator behavior.
     #[serde(flatten)]
     pub kind: EvaluatorKind,
@@ -719,6 +730,26 @@ pub struct GateConfig {
     pub cost: Option<CostGateConfig>,
 }
 
+impl GateConfig {
+    /// Whether at least one release criterion is configured.
+    pub fn is_configured(&self) -> bool {
+        self.min_cases.is_some()
+            || self.min_unique_cases.is_some()
+            || self.max_duplicate_case_rate.is_some()
+            || self.min_primary_scored_rate.is_some()
+            || self.max_primary_evaluator_error_rate.is_some()
+            || self.max_primary_not_applicable_rate.is_some()
+            || self.max_primary_unscored_rate.is_some()
+            || self.max_primary_regression_pp.is_some()
+            || self.max_valid_but_wrong_increase_pp.is_some()
+            || self.min_candidate_schema_validity.is_some()
+            || self.max_error_rate.is_some()
+            || self.max_timeout_rate.is_some()
+            || self.latency.is_some()
+            || self.cost.is_some()
+    }
+}
+
 /// Operational latency gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -977,6 +1008,10 @@ impl Config {
                 ));
             }
             validate_evaluator(&evaluator.id, &evaluator.kind)?;
+            validate_implementation(
+                &format!("evaluators.{}", evaluator.id),
+                &evaluator.implementation,
+            )?;
             if matches!(
                 evaluator.kind,
                 EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. }
@@ -1054,6 +1089,29 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
                     )));
                 }
             }
+            let base_url = url::Url::parse(&adapter.base_url).map_err(|error| {
+                CoreError::Configuration(format!("{name}.base_url is invalid: {error}"))
+            })?;
+            if !matches!(base_url.scheme(), "http" | "https")
+                || base_url.host_str().is_none()
+                || !base_url.username().is_empty()
+                || base_url.password().is_some()
+                || base_url.query().is_some()
+                || base_url.fragment().is_some()
+            {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.base_url must be an HTTP(S) root with a host and without credentials, query, or fragment"
+                )));
+            }
+            if base_url
+                .path()
+                .trim_end_matches('/')
+                .ends_with("/chat/completions")
+            {
+                return Err(CoreError::Configuration(format!(
+                    "{name}.base_url must be the API root (for example /v1), not the full /chat/completions endpoint"
+                )));
+            }
             if adapter
                 .api_key_env
                 .as_deref()
@@ -1081,9 +1139,11 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
                     "{name}.request.max_output_tokens must be between 1 and {HARD_MAX_OUTPUT_TOKENS}"
                 )));
             }
-            if !adapter.request.temperature.is_finite() || adapter.request.temperature < 0.0 {
+            if !adapter.request.temperature.is_finite()
+                || !(0.0..=2.0).contains(&adapter.request.temperature)
+            {
                 return Err(CoreError::Configuration(format!(
-                    "{name}.request.temperature must be a finite non-negative number"
+                    "{name}.request.temperature must be a finite number between 0 and 2"
                 )));
             }
             if let Some(structured) = &adapter.structured_output {
@@ -1124,6 +1184,11 @@ fn validate_variant(name: &str, variant: &VariantConfig) -> Result<()> {
 }
 
 fn validate_implementation(name: &str, implementation: &ImplementationConfig) -> Result<()> {
+    if implementation.sources.len() > HARD_MAX_IMPLEMENTATION_SOURCES {
+        return Err(CoreError::Configuration(format!(
+            "{name}.implementation.sources contains more than {HARD_MAX_IMPLEMENTATION_SOURCES} files"
+        )));
+    }
     if implementation
         .digest
         .as_deref()
@@ -1608,6 +1673,7 @@ mod tests {
             evaluators: vec![EvaluatorConfig {
                 id: "exact".to_owned(),
                 implementation_version: None,
+                implementation: ImplementationConfig::default(),
                 kind: EvaluatorKind::ExactJson,
             }],
             outcomes: BTreeMap::from([(
@@ -1735,6 +1801,61 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_openai_urls_and_temperatures_are_rejected() {
+        for base_url in [
+            "file:///etc/passwd",
+            "https://user@example.com/v1",
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?token=secret",
+            "https://example.com/v1#secret",
+            "https://example.com/v1/chat/completions",
+        ] {
+            let mut config = minimal();
+            config.variants.insert(
+                "candidate".to_owned(),
+                VariantConfig::OpenaiCompatible(Box::new(OpenAiCompatibleConfig {
+                    base_url: base_url.to_owned(),
+                    api_key_env: Some("TEST_API_KEY".to_owned()),
+                    model: "model".to_owned(),
+                    request: OpenAiRequestConfig {
+                        system: None,
+                        user_template: "{{ input }}".to_owned(),
+                        temperature: 0.0,
+                        max_output_tokens: 100,
+                    },
+                    structured_output: None,
+                    timeout_ms: 1_000,
+                    concurrency: 1,
+                    retries: 0,
+                    pricing: None,
+                })),
+            );
+            assert!(Config::validate(config).is_err(), "accepted {base_url}");
+        }
+        let mut config = minimal();
+        config.variants.insert(
+            "candidate".to_owned(),
+            VariantConfig::OpenaiCompatible(Box::new(OpenAiCompatibleConfig {
+                base_url: "http://127.0.0.1:8000/v1".to_owned(),
+                api_key_env: None,
+                model: "model".to_owned(),
+                request: OpenAiRequestConfig {
+                    system: None,
+                    user_template: "{{ input }}".to_owned(),
+                    temperature: 2.1,
+                    max_output_tokens: 100,
+                },
+                structured_output: None,
+                timeout_ms: 1_000,
+                concurrency: 1,
+                retries: 0,
+                pricing: None,
+            })),
+        );
+        assert!(Config::validate(config).is_err());
+    }
+
+    #[test]
     fn ambiguous_date_formats_and_empty_keyed_fields_are_rejected() {
         let mut date = minimal();
         date.evaluators[0].kind = EvaluatorKind::CanonicalDate {
@@ -1810,6 +1931,7 @@ mod tests {
         config.evaluators = vec![EvaluatorConfig {
             id: "external".to_owned(),
             implementation_version: Some("v1".to_owned()),
+            implementation: ImplementationConfig::default(),
             kind: EvaluatorKind::Command {
                 command: CommandSpec {
                     program: "worker".to_owned(),

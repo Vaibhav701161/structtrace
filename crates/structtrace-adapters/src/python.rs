@@ -132,7 +132,7 @@ mod tests {
                 .error
                 .as_ref()
                 .map(|error| error.message.as_str()),
-            Some("RuntimeError")
+            Some("Python callable failed with RuntimeError")
         );
     }
 
@@ -205,5 +205,107 @@ mod tests {
         );
         assert_eq!(mixed.rows[1].status, OutputStatus::Ok);
         assert!(mixed.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_loop_stdout_capture_and_common_values_are_supported() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("bridge.py"), BRIDGE_SOURCE).unwrap();
+        fs::write(
+            root.path().join("app.py"),
+            r#"print("IMPORT_BANNER")
+import asyncio
+from dataclasses import dataclass
+
+first_loop = None
+
+async def stable_loop(case):
+    global first_loop
+    current = asyncio.get_running_loop()
+    if first_loop is None:
+        first_loop = current
+    if current is not first_loop:
+        raise RuntimeError("loop changed")
+    print("USER_DEBUG_ON_STDOUT")
+    return {"same_loop": True}
+
+@dataclass
+class Result:
+    label: str
+
+def dataclass_result(case):
+    return Result("ok")
+
+def ordinary_protocol_field(case):
+    return {"protocol": "structtrace.variant", "business_value": 7}
+"#,
+        )
+        .unwrap();
+        let mut second = case();
+        second.id = "two".to_owned();
+        let loop_run = run_python(
+            python_program(),
+            "app:stable_loop",
+            1_000,
+            &[case(), second],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert!(
+            loop_run
+                .rows
+                .iter()
+                .all(|row| row.status == OutputStatus::Ok)
+        );
+        let stderr = String::from_utf8(loop_run.stderr).unwrap();
+        assert!(stderr.contains("IMPORT_BANNER"));
+        assert!(stderr.contains("USER_DEBUG_ON_STDOUT"));
+
+        for (callable, pointer) in [
+            ("app:dataclass_result", "/label"),
+            ("app:ordinary_protocol_field", "/business_value"),
+        ] {
+            let run = run_python(
+                python_program(),
+                callable,
+                1_000,
+                &[case()],
+                root.path(),
+                &root.path().join("bridge.py"),
+                &CommandLimits::default(),
+            )
+            .await;
+            assert_eq!(run.rows[0].status, OutputStatus::Ok);
+            let parsed: serde_json::Value =
+                serde_json::from_str(run.rows[0].raw_output.as_deref().unwrap()).unwrap();
+            assert!(parsed.pointer(pointer).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_import_failure_is_sanitized_per_case() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("bridge.py"), BRIDGE_SOURCE).unwrap();
+        let run = run_python(
+            python_program(),
+            "missing_private_module:run",
+            1_000,
+            &[case()],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert_eq!(run.rows[0].status, OutputStatus::Error);
+        let error = run.rows[0].error.as_ref().unwrap();
+        assert_eq!(error.kind, "startup_error");
+        assert_eq!(
+            error.message,
+            "Python callable failed with ModuleNotFoundError"
+        );
+        assert!(error.fingerprint.is_some());
+        assert!(!String::from_utf8(run.stderr).unwrap().contains("Traceback"));
     }
 }

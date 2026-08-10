@@ -9,6 +9,14 @@ source-file edit during a long run cannot change its evidence bundle. Baseline a
 JSONL are retained independently of derived `cases.jsonl`. Custom evaluators add hash-bound
 `external-evaluator-receipts.jsonl`.
 
+Manifests and SQLite record a run kind: `production`, `demo`, `research_fixture`, or `test`.
+`latest` selects only a completed production run; use `latest-demo`, `latest-research`, or
+`latest-any` explicitly for other histories.
+
+Live runs snapshot model-facing schemas before either variant executes. Configured executables,
+Python entry modules, evaluator implementations, declared source files/digests, relevant lockfiles,
+and interpreter identity form a bounded fingerprint that is rechecked before finalization.
+
 Final writes are atomic. BLAKE3 hashes bind exact dataset, schema, imported/generated outputs, and
 finalized artifacts. WAL is used during active execution and checkpointed on completion.
 

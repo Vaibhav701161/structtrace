@@ -1,6 +1,9 @@
 # OpenAI-compatible integration
 
-The focused provider adapter calls `/chat/completions` on an explicitly configured base URL. It supports system and rendered user messages, deterministic request settings, `json_object` or `json_schema` response formats, bounded concurrency, token accounting, and user-supplied pricing.
+The focused provider adapter calls `/chat/completions` on an explicitly configured HTTP(S) API
+root. Full endpoint paths, embedded credentials, query strings, fragments, and non-HTTP schemes
+are rejected during configuration validation. This is a deliberately narrow compatibility
+surface, not a claim of universal OpenAI API compatibility.
 
 ```yaml
 kind: openai_compatible
@@ -25,3 +28,15 @@ responses remain failures. Retries are disabled by default; when enabled, every 
 retained and uses bounded exponential backoff, honoring numeric `Retry-After` seconds when
 provided. Full provider response retention defaults to false. Pricing is never inferred, because
 provider price tables change independently from a run.
+
+For `json_schema`, the exact model-facing schema bytes are size-checked, compiled, captured under
+`inputs/variants/<variant>/model-facing-schema.json`, and bound into resume, manifest, and replay
+provenance before either variant executes. A schema or configured implementation change during the
+run refuses finalization.
+
+| Server profile | Automated evidence | Status |
+|---|---|---|
+| Local Axum OpenAI-shaped mock | content, malformed/error response, usage, cost, deadline, retry | Tested |
+| Unauthenticated local `/v1` root | request construction and response parsing | Tested |
+| Hosted OpenAI service | no live compatibility run retained | Experimental / unverified |
+| Other OpenAI-compatible providers | no universal compatibility claim | Experimental / unverified |

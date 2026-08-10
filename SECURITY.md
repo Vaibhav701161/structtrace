@@ -16,7 +16,10 @@ configuration from untrusted repositories before invoking `structtrace run`.
 StructTrace does not sandbox user executables.
 
 JSON Schema remote retrieval is disabled. The local report server binds to a
-random `127.0.0.1` port and does not expose a public listener. Generated reports
+random `127.0.0.1` port and serves every verified asset below a fresh 256-bit
+capability URL. It validates the loopback Host and rejects foreign Origin and
+Referer values. Responses disable caching and MIME sniffing and carry CSP and
+same-origin resource headers. Generated reports
 contain no external scripts, CDN assets, analytics, or telemetry. Case bodies are
 lazy-loaded from bounded local chunks, and an aggregate-only share export omits all case data.
 
@@ -52,6 +55,10 @@ substitute for reviewing an artifact generated from sensitive data.
 Run directories are local files and inherit filesystem permissions from the
 user and host. Encrypt or delete them according to the organization’s data
 retention policy.
+
+On Unix, StructTrace creates run directories as `0700` and files as `0600`.
+Equivalent restrictive Windows ACL enforcement is not yet verified, so command
+and Python execution remain Beta on Windows.
 
 ## Integrity
 

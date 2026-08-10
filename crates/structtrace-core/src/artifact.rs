@@ -74,6 +74,21 @@ pub enum RunStatus {
     Corrupt,
 }
 
+/// Purpose of a run, used to keep examples and verification fixtures out of production history.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    /// A user-requested comparison eligible for the default `latest` selector.
+    #[default]
+    Production,
+    /// A bundled product demonstration.
+    Demo,
+    /// A normalized research verification fixture with no pooled release claim.
+    ResearchFixture,
+    /// An internal automated test run.
+    Test,
+}
+
 /// Reproducibility and artifact-integrity manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifest {
@@ -83,6 +98,9 @@ pub struct RunManifest {
     pub artifact_format_version: u32,
     /// ULID run identity.
     pub run_id: String,
+    /// Purpose of this run; only production runs participate in default `latest` resolution.
+    #[serde(default)]
+    pub run_kind: RunKind,
     /// Project name.
     pub project_name: String,
     /// Exact source configuration hash.
@@ -134,6 +152,7 @@ impl RunManifest {
             structtrace_version: env!("CARGO_PKG_VERSION").to_owned(),
             artifact_format_version: ARTIFACT_FORMAT_VERSION,
             run_id,
+            run_kind: RunKind::Production,
             project_name,
             configuration_file_hash: String::new(),
             normalized_configuration_hash: String::new(),
@@ -295,28 +314,74 @@ pub struct RunSummary {
     /// Per-evaluator pass counts by variant.
     pub evaluator_passes: BTreeMap<String, EvaluatorComparison>,
     /// Field-level regression and improvement counts.
+    #[serde(default)]
     pub field_hotspots: Vec<FieldHotspot>,
+    /// Field facts emitted by evaluators reachable from the selected primary outcome.
+    #[serde(default)]
+    pub primary_field_hotspots: Vec<FieldHotspot>,
+    /// Field facts from every configured evaluator, explicitly diagnostic only.
+    #[serde(default)]
+    pub all_evaluator_field_diagnostics: Vec<FieldHotspot>,
 }
 
 /// Exact-duplicate audit for the matched dataset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceSummary {
-    /// All matched rows, including repeated semantic cases.
+    /// All matched rows, including exact duplicates and repeated trials.
     pub total_rows: usize,
-    /// Distinct fingerprints of input, expected output, and relevant metadata.
-    pub unique_semantic_cases: usize,
-    /// Number of fingerprints represented by more than one row.
+    /// Evidence units represented by exactly one row.
+    pub singleton_evidence_units: usize,
+    /// Evidence groups whose complete scored and operational observations are identical.
     pub exact_duplicate_groups: usize,
-    /// Largest number of rows sharing one configured evidence unit.
-    pub largest_duplicate_group: usize,
-    /// Fraction of rows beyond the first member of each fingerprint group.
-    pub duplicate_case_rate: f64,
-    /// Denominator used by independent paired inference and evidence gates.
-    pub effective_gate_denominator: usize,
-    /// Repeated evidence groups whose retained observations disagree.
-    pub conflicting_repeated_groups: usize,
-    /// Human-readable configured inference-unit definition.
-    pub inference_unit: String,
+    /// Evidence groups containing differing scored or operational observations.
+    pub repeated_trial_groups: usize,
+    /// Stimuli associated with incompatible expected references.
+    pub label_conflict_groups: usize,
+    /// Rows beyond the first member of exact-duplicate groups.
+    pub exact_duplicate_rows: usize,
+    /// Largest number of rows sharing one evidence-unit identity.
+    pub largest_group: usize,
+    /// Fraction of captured rows that are redundant exact duplicates.
+    pub exact_duplicate_row_rate: f64,
+    /// Denominator used by independent paired inference and gates.
+    pub effective_inference_units: usize,
+    /// Human-readable configured evidence-unit identity.
+    pub inference_policy: String,
+    /// Deterministic per-group classifications for audit and report diagnostics.
+    pub groups: Vec<EvidenceGroupDiagnostic>,
+}
+
+/// Conservative v1 classification for one configured evidence group.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGroupKind {
+    /// One row represents the evidence unit.
+    Singleton,
+    /// Multiple rows have identical stimulus, reference, scored, and operational evidence.
+    ExactDuplicate,
+    /// Multiple rows disagree in scored or operational evidence and are not independently modeled.
+    RepeatedTrial,
+    /// One stimulus maps to incompatible expected references.
+    LabelConflict,
+}
+
+/// Safe, case-ID-free evidence-group audit fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceGroupDiagnostic {
+    /// Canonical hash of the configured evidence-unit identity.
+    pub evidence_unit_hash: String,
+    /// Canonical stimulus hashes observed in the group.
+    pub stimulus_hashes: Vec<String>,
+    /// Canonical reference hashes observed in the group.
+    pub reference_hashes: Vec<String>,
+    /// Canonical retention-independent scored-observation hashes.
+    pub scored_observation_hashes: Vec<String>,
+    /// Canonical operational-observation hashes.
+    pub operational_observation_hashes: Vec<String>,
+    /// Conservative group classification.
+    pub kind: EvidenceGroupKind,
+    /// Number of captured rows in the group.
+    pub rows: usize,
 }
 
 /// Semantic-only paired analysis, separate from complete-denominator deployment success.
@@ -363,6 +428,9 @@ pub struct EvaluatorStateCounts {
 /// JSON Pointer-level paired changes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FieldHotspot {
+    /// Evaluator whose facts produced this diagnostic.
+    #[serde(default)]
+    pub evaluator_id: String,
     /// Output JSON Pointer.
     pub pointer: String,
     /// Baseline pass and candidate fail.
@@ -371,4 +439,10 @@ pub struct FieldHotspot {
     pub improvements: usize,
     /// Total candidate failures.
     pub candidate_failures: usize,
+    /// Baseline field-result states, including missing results.
+    #[serde(default)]
+    pub baseline: EvaluatorStateCounts,
+    /// Candidate field-result states, including missing results.
+    #[serde(default)]
+    pub candidate: EvaluatorStateCounts,
 }

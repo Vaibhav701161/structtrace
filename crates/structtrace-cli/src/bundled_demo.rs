@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use serde::Deserialize;
+use structtrace_core::artifact::RunKind;
 use structtrace_core::config::{Config, VariantConfig};
 
 const SUPPORT_CONFIG: &str = include_str!("../../../demo/support-ticket/structtrace.yaml");
@@ -79,7 +80,7 @@ pub fn run_invoice(project_root: &Path) -> anyhow::Result<structtrace_engine::Co
             path: fixture_root.join("outputs/candidate.jsonl"),
         },
     );
-    structtrace_engine::run_recorded_with_config(&root, &config_path, config)
+    structtrace_engine::run_recorded_with_config_kind(&root, &config_path, config, RunKind::Demo)
 }
 
 /// Materialize and run the support-ticket fixture below local state.
@@ -119,7 +120,7 @@ pub fn run_support_ticket(project_root: &Path) -> anyhow::Result<structtrace_eng
             path: fixture_root.join("outputs/candidate.jsonl"),
         },
     );
-    structtrace_engine::run_recorded_with_config(&root, &config_path, config)
+    structtrace_engine::run_recorded_with_config_kind(&root, &config_path, config, RunKind::Demo)
 }
 
 /// Materialize and verify normalized accepted research outcome matrices.
@@ -163,23 +164,25 @@ pub fn run_research(project_root: &Path) -> anyhow::Result<ResearchDemo> {
                 path: study_root.join("generated/candidate.jsonl"),
             },
         );
-        runs.push(structtrace_engine::run_recorded_with_config(
+        runs.push(structtrace_engine::run_recorded_with_config_kind(
             &root,
             &config_path,
             config,
+            RunKind::ResearchFixture,
         )?);
     }
-    let index_path = fixture_root.join("INDEX.md");
+    let index_path = fixture_root.join("index.html");
     let mut index = String::from(
-        "# Accepted research fixtures\n\nThese are separate studies. No pooled effect or release gate is calculated.\n\n",
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>StructTrace research fixtures</title><style>body{font:16px/1.6 system-ui;max-width:780px;margin:4rem auto;padding:0 1.5rem;color:#172033}li{margin:.8rem 0}code{font-size:.9em}</style><h1>Accepted research fixtures</h1><p><strong>These studies are separate. No pooled effect or release gate is calculated.</strong></p><ul>",
     );
     for (study, run) in studies.iter().zip(&runs) {
         index.push_str(&format!(
-            "- {}: `{}`\n",
+            "<li>{}: <a href=\"{}\">open separate report</a></li>",
             study.label,
             run.run_dir.join("report/index.html").display()
         ));
     }
+    index.push_str("</ul></html>");
     write_fixture(&index_path, &index)?;
     Ok(ResearchDemo { runs, index_path })
 }

@@ -99,7 +99,13 @@ cd structtrace
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
 structtrace doctor --strict
+structtrace doctor --strict --dry-run 3
 ```
+
+Strict doctor validates configuration and retained inputs without contacting a provider. The
+optional bounded dry run additionally exercises local command, Python, and custom-evaluator
+protocols against the first `N` cases. OpenAI-compatible variants are deliberately never called by
+doctor.
 
 The release workflow and checksum-verifying installers are release-candidate assets. They become
 supported only after clean Linux, macOS, and Windows virtual-machine installation checks have been
@@ -130,6 +136,10 @@ structtrace init my-check --preset extraction
 
 Initialization refuses to overwrite existing StructTrace files.
 
+Bundled demos and research fixtures are isolated from production history. `latest` always means
+the latest completed production run; `latest-demo`, `latest-research`, and `latest-any` are
+explicit opt-in selectors.
+
 ## Execution sources
 
 | Adapter | Status | Use it when | Execution behavior |
@@ -140,6 +150,11 @@ Initialization refuses to overwrite existing StructTrace files.
 | OpenAI-compatible | Experimental | comparing models or request settings | explicit endpoint, bounded total case deadline and opt-in backoff |
 
 All adapters receive a label-free case view and produce the same `VariantOutput` envelope before entering the same storage, evaluation, report, gate, and replay path. Adapter errors, timeouts, malformed responses, nonzero exits, and missing outputs never shrink the denominator.
+
+For live execution, StructTrace snapshots model-facing schemas before either variant starts and
+hash-binds only configured implementation inputs under explicit size/count ceilings. It rechecks
+those schema and implementation hashes before finalization. External evaluator
+`implementation.sources` and `implementation.digest` participate in the same provenance boundary.
 
 ## Evaluators and outcomes
 
@@ -267,11 +282,11 @@ storage:
       - /input/phone
 ```
 
-Raw retention is enforced before portable output artifacts are written. Full provider-response
-retention defaults to off. Report redaction is fail-closed, includes model-visible metadata in its
+Raw retention changes persisted presentation only; stable scoring facts, statistics, and gates are
+retention-invariant. Full provider-response retention defaults to off. Report redaction is fail-closed, includes model-visible metadata in its
 source, and removes matching echoes from parsed output, evaluator evidence, provider response
 bodies, retry records, and search indexes. The report server binds to a random loopback-only
-address. Opening a completed report serves its immutable finalized bundle; the optional one-file
+address and requires a fresh 256-bit capability path for every asset. Opening a completed report serves its immutable finalized bundle; the optional one-file
 export copies a finalized size-limited derivative. `--export-share` creates a new aggregate-only
 directory with every case-level value omitted.
 

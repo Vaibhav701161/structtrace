@@ -15,7 +15,9 @@ use minijinja::{AutoEscape, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use structtrace_core::{
-    artifact::{PairedCaseRecord, RunManifest, RunStatus, RunSummary, VariantSummary},
+    artifact::{
+        EvaluatorStateCounts, PairedCaseRecord, RunManifest, RunStatus, RunSummary, VariantSummary,
+    },
     config::{Config, TextRedactionMode},
     gate::{GateRuleStatus, GateStatus},
     hashing::hash_file,
@@ -44,6 +46,10 @@ struct ReportView {
     run_id: String,
     gate_label: String,
     gate_class: String,
+    deployment_authorized: bool,
+    has_quality_failures: bool,
+    has_evidence_failures: bool,
+    has_runtime_errors: bool,
     default_filter: String,
     difference: String,
     interval: String,
@@ -51,7 +57,8 @@ struct ReportView {
     unique_cases: usize,
     duplicate_groups: usize,
     largest_duplicate_group: usize,
-    conflicting_groups: usize,
+    repeated_trial_groups: usize,
+    label_conflict_groups: usize,
     inference_unit: String,
     evidence_denominator: usize,
     semantic_jointly_scored: usize,
@@ -67,6 +74,7 @@ struct ReportView {
     evaluator_rows: Vec<EvaluatorRowView>,
     operational_rows: Vec<OperationalRow>,
     hotspots: Vec<HotspotView>,
+    diagnostic_hotspots: Vec<HotspotView>,
     cases: Vec<CaseView>,
     embedded_cases_json: Option<String>,
     share_derivative: bool,
@@ -137,10 +145,13 @@ struct GateRuleView {
 
 #[derive(Debug, Serialize)]
 struct HotspotView {
+    evaluator_id: String,
     pointer: String,
     regressions: usize,
     improvements: usize,
     failures: usize,
+    baseline_states: String,
+    candidate_states: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,9 +312,17 @@ fn write_share_directory(
     view.default_filter = "all".to_owned();
     view.evaluator_rows.clear();
     view.hotspots.clear();
+    view.diagnostic_hotspots.clear();
     view.research_studies.clear();
     view.manifest_rows = vec![
         ("Run ID".to_owned(), manifest.run_id.clone()),
+        (
+            "Run kind".to_owned(),
+            serde_json::to_value(manifest.run_kind)?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned(),
+        ),
         (
             "StructTrace version".to_owned(),
             manifest.structtrace_version.clone(),
@@ -359,6 +378,13 @@ fn jointly_scored_cases(summary: &RunSummary) -> usize {
     summary.primary_jointly_scored
 }
 
+fn field_states(counts: &EvaluatorStateCounts) -> String {
+    format!(
+        "pass {} · fail {} · error {} · n/a {} · unscored {}",
+        counts.passed, counts.failed, counts.error, counts.not_applicable, counts.unscored
+    )
+}
+
 /// Serve a report on a random loopback-only port until interrupted.
 pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
     let generated = finalized_report(run_dir)?;
@@ -369,7 +395,9 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
         .to_owned();
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
-    let url = format!("http://127.0.0.1:{}/", address.port());
+    let token = capability_token();
+    let expected_host = format!("127.0.0.1:{}", address.port());
+    let url = format!("http://{expected_host}/{token}/");
     println!("StructTrace report: {url}");
     if open_browser {
         if let Err(error) = open::that(&url) {
@@ -378,10 +406,14 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
             );
         }
     }
-    let assets = Arc::new(load_verified_report_assets(&directory)?);
+    let state = Arc::new(ReportServerState {
+        token,
+        expected_host,
+        assets: load_verified_report_assets(&directory)?,
+    });
     let service = axum::Router::new()
         .fallback(serve_verified_asset)
-        .with_state(assets);
+        .with_state(state);
     axum::serve(listener, service)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -391,6 +423,20 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
 }
 
 type VerifiedReportAssets = BTreeMap<String, (String, axum::body::Bytes)>;
+
+#[derive(Debug)]
+struct ReportServerState {
+    token: String,
+    expected_host: String,
+    assets: VerifiedReportAssets,
+}
+
+fn capability_token() -> String {
+    rand::random::<[u8; 32]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn load_verified_report_assets(directory: &Path) -> anyhow::Result<VerifiedReportAssets> {
     fn visit(
@@ -435,10 +481,35 @@ fn load_verified_report_assets(directory: &Path) -> anyhow::Result<VerifiedRepor
 }
 
 async fn serve_verified_asset(
-    axum::extract::State(assets): axum::extract::State<Arc<VerifiedReportAssets>>,
+    axum::extract::State(state): axum::extract::State<Arc<ReportServerState>>,
+    headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> axum::response::Response {
-    let requested = uri.path().trim_start_matches('/');
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if host != Some(state.expected_host.as_str()) {
+        return axum::http::StatusCode::MISDIRECTED_REQUEST.into_response();
+    }
+    let expected_origin = format!("http://{}", state.expected_host);
+    for header in [axum::http::header::ORIGIN, axum::http::header::REFERER] {
+        if let Some(value) = headers.get(header).and_then(|value| value.to_str().ok()) {
+            if value != expected_origin
+                && !value
+                    .strip_prefix(&expected_origin)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return axum::http::StatusCode::FORBIDDEN.into_response();
+            }
+        }
+    }
+    let path = uri.path().trim_start_matches('/');
+    let Some((provided_token, requested)) = path.split_once('/') else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    if provided_token != state.token {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
     let requested = if requested.is_empty() {
         "index.html"
     } else {
@@ -447,14 +518,38 @@ async fn serve_verified_asset(
     if requested.contains("..") || requested.contains('\\') {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
-    let Some((content_type, bytes)) = assets.get(requested) else {
+    let Some((content_type, bytes)) = state.assets.get(requested) else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
-    (
-        [(axum::http::header::CONTENT_TYPE, content_type.as_str())],
-        bytes.clone(),
-    )
-        .into_response()
+    let mut response = bytes.clone().into_response();
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        content_type.parse().expect("static content type is valid"),
+    );
+    response_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response_headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response_headers.insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    response_headers.insert(
+        "cross-origin-resource-policy",
+        axum::http::HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 /// Resolve an existing report without mutating a completed run.
@@ -701,6 +796,10 @@ fn build_view(
             GateStatus::NotConfigured | GateStatus::InsufficientEvidence => "warn",
         }
         .to_owned(),
+        deployment_authorized: summary.gate.deployment_authorized,
+        has_quality_failures: !summary.gate.quality_failures.is_empty(),
+        has_evidence_failures: !summary.gate.evidence_failures.is_empty(),
+        has_runtime_errors: !summary.gate.runtime_errors.is_empty(),
         default_filter: match config.report.default_case_filter.as_str() {
             "baseline_only_pass"
             | "candidate_only_pass"
@@ -721,12 +820,15 @@ fn build_view(
             summary.bootstrap.lower_pp, summary.bootstrap.upper_pp
         ),
         total_rows: summary.evidence.total_rows,
-        unique_cases: summary.evidence.unique_semantic_cases,
+        unique_cases: summary.evidence.singleton_evidence_units
+            + summary.evidence.exact_duplicate_groups
+            + summary.evidence.repeated_trial_groups,
         duplicate_groups: summary.evidence.exact_duplicate_groups,
-        largest_duplicate_group: summary.evidence.largest_duplicate_group,
-        conflicting_groups: summary.evidence.conflicting_repeated_groups,
-        inference_unit: summary.evidence.inference_unit.clone(),
-        evidence_denominator: summary.evidence.effective_gate_denominator,
+        largest_duplicate_group: summary.evidence.largest_group,
+        repeated_trial_groups: summary.evidence.repeated_trial_groups,
+        label_conflict_groups: summary.evidence.label_conflict_groups,
+        inference_unit: summary.evidence.inference_policy.clone(),
+        evidence_denominator: summary.evidence.effective_inference_units,
         semantic_jointly_scored: summary.jointly_scored_semantic.jointly_scored_cases,
         semantic_excluded: summary.jointly_scored_semantic.excluded_pairs,
         semantic_difference: format!(
@@ -767,13 +869,29 @@ fn build_view(
         evaluator_rows,
         operational_rows: operational_rows(summary),
         hotspots: summary
-            .field_hotspots
+            .primary_field_hotspots
             .iter()
             .map(|item| HotspotView {
+                evaluator_id: item.evaluator_id.clone(),
                 pointer: item.pointer.clone(),
                 regressions: item.regressions,
                 improvements: item.improvements,
                 failures: item.candidate_failures,
+                baseline_states: field_states(&item.baseline),
+                candidate_states: field_states(&item.candidate),
+            })
+            .collect(),
+        diagnostic_hotspots: summary
+            .all_evaluator_field_diagnostics
+            .iter()
+            .map(|item| HotspotView {
+                evaluator_id: item.evaluator_id.clone(),
+                pointer: item.pointer.clone(),
+                regressions: item.regressions,
+                improvements: item.improvements,
+                failures: item.candidate_failures,
+                baseline_states: field_states(&item.baseline),
+                candidate_states: field_states(&item.candidate),
             })
             .collect(),
         cases,
@@ -781,6 +899,13 @@ fn build_view(
         share_derivative: false,
         manifest_rows: vec![
             ("Run ID".to_owned(), manifest.run_id.clone()),
+            (
+                "Run kind".to_owned(),
+                serde_json::to_value(manifest.run_kind)?
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            ),
             (
                 "StructTrace version".to_owned(),
                 manifest.structtrace_version.clone(),
@@ -799,19 +924,26 @@ fn build_view(
             ),
             (
                 "Configured evidence units".to_owned(),
-                summary.evidence.unique_semantic_cases.to_string(),
+                (summary.evidence.singleton_evidence_units
+                    + summary.evidence.exact_duplicate_groups
+                    + summary.evidence.repeated_trial_groups)
+                    .to_string(),
             ),
             (
                 "Exact duplicate groups".to_owned(),
                 summary.evidence.exact_duplicate_groups.to_string(),
             ),
             (
-                "Inference unit".to_owned(),
-                summary.evidence.inference_unit.clone(),
+                "Inference policy".to_owned(),
+                summary.evidence.inference_policy.clone(),
             ),
             (
-                "Conflicting repeated groups".to_owned(),
-                summary.evidence.conflicting_repeated_groups.to_string(),
+                "Repeated-trial groups".to_owned(),
+                summary.evidence.repeated_trial_groups.to_string(),
+            ),
+            (
+                "Label-conflict groups".to_owned(),
+                summary.evidence.label_conflict_groups.to_string(),
             ),
             (
                 "Primary scored cases".to_owned(),
@@ -827,7 +959,7 @@ fn build_view(
                 "Jointly scored cases".to_owned(),
                 format!(
                     "{} / {}",
-                    summary.primary_jointly_scored, summary.evidence.effective_gate_denominator
+                    summary.primary_jointly_scored, summary.evidence.effective_inference_units
                 ),
             ),
             (
@@ -1471,9 +1603,9 @@ const TEMPLATE: &str = r##"<!doctype html>
   </section>
 
   <h2>Evidence independence</h2>
-  <p class="muted">Exact semantic duplicates remain visible descriptively but cannot multiply the inferential denominator. Conflicting repeated observations are excluded from inference and force an insufficient-evidence gate.</p>
-  <table><thead><tr><th>Captured rows</th><th>Evidence units</th><th>Inference denominator</th><th>Duplicate groups</th><th>Conflicting groups</th><th>Largest group</th></tr></thead><tbody><tr><td class="num">{{ total_rows }}</td><td class="num">{{ unique_cases }}</td><td class="num">{{ evidence_denominator }}</td><td class="num">{{ duplicate_groups }}</td><td class="num">{{ conflicting_groups }}</td><td class="num">{{ largest_duplicate_group }}</td></tr></tbody></table>
-  <p class="muted">Inference unit: <code>{{ inference_unit }}</code></p>
+  <p class="muted">Exact duplicates remain visible descriptively but count once. Repeated trials are never resolved by row order or case ID; v1 excludes them from independent inference and makes the gate insufficient. Label conflicts fail before execution.</p>
+  <table><thead><tr><th>Captured rows</th><th>Evidence groups</th><th>Inference units</th><th>Exact duplicate groups</th><th>Repeated trials</th><th>Label conflicts</th><th>Largest group</th></tr></thead><tbody><tr><td class="num">{{ total_rows }}</td><td class="num">{{ unique_cases }}</td><td class="num">{{ evidence_denominator }}</td><td class="num">{{ duplicate_groups }}</td><td class="num">{{ repeated_trial_groups }}</td><td class="num">{{ label_conflict_groups }}</td><td class="num">{{ largest_duplicate_group }}</td></tr></tbody></table>
+  <p class="muted">Inference policy: <code>{{ inference_unit }}</code></p>
 
   <h3>Descriptive execution totals</h3>
   <p class="muted">All captured rows, including repeats. These values make no independence claim and are not used by the release gate.</p>
@@ -1492,13 +1624,14 @@ const TEMPLATE: &str = r##"<!doctype html>
   <h2>Independent deployment-success transition matrix</h2>
   <div class="matrix" aria-label="Paired transition matrix"><div class="cell"><span>Both pass</span><strong>{{ transition.both_pass }}</strong></div><div class="cell loss"><span>Baseline-only pass</span><strong>{{ transition.baseline_only }}</strong></div><div class="cell win"><span>Candidate-only pass</span><strong>{{ transition.candidate_only }}</strong></div><div class="cell"><span>Both fail</span><strong>{{ transition.both_fail }}</strong></div></div>
 
-  <h2>Release gate</h2><div class="panel">{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
+  <h2>Release gate</h2><div class="panel"><strong>{% if deployment_authorized %}DEPLOYMENT AUTHORIZED{% else %}DO NOT DEPLOY{% endif %}</strong>{% if has_quality_failures %}<p>Quality threshold failed.</p>{% endif %}{% if has_evidence_failures %}<p>Evidence requirements are also insufficient.</p>{% endif %}{% if has_runtime_errors %}<p>One or more rules could not be evaluated safely.</p>{% endif %}{% if gate_rules %}{% for rule in gate_rules %}<div class="rule"><div class="pill {{ rule.class }}">{{ rule.state }}</div><div><strong>{{ rule.name }}</strong><br><span class="muted">{{ rule.message }}</span></div></div>{% endfor %}{% else %}<strong>No release criteria were configured.</strong><p class="muted">This run was analyzed, but StructTrace cannot make a deployment decision.</p>{% endif %}</div>
 
   <h2>Evaluator results</h2><p class="muted">Every evaluator state remains explicit; errors, not-applicable results, and missing scores are never folded into semantic failure.</p><table><thead><tr><th rowspan="2">Evaluator</th><th colspan="5">Baseline</th><th colspan="5">Candidate</th></tr><tr><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th><th>Pass</th><th>Fail</th><th>Error</th><th>N/A</th><th>Unscored</th></tr></thead><tbody>{% for row in evaluator_rows %}<tr><td><code>{{ row.id }}</code></td><td class="num">{{ row.baseline.pass }}</td><td class="num">{{ row.baseline.fail }}</td><td class="num">{{ row.baseline.error }}</td><td class="num">{{ row.baseline.not_applicable }}</td><td class="num">{{ row.baseline.unscored }}</td><td class="num">{{ row.candidate.pass }}</td><td class="num">{{ row.candidate.fail }}</td><td class="num">{{ row.candidate.error }}</td><td class="num">{{ row.candidate.not_applicable }}</td><td class="num">{{ row.candidate.unscored }}</td></tr>{% endfor %}</tbody></table>
 
   <h2>Operational comparison</h2><p class="muted">Latency is descriptive unless a threshold is configured. Costs are shown only from explicit adapter pricing and are never inferred.</p><table><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody>{% for row in operational_rows %}<tr><td>{{ row.label }}</td><td class="num">{{ row.baseline }}</td><td class="num">{{ row.candidate }}</td></tr>{% endfor %}</tbody></table>
 
-  <h2>Field-level hotspots</h2>{% if hotspots %}<table><thead><tr><th>JSON Pointer</th><th>Candidate regressions</th><th>Candidate improvements</th><th>Candidate failures</th></tr></thead><tbody>{% for item in hotspots %}<tr><td><code>{{ item.pointer }}</code></td><td class="num">{{ item.regressions }}</td><td class="num">{{ item.improvements }}</td><td class="num">{{ item.failures }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No field-level evaluators were configured.</p>{% endif %}
+  <h2>Primary-outcome field hotspots</h2><p class="muted">Only evaluators reachable from the selected primary outcome are included.</p>{% if hotspots %}<table><thead><tr><th>Evaluator</th><th>JSON Pointer</th><th>Candidate regressions</th><th>Candidate improvements</th><th>Baseline states</th><th>Candidate states</th></tr></thead><tbody>{% for item in hotspots %}<tr><td><code>{{ item.evaluator_id }}</code></td><td><code>{{ item.pointer }}</code></td><td class="num">{{ item.regressions }}</td><td class="num">{{ item.improvements }}</td><td>{{ item.baseline_states }}</td><td>{{ item.candidate_states }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">The primary outcome has no field-level facts.</p>{% endif %}
+  <h2>All-evaluator field diagnostics</h2><p class="muted">Diagnostic only. Evaluator identities and pass, fail, error, not-applicable, and unscored states remain separate.</p>{% if diagnostic_hotspots %}<table><thead><tr><th>Evaluator</th><th>JSON Pointer</th><th>Regressions</th><th>Improvements</th><th>Baseline states</th><th>Candidate states</th></tr></thead><tbody>{% for item in diagnostic_hotspots %}<tr><td><code>{{ item.evaluator_id }}</code></td><td><code>{{ item.pointer }}</code></td><td class="num">{{ item.regressions }}</td><td class="num">{{ item.improvements }}</td><td>{{ item.baseline_states }}</td><td>{{ item.candidate_states }}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No field-level evaluator diagnostics are available.</p>{% endif %}
 
   {% if not share_derivative %}<h2>Case explorer</h2>
   <p class="muted">Case details are loaded in bounded chunks. Search covers case IDs and redacted metadata; filters include outcome, validity, adapter, and evaluator states.</p>
@@ -1652,13 +1785,16 @@ mod tests {
             primary_jointly_scored: total,
             evidence: structtrace_core::artifact::EvidenceSummary {
                 total_rows: total,
-                unique_semantic_cases: total,
+                singleton_evidence_units: total,
                 exact_duplicate_groups: 0,
-                largest_duplicate_group: usize::from(total > 0),
-                duplicate_case_rate: 0.0,
-                effective_gate_denominator: total,
-                conflicting_repeated_groups: 0,
-                inference_unit: "fingerprint:/input,/expected,/model_visible_metadata".to_owned(),
+                repeated_trial_groups: 0,
+                label_conflict_groups: 0,
+                exact_duplicate_rows: 0,
+                largest_group: usize::from(total > 0),
+                exact_duplicate_row_rate: 0.0,
+                effective_inference_units: total,
+                inference_policy: "fingerprint:/input,/expected,/model_visible_metadata".to_owned(),
+                groups: Vec::new(),
             },
             independent_paired: paired.clone(),
             independent_bootstrap: BootstrapInterval {
@@ -1687,10 +1823,16 @@ mod tests {
             },
             gate: GateDecision {
                 status: GateStatus::Passed,
+                deployment_authorized: true,
+                quality_failures: Vec::new(),
+                evidence_failures: Vec::new(),
+                runtime_errors: Vec::new(),
                 rules: vec![],
             },
             evaluator_passes: BTreeMap::new(),
             field_hotspots: vec![],
+            primary_field_hotspots: vec![],
+            all_evaluator_field_diagnostics: vec![],
         }
     }
 
@@ -1737,7 +1879,8 @@ mod tests {
         let html = render_records(&config, &records);
         assert!(!html.contains(attack));
         assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("No field-level evaluators were configured."));
+        assert!(html.contains("The primary outcome has no field-level facts."));
+        assert!(html.contains("No field-level evaluator diagnostics are available."));
     }
 
     #[test]
@@ -2072,5 +2215,85 @@ mod tests {
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains(echo));
         assert!(!serialized.contains("provider_response"));
+    }
+
+    fn server_state() -> Arc<ReportServerState> {
+        Arc::new(ReportServerState {
+            token: "secret-token".to_owned(),
+            expected_host: "127.0.0.1:43210".to_owned(),
+            assets: BTreeMap::from([(
+                "index.html".to_owned(),
+                (
+                    "text/html; charset=utf-8".to_owned(),
+                    axum::body::Bytes::from_static(b"safe"),
+                ),
+            )]),
+        })
+    }
+
+    fn request_headers(host: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, host.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn report_requires_capability_token_and_rejects_foreign_host() {
+        let missing = serve_verified_asset(
+            axum::extract::State(server_state()),
+            request_headers("127.0.0.1:43210"),
+            "/index.html".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let foreign = serve_verified_asset(
+            axum::extract::State(server_state()),
+            request_headers("attacker.invalid"),
+            "/secret-token/".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            foreign.status(),
+            axum::http::StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn report_rejects_foreign_origin_and_sets_security_headers() {
+        let mut headers = request_headers("127.0.0.1:43210");
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://attacker.invalid".parse().unwrap(),
+        );
+        let foreign = serve_verified_asset(
+            axum::extract::State(server_state()),
+            headers,
+            "/secret-token/".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(foreign.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let response = serve_verified_asset(
+            axum::extract::State(server_state()),
+            request_headers("127.0.0.1:43210"),
+            "/secret-token/".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert!(response.headers().contains_key("content-security-policy"));
+        assert!(
+            response
+                .headers()
+                .contains_key("cross-origin-resource-policy")
+        );
     }
 }

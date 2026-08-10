@@ -32,6 +32,9 @@ pub struct OutputError {
     pub kind: String,
     /// Redaction-safe explanation.
     pub message: String,
+    /// Stable, redaction-safe error-class fingerprint when supplied by an adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// Optional provider token accounting.
@@ -99,6 +102,7 @@ impl VariantOutput {
             error: Some(OutputError {
                 kind: "missing_output".to_owned(),
                 message: "No output row was supplied for this dataset case.".to_owned(),
+                fingerprint: None,
             }),
             latency_ms: None,
             usage: None,

@@ -15,7 +15,7 @@ fn help_and_doctor_succeed() {
 }
 
 #[test]
-fn strict_doctor_fails_expected_leaf_and_label_bearing_id_leakage() {
+fn strict_doctor_fails_expected_leaf_leakage() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join("data.jsonl"),
@@ -52,6 +52,74 @@ analysis: {primary_outcome: correct}
         .status()
         .unwrap();
     assert!(!status.success());
+}
+
+#[test]
+fn strict_doctor_requires_a_project_but_opaque_case_ids_are_allowed() {
+    let empty = tempdir().unwrap();
+    let strict_missing = binary()
+        .args([
+            "--quiet",
+            "--project-root",
+            empty.path().to_str().unwrap(),
+            "doctor",
+            "--strict",
+        ])
+        .status()
+        .unwrap();
+    assert!(!strict_missing.success());
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                empty.path().to_str().unwrap(),
+                "doctor",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let root = tempdir().unwrap();
+    std::fs::write(
+        root.path().join("data.jsonl"),
+        "{\"id\":\"currency-usd\",\"input\":{\"text\":\"invoice\"},\"expected\":{\"currency\":\"USD\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
+    let output = "{\"case_id\":\"currency-usd\",\"status\":\"ok\",\"raw_output\":\"{\\\"currency\\\":\\\"USD\\\"}\"}\n";
+    std::fs::write(root.path().join("baseline.jsonl"), output).unwrap();
+    std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
+    std::fs::write(
+        root.path().join("structtrace.yaml"),
+        r#"version: 1
+project: {name: opaque-id-test}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators: [{id: exact, kind: exact_json}]
+outcomes: {correct: {all_of: [exact]}}
+analysis: {primary_outcome: correct}
+gate: {max_primary_regression_pp: 0}
+"#,
+    )
+    .unwrap();
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                root.path().to_str().unwrap(),
+                "doctor",
+                "--strict",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
@@ -268,6 +336,92 @@ fn offline_demos_complete_without_credentials() {
 }
 
 #[test]
+fn demos_do_not_pollute_production_latest() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    assert!(
+        binary()
+            .args(["init", project.to_str().unwrap(), "--template", "recorded"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "run",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let manifests = || {
+        std::fs::read_dir(project.join(".structtrace/runs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path().join("manifest.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .collect::<Vec<_>>()
+    };
+    let production_id = manifests()
+        .into_iter()
+        .find(|manifest| manifest["run_kind"] == "production")
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "demo",
+                "invoice",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = binary()
+        .args([
+            "--format",
+            "json",
+            "--project-root",
+            project.to_str().unwrap(),
+            "report",
+            "latest",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&production_id));
+    let demo_id = manifests()
+        .into_iter()
+        .find(|manifest| manifest["run_kind"] == "demo")
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let output = binary()
+        .args([
+            "--format",
+            "json",
+            "--project-root",
+            project.to_str().unwrap(),
+            "report",
+            "latest-demo",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&demo_id));
+}
+
+#[test]
 fn interrupted_run_resumes_without_reinvoking_completed_baseline() {
     let root = tempdir().unwrap();
     let project = root.path().join("resume-project");
@@ -301,7 +455,7 @@ for line in sys.stdin:
     request = json.loads(line)
     text = request["input"]["text"]
     label = "rejected" if "negative" in text else "accepted"
-    response = {"protocol":"structtrace.variant","protocol_version":1,"case_id":request["case_id"],"status":"ok","output":{"label":label,"reason":"resume fixture"}}
+    response = {"protocol":"structtrace.variant","protocol_version":2,"case_id":request["case_id"],"status":"ok","output":{"label":label,"reason":"resume fixture"}}
     print(json.dumps(response), flush=True)
 "#,
     )

@@ -5,8 +5,21 @@ here.
 
 ## Unreleased
 
-- Advance the artifact format to version 6 with explicit evidence units, row-order-invariant
-  conflict handling, one denominator for primary report blocks, and separate descriptive totals.
+- Advance the artifact format to version 7 and subprocess protocols to version 2. Evidence is now
+  classified as singleton, exact duplicate, repeated trial, or label conflict with separate
+  stimulus, reference, scored-observation, and operational hashes.
+- Make retention and raw formatting presentation-only for evidence classification; remove
+  arbitrary case-ID representatives and block independent gates for repeated-trial evidence.
+- Isolate production, demo, research-fixture, and test histories; `latest` now means the latest
+  completed production run, with explicit selectors for other kinds.
+- Snapshot and manifest-bind model-facing schemas before execution; bound configured source
+  fingerprinting, include evaluator implementations, and refuse finalization after mid-run changes.
+- Harden Python workers with one persistent event loop, exclusive protocol stdout, common Python
+  value normalization, explicit envelopes, protected fields, and sanitized failure fingerprints.
+- Require random report capability URLs, loopback Host/Origin/Referer checks, no-store responses,
+  CSP headers, and same-origin resource policy.
+- Separate primary-outcome field hotspots from all-evaluator diagnostics while retaining evaluator
+  identity and pass, fail, error, not-applicable, and unscored states.
 - Replace dataset IDs at live adapter boundaries with opaque execution tokens and remove IDs from
   Python callable and OpenAI prompt contexts; make strict doctor fail expected-leaf and ID leakage.
 - Cap bootstrap samples and total resampling work; split normalized research evidence into three

@@ -16,7 +16,7 @@ use structtrace_adapters::{
 };
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
-    artifact::RunStatus,
+    artifact::{RunKind, RunStatus},
     config::{Config, VariantConfig},
     dataset::{Dataset, VariantCase},
     evaluation::compile_schema,
@@ -44,9 +44,16 @@ struct ExecutionCheckpoint {
     schema_hash: String,
     execution_definition_hash: String,
     implementation_fingerprint: String,
+    model_facing_schema_hashes: BTreeMap<String, String>,
     completed_outputs: BTreeMap<String, String>,
     original_input_hashes: BTreeMap<String, String>,
     source_labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedModelSchema {
+    bytes: Vec<u8>,
+    value: Value,
 }
 
 /// Execute the configured baseline and candidate, then use the shared evaluator pipeline.
@@ -97,6 +104,12 @@ async fn run_configured_inner(
     let schema_value: Value = serde_json::from_slice(&schema_bytes)
         .with_context(|| format!("schema {} is not valid JSON", schema_path.display()))?;
     compile_schema(&schema_value)?;
+    let captured_model_schemas =
+        capture_model_facing_schemas(&project_root, &config, &schema_bytes, &schema_value)?;
+    let model_facing_schema_hashes = captured_model_schemas
+        .iter()
+        .map(|(name, schema)| (name.clone(), hash_bytes(&schema.bytes)))
+        .collect::<BTreeMap<_, _>>();
 
     let storage_root = resolve(&project_root, &config.storage.root);
     let definition_hash = hash_canonical_json(&serde_json::json!({
@@ -108,7 +121,7 @@ async fn run_configured_inner(
         "gate": config.gate,
         "limits": config.limits,
     }))?;
-    let implementation_fingerprint = implementation_fingerprint(&project_root, &config)?;
+    let initial_implementation_fingerprint = implementation_fingerprint(&project_root, &config)?;
     let expected = ExecutionCheckpoint {
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
         run_id: resume_run_id.clone().unwrap_or_default(),
@@ -117,7 +130,8 @@ async fn run_configured_inner(
         dataset_hash: dataset.source_hash.clone(),
         schema_hash: hash_bytes(&schema_bytes),
         execution_definition_hash: definition_hash,
-        implementation_fingerprint: implementation_fingerprint.clone(),
+        implementation_fingerprint: initial_implementation_fingerprint.clone(),
+        model_facing_schema_hashes: model_facing_schema_hashes.clone(),
         completed_outputs: BTreeMap::new(),
         original_input_hashes: BTreeMap::new(),
         source_labels: BTreeMap::new(),
@@ -151,7 +165,7 @@ async fn run_configured_inner(
             }
             None => {
                 let run_id = Ulid::new().to_string();
-                let store = RunStore::create(&storage_root, &run_id)?;
+                let store = RunStore::create(&storage_root, &run_id, RunKind::Production)?;
                 store.set_status(&run_id, RunStatus::Validating)?;
                 let mut checkpoint = expected;
                 checkpoint.run_id.clone_from(&run_id);
@@ -166,6 +180,15 @@ async fn run_configured_inner(
                 )?;
                 atomic_write(run_dir.join("inputs/dataset.jsonl"), &dataset.source_bytes)?;
                 atomic_write(run_dir.join("inputs/schema.json"), &schema_bytes)?;
+                for (variant, schema) in &captured_model_schemas {
+                    atomic_write(
+                        run_dir
+                            .join("inputs/variants")
+                            .join(variant)
+                            .join("model-facing-schema.json"),
+                        &schema.bytes,
+                    )?;
+                }
                 write_checkpoint(run_dir, &checkpoint)?;
                 store.record_event(
                     "inputs_validated",
@@ -184,7 +207,9 @@ async fn run_configured_inner(
         "baseline",
         config.variants.get("baseline").expect("validated config"),
         &dataset,
-        &schema_value,
+        captured_model_schemas
+            .get("baseline")
+            .map(|schema| &schema.value),
         &bridge_path,
         &config.limits,
         store.run_dir(),
@@ -196,13 +221,30 @@ async fn run_configured_inner(
         "candidate",
         config.variants.get("candidate").expect("validated config"),
         &dataset,
-        &schema_value,
+        captured_model_schemas
+            .get("candidate")
+            .map(|schema| &schema.value),
         &bridge_path,
         &config.limits,
         store.run_dir(),
         &mut checkpoint,
     )
     .await?;
+    let final_implementation_fingerprint = implementation_fingerprint(&project_root, &config)?;
+    anyhow::ensure!(
+        final_implementation_fingerprint == initial_implementation_fingerprint,
+        "configured implementation inputs changed during execution; finalization refused"
+    );
+    let final_model_schemas =
+        capture_model_facing_schemas(&project_root, &config, &schema_bytes, &schema_value)?;
+    let final_model_schema_hashes = final_model_schemas
+        .iter()
+        .map(|(name, schema)| (name.clone(), hash_bytes(&schema.bytes)))
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        final_model_schema_hashes == model_facing_schema_hashes,
+        "a model-facing structured-output schema changed during execution; finalization refused"
+    );
     failure_guard.disarm();
     drop(failure_guard);
     drop(store);
@@ -216,7 +258,8 @@ async fn run_configured_inner(
         baseline,
         candidate,
         Some(run_id),
-        Some(implementation_fingerprint),
+        Some(initial_implementation_fingerprint),
+        RunKind::Production,
     )?;
     let checkpoint_path = completed.run_dir.join("execution-checkpoint.json");
     if checkpoint_path.is_file() {
@@ -225,22 +268,53 @@ async fn run_configured_inner(
     Ok(completed)
 }
 
-fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::Result<String> {
-    let mut sources = BTreeMap::<String, String>::new();
-    collect_project_python_sources(project_root, project_root, &mut sources)?;
-    for lockfile in [
-        "Cargo.lock",
-        "uv.lock",
-        "poetry.lock",
-        "requirements.txt",
-        "requirements.lock",
-        "Pipfile.lock",
-    ] {
-        let path = project_root.join(lockfile);
-        if path.is_file() {
-            sources.insert(lockfile.to_owned(), hash_file(&path)?);
-        }
+fn capture_model_facing_schemas(
+    project_root: &Path,
+    config: &Config,
+    external_schema_bytes: &[u8],
+    external_schema: &Value,
+) -> anyhow::Result<BTreeMap<String, CapturedModelSchema>> {
+    let mut captured = BTreeMap::new();
+    for (name, variant) in &config.variants {
+        let VariantConfig::OpenaiCompatible(adapter) = variant else {
+            continue;
+        };
+        let Some(structured) = &adapter.structured_output else {
+            continue;
+        };
+        let (bytes, value) = if let Some(configured_path) = &structured.schema {
+            let path = resolve(project_root, configured_path);
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("model-facing schema is missing: {}", path.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "model-facing schema must be a regular non-symlink file: {}",
+                path.display()
+            );
+            let bytes = structtrace_core::hashing::read_bounded(
+                &path,
+                config.limits.max_schema_bytes,
+                "model-facing schema",
+            )?;
+            let value = serde_json::from_slice::<Value>(&bytes).with_context(|| {
+                format!("model-facing schema {} is invalid JSON", path.display())
+            })?;
+            (bytes, value)
+        } else {
+            (external_schema_bytes.to_vec(), external_schema.clone())
+        };
+        compile_schema(&value)?;
+        captured.insert(name.clone(), CapturedModelSchema { bytes, value });
     }
+    Ok(captured)
+}
+
+fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::Result<String> {
+    const MAX_BOUND_FILE_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_TOTAL_BOUND_BYTES: u64 = 512 * 1024 * 1024;
+    let mut sources = BTreeMap::<String, String>::new();
+    let mut bound_bytes = 0_u64;
+    let mut has_live_implementation = false;
     for (variant_id, variant) in &config.variants {
         match variant {
             VariantConfig::Command {
@@ -248,23 +322,23 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
                 implementation,
                 ..
             } => {
+                has_live_implementation = true;
                 if let Some(path) = resolve_executable(project_root, &command.program) {
-                    sources.insert(format!("variant:{variant_id}:program"), hash_file(&path)?);
-                }
-                for (index, argument) in command.args.iter().enumerate() {
-                    let path = resolve(project_root, Path::new(argument));
-                    if path.is_file() {
-                        sources.insert(
-                            format!("variant:{variant_id}:argument:{index}"),
-                            hash_file(&path)?,
-                        );
-                    }
+                    bind_file(
+                        format!("variant:{variant_id}:program"),
+                        &path,
+                        &mut sources,
+                        &mut bound_bytes,
+                        MAX_BOUND_FILE_BYTES,
+                        MAX_TOTAL_BOUND_BYTES,
+                    )?;
                 }
                 bind_declared_implementation(
                     project_root,
                     &format!("variant:{variant_id}"),
                     implementation,
                     &mut sources,
+                    &mut bound_bytes,
                 )?;
             }
             VariantConfig::Python {
@@ -272,10 +346,18 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
                 implementation,
                 ..
             } => {
+                has_live_implementation = true;
                 if let Some((module, _)) = callable.split_once(':') {
                     let path = project_root.join(format!("{}.py", module.replace('.', "/")));
                     if path.is_file() {
-                        sources.insert(format!("variant:{variant_id}:python"), hash_file(&path)?);
+                        bind_file(
+                            format!("variant:{variant_id}:python"),
+                            &path,
+                            &mut sources,
+                            &mut bound_bytes,
+                            MAX_BOUND_FILE_BYTES,
+                            MAX_TOTAL_BOUND_BYTES,
+                        )?;
                     }
                 }
                 bind_declared_implementation(
@@ -283,6 +365,7 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
                     &format!("variant:{variant_id}"),
                     implementation,
                     &mut sources,
+                    &mut bound_bytes,
                 )?;
             }
             VariantConfig::Recorded { .. } | VariantConfig::OpenaiCompatible(_) => {}
@@ -291,49 +374,66 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
     for evaluator in &config.evaluators {
         match &evaluator.kind {
             structtrace_core::config::EvaluatorKind::Command { command, .. } => {
-                let path = resolve(project_root, Path::new(&command.program));
-                if path.is_file() {
-                    sources.insert(
+                has_live_implementation = true;
+                if let Some(path) = resolve_executable(project_root, &command.program) {
+                    bind_file(
                         format!("evaluator:{}:program", evaluator.id),
-                        hash_file(&path)?,
-                    );
+                        &path,
+                        &mut sources,
+                        &mut bound_bytes,
+                        MAX_BOUND_FILE_BYTES,
+                        MAX_TOTAL_BOUND_BYTES,
+                    )?;
                 }
             }
             structtrace_core::config::EvaluatorKind::Python { callable, .. } => {
+                has_live_implementation = true;
                 if let Some((module, _)) = callable.split_once(':') {
                     let path = project_root.join(format!("{}.py", module.replace('.', "/")));
                     if path.is_file() {
-                        sources.insert(
+                        bind_file(
                             format!("evaluator:{}:python", evaluator.id),
-                            hash_file(&path)?,
-                        );
+                            &path,
+                            &mut sources,
+                            &mut bound_bytes,
+                            MAX_BOUND_FILE_BYTES,
+                            MAX_TOTAL_BOUND_BYTES,
+                        )?;
                     }
                 }
             }
             _ => {}
         }
+        bind_declared_implementation(
+            project_root,
+            &format!("evaluator:{}", evaluator.id),
+            &evaluator.implementation,
+            &mut sources,
+            &mut bound_bytes,
+        )?;
     }
-    let git_commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    let git_dirty_hash = std::process::Command::new("git")
-        .args(["diff", "--binary", "HEAD"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| hash_bytes(&output.stdout));
-    let git_status_hash = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| hash_bytes(&output.stdout));
+    if has_live_implementation {
+        for lockfile in [
+            "Cargo.lock",
+            "uv.lock",
+            "poetry.lock",
+            "requirements.txt",
+            "requirements.lock",
+            "Pipfile.lock",
+        ] {
+            let path = project_root.join(lockfile);
+            if path.is_file() {
+                bind_file(
+                    format!("lockfile:{lockfile}"),
+                    &path,
+                    &mut sources,
+                    &mut bound_bytes,
+                    MAX_BOUND_FILE_BYTES,
+                    MAX_TOTAL_BOUND_BYTES,
+                )?;
+            }
+        }
+    }
     let interpreters = config
         .variants
         .values()
@@ -355,6 +455,9 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .map(|interpreter| {
+            let resolved_path = resolve_executable(project_root, interpreter)
+                .and_then(|path| path.canonicalize().ok())
+                .map(|path| path.display().to_string());
             let version = std::process::Command::new(interpreter)
                 .arg("--version")
                 .output()
@@ -366,14 +469,14 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
                         String::from_utf8_lossy(&output.stderr)
                     )
                 });
-            (interpreter.clone(), version)
+            (
+                interpreter.clone(),
+                serde_json::json!({"resolved_path": resolved_path, "version": version}),
+            )
         })
         .collect::<BTreeMap<_, _>>();
     hash_canonical_json(&serde_json::json!({
         "sources": sources,
-        "git_commit": git_commit,
-        "git_dirty_hash": git_dirty_hash,
-        "git_status_hash": git_status_hash,
         "interpreters": interpreters,
         "binary": env!("CARGO_PKG_VERSION"),
     }))
@@ -383,12 +486,13 @@ fn implementation_fingerprint(project_root: &Path, config: &Config) -> anyhow::R
 fn resolve_executable(project_root: &Path, program: &str) -> Option<PathBuf> {
     let configured = resolve(project_root, Path::new(program));
     if configured.is_file() {
-        return Some(configured);
+        return configured.canonicalize().ok();
     }
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|directory| directory.join(program))
             .find(|path| path.is_file())
+            .and_then(|path| path.canonicalize().ok())
     })
 }
 
@@ -397,81 +501,57 @@ fn bind_declared_implementation(
     label: &str,
     implementation: &structtrace_core::config::ImplementationConfig,
     output: &mut BTreeMap<String, String>,
+    total_bytes: &mut u64,
 ) -> anyhow::Result<()> {
     if let Some(digest) = &implementation.digest {
         output.insert(format!("{label}:declared-digest"), digest.clone());
     }
     for (index, source) in implementation.sources.iter().enumerate() {
         let path = resolve(project_root, source);
-        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
-            format!(
-                "declared implementation source is missing: {}",
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "declared implementation source must be a regular non-symlink file: {}",
-            path.display()
-        );
-        output.insert(
+        bind_file(
             format!("{label}:declared-source:{index}"),
-            hash_file(&path)?,
-        );
+            &path,
+            output,
+            total_bytes,
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+        )?;
     }
     Ok(())
 }
 
-fn collect_project_python_sources(
-    root: &Path,
-    directory: &Path,
+fn bind_file(
+    label: impl Into<String>,
+    path: &Path,
     output: &mut BTreeMap<String, String>,
+    total_bytes: &mut u64,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
 ) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            anyhow::ensure!(
-                path.extension().and_then(|value| value.to_str()) != Some("py"),
-                "Python implementation source must not be a symlink: {}",
-                path.display()
-            );
-            continue;
-        }
-        if file_type.is_dir() {
-            if matches!(
-                name.to_str(),
-                Some(
-                    ".git"
-                        | ".structtrace"
-                        | ".venv"
-                        | ".tox"
-                        | "target"
-                        | "node_modules"
-                        | "dist"
-                        | "build"
-                        | "__pycache__"
-                )
-            ) {
-                continue;
-            }
-            collect_project_python_sources(root, &path, output)?;
-        } else if path.extension().and_then(|value| value.to_str()) == Some("py") {
-            let metadata = entry.metadata()?;
-            anyhow::ensure!(
-                metadata.len() <= 16 * 1024 * 1024,
-                "Python source is too large to fingerprint: {}",
-                path.display()
-            );
-            let relative = path
-                .strip_prefix(root)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            output.insert(format!("python-tree:{relative}"), hash_file(&path)?);
-        }
-    }
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "configured implementation input is missing: {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "configured implementation input must be a regular non-symlink file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_file_bytes,
+        "configured implementation input exceeds {max_file_bytes} bytes: {}",
+        path.display()
+    );
+    *total_bytes = total_bytes
+        .checked_add(metadata.len())
+        .context("implementation fingerprint byte count overflow")?;
+    anyhow::ensure!(
+        *total_bytes <= max_total_bytes,
+        "configured implementation inputs exceed {max_total_bytes} total bytes"
+    );
+    output.insert(label.into(), hash_file(path)?);
     Ok(())
 }
 
@@ -481,7 +561,7 @@ async fn prepare_or_restore(
     name: &str,
     variant: &VariantConfig,
     dataset: &Dataset,
-    external_schema: &Value,
+    model_facing_schema: Option<&Value>,
     bridge_path: &Path,
     limits: &structtrace_core::config::LimitsConfig,
     run_dir: &Path,
@@ -522,7 +602,7 @@ async fn prepare_or_restore(
         name,
         variant,
         dataset,
-        external_schema,
+        model_facing_schema,
         bridge_path,
         limits,
     )
@@ -568,7 +648,7 @@ async fn prepare_variant(
     name: &str,
     variant: &VariantConfig,
     dataset: &Dataset,
-    external_schema: &Value,
+    model_facing_schema: Option<&Value>,
     bridge_path: &Path,
     limits: &structtrace_core::config::LimitsConfig,
 ) -> anyhow::Result<PreparedVariant> {
@@ -640,26 +720,7 @@ async fn prepare_variant(
             )
         }
         VariantConfig::OpenaiCompatible(adapter) => {
-            let output_schema = match adapter
-                .structured_output
-                .as_ref()
-                .and_then(|structured| structured.schema.as_ref())
-            {
-                Some(path) => {
-                    let path = resolve(project_root, path);
-                    let bytes = std::fs::read(&path).with_context(|| {
-                        format!("could not read structured-output schema {}", path.display())
-                    })?;
-                    Some(serde_json::from_slice::<Value>(&bytes).with_context(|| {
-                        format!(
-                            "structured-output schema {} is invalid JSON",
-                            path.display()
-                        )
-                    })?)
-                }
-                None if adapter.structured_output.is_some() => Some(external_schema.clone()),
-                None => None,
-            };
+            let output_schema = model_facing_schema.cloned();
             if let Some(schema) = &output_schema {
                 compile_schema(schema)?;
             }
@@ -712,7 +773,7 @@ fn from_adapter(source_label: String, run: AdapterRun) -> anyhow::Result<Prepare
 fn materialize_python_bridge(project_root: &Path, config: &Config) -> anyhow::Result<PathBuf> {
     let bridge_path = resolve(project_root, &config.storage.root)
         .join("runtime")
-        .join("python-bridge-v1.py");
+        .join("python-bridge-v2.py");
     let parent = bridge_path.parent().context("bridge path has no parent")?;
     std::fs::create_dir_all(parent)?;
     if std::fs::read(&bridge_path).ok().as_deref() != Some(BRIDGE_SOURCE.as_bytes()) {
@@ -733,6 +794,8 @@ fn verify_resume_compatibility(
     expected: &ExecutionCheckpoint,
     actual: &ExecutionCheckpoint,
 ) -> anyhow::Result<()> {
+    let expected_model_schemas = hash_canonical_json(&expected.model_facing_schema_hashes)?;
+    let actual_model_schemas = hash_canonical_json(&actual.model_facing_schema_hashes)?;
     let checks = [
         (
             "artifact format version",
@@ -768,6 +831,11 @@ fn verify_resume_compatibility(
             "implementation fingerprint",
             expected.implementation_fingerprint.clone(),
             actual.implementation_fingerprint.clone(),
+        ),
+        (
+            "model-facing schema hashes",
+            expected_model_schemas,
+            actual_model_schemas,
         ),
     ];
     let changed = checks
@@ -848,6 +916,7 @@ mod tests {
             schema_hash: "schema".to_owned(),
             execution_definition_hash: "definition".to_owned(),
             implementation_fingerprint: "implementation".to_owned(),
+            model_facing_schema_hashes: BTreeMap::new(),
             completed_outputs: BTreeMap::new(),
             original_input_hashes: BTreeMap::new(),
             source_labels: BTreeMap::new(),
@@ -873,6 +942,119 @@ mod tests {
     }
 
     #[test]
+    fn changing_model_facing_schema_blocks_resume() {
+        let expected = checkpoint();
+        let mut actual = expected.clone();
+        actual
+            .model_facing_schema_hashes
+            .insert("candidate".to_owned(), "changed".to_owned());
+        let error = verify_resume_compatibility(&expected, &actual).unwrap_err();
+        assert!(error.to_string().contains("model-facing schema hashes"));
+    }
+
+    #[test]
+    fn recorded_run_does_not_scan_unrelated_python_tree() {
+        let root = tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "version": 1,
+            "project": {"name": "recorded-only"},
+            "dataset": {"path": "data.jsonl"},
+            "schema": {"path": "schema.json"},
+            "variants": {
+                "baseline": {"kind": "recorded", "path": "baseline.jsonl"},
+                "candidate": {"kind": "recorded", "path": "candidate.jsonl"}
+            },
+            "evaluators": [{"id": "exact", "kind": "exact_json"}],
+            "outcomes": {"correct": {"all_of": ["exact"]}},
+            "analysis": {"primary_outcome": "correct"}
+        }))
+        .unwrap();
+        let before = implementation_fingerprint(root.path(), &config).unwrap();
+        std::fs::write(
+            root.path().join("unrelated.py"),
+            "raise RuntimeError('unused')",
+        )
+        .unwrap();
+        let after = implementation_fingerprint(root.path(), &config).unwrap();
+        assert_eq!(before, after);
+    }
+
+    fn openai_schema_config() -> Config {
+        serde_json::from_value(json!({
+            "version": 1,
+            "project": {"name": "schema-snapshot"},
+            "dataset": {"path": "data.jsonl"},
+            "schema": {"path": "external.json"},
+            "variants": {
+                "baseline": {"kind": "recorded", "path": "baseline.jsonl"},
+                "candidate": {
+                    "kind": "openai_compatible",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": "local-model",
+                    "request": {"user_template": "{{ input }}"},
+                    "structured_output": {"mode": "json_schema", "schema": "model.json"}
+                }
+            },
+            "evaluators": [{"id": "exact", "kind": "exact_json"}],
+            "outcomes": {"correct": {"all_of": ["exact"]}},
+            "analysis": {"primary_outcome": "correct"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn model_facing_schema_is_captured_exactly_and_size_bounded() {
+        let root = tempdir().unwrap();
+        let external = br#"{"type":"object"}"#;
+        let model = br#"{"type":"object","required":["answer"]}"#;
+        std::fs::write(root.path().join("model.json"), model).unwrap();
+        let config = openai_schema_config();
+        let captured = capture_model_facing_schemas(
+            root.path(),
+            &config,
+            external,
+            &serde_json::from_slice(external).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured["candidate"].bytes, model);
+
+        let mut bounded = config;
+        bounded.limits.max_schema_bytes = 8;
+        assert!(
+            capture_model_facing_schemas(
+                root.path(),
+                &bounded,
+                external,
+                &serde_json::from_slice(external).unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_facing_schema_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("real.json"), "{\"type\":\"object\"}").unwrap();
+        symlink(
+            root.path().join("real.json"),
+            root.path().join("model.json"),
+        )
+        .unwrap();
+        let external = br#"{"type":"object"}"#;
+        assert!(
+            capture_model_facing_schemas(
+                root.path(),
+                &openai_schema_config(),
+                external,
+                &serde_json::from_slice(external).unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn opaque_adapter_token_maps_back_without_exposing_dataset_id() {
         let case = Case {
             id: "gold-positive-001".to_owned(),
@@ -890,6 +1072,9 @@ mod tests {
         let token = VariantCase::from(&case).id;
         assert_ne!(token, case.id);
         assert!(!token.contains("positive"));
+        let mut renamed = case.clone();
+        renamed.id = "completely-different-id".to_owned();
+        assert_eq!(VariantCase::from(&renamed).id, token);
         let run = AdapterRun {
             rows: vec![structtrace_core::output::VariantOutput {
                 case_id: token,
@@ -969,7 +1154,7 @@ analysis: {primary_outcome: correct}
         std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(
             root.path().join("variant.py"),
-            "import json, pathlib, sys\nfor line in sys.stdin:\n request=json.loads(line)\n pathlib.Path('data.jsonl').write_text('{\"id\":\"tampered\",\"input\":{}}\\n')\n print(json.dumps({'protocol':'structtrace.variant','protocol_version':1,'case_id':request['case_id'],'status':'ok','output':{'label':'yes'}}), flush=True)\n",
+            "import json, pathlib, sys\nfor line in sys.stdin:\n request=json.loads(line)\n pathlib.Path('data.jsonl').write_text('{\"id\":\"tampered\",\"input\":{}}\\n')\n print(json.dumps({'protocol':'structtrace.variant','protocol_version':2,'case_id':request['case_id'],'status':'ok','output':{'label':'yes'}}), flush=True)\n",
         )
         .unwrap();
         std::fs::write(
@@ -1052,7 +1237,7 @@ analysis: {{primary_outcome: correct}}
             "baseline",
             &impossible,
             &dataset,
-            &json!({"type": "object"}),
+            None,
             Path::new("unused.py"),
             &structtrace_core::config::LimitsConfig::default(),
             root.path(),

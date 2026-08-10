@@ -79,12 +79,14 @@ result and diagnostics. Replay recomputes built-in evaluators and outcome
 composition from that hash-bound receipt instead of silently re-executing a
 potential side effect.
 
-## Raw retention precedes portable finalization
+## Retention is presentation-only
 
-When `retain_raw_outputs` is false, valid parsed values are retained when
-available and original raw text is removed before output and paired artifacts
-are finalized. This reduces debugging and malformed-text replay fidelity; the
-product exposes that tradeoff rather than retaining hidden raw copies.
+Scoring uses a stable normalized observation that excludes raw formatting,
+prompts, provider envelopes, evaluator prose, and retry response bodies.
+Removing those values may reduce display and forensic fidelity, but cannot
+change parsing status, evaluator states, evidence classification, statistics,
+or the release decision. A retained parse-error marker preserves the original
+strict-parse outcome when raw text is intentionally discarded.
 
 ## Report redaction removes repeated echoes
 
@@ -92,7 +94,8 @@ Configured case-envelope JSON Pointers identify sensitive values. Report
 generation redacts both the selected location and equal values echoed in model
 output or evaluator details. Bounded offline reports use a small summary, a redacted search index,
 and lazy case chunks; one-file derivatives exist only below a configured limit. Reports are served
-only on loopback by default. The dedicated share export omits all case-level content.
+only on loopback beneath a fresh capability URL, so knowing the port is insufficient. The dedicated
+share export omits all case-level content.
 
 ## Release gates are multi-state evidence decisions
 
@@ -122,3 +125,20 @@ paired statistics, evaluator counts, hotspots, and the gate share the same evide
 Dataset IDs remain evaluator and report identifiers. Live command and Python protocols receive a
 deterministic opaque execution token that StructTrace maps back after validation. Python callables
 receive no identifier, and OpenAI templates expose neither dataset IDs nor transport tokens.
+
+## Run kinds isolate examples from production history
+
+Every manifest and SQLite run row records `production`, `demo`,
+`research_fixture`, or `test`. The default `latest` selector resolves only a
+completed production run. Explicit `latest-demo`, `latest-research`, and
+`latest-any` selectors prevent bundled examples from silently becoming release
+evidence.
+
+## Live execution inputs are snapshotted and bounded
+
+Before either variant runs, StructTrace captures every model-facing schema and
+hash-binds its exact bytes into the checkpoint and manifest. Only configured
+executables, Python entry modules, declared `implementation.sources`, declared
+digests, relevant lockfiles, and interpreter identity participate in the
+implementation fingerprint. The fingerprint and model-schema hashes are
+recomputed after execution; a change refuses finalization.

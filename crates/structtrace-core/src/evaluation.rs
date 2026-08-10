@@ -221,16 +221,24 @@ pub fn evaluate_case_with_external(
     primary_outcome: &str,
     external_results: &BTreeMap<String, EvaluatorResult>,
 ) -> CaseEvaluation {
-    let parsed_result = output
-        .parse_source()
-        .filter(|_| output.status == OutputStatus::Ok)
-        .ok_or_else(|| {
-            output.error.as_ref().map_or_else(
-                || "adapter did not return an output".to_owned(),
-                |error| error.message.clone(),
-            )
-        })
-        .and_then(|raw| parse_strict(&raw));
+    let parsed_result = if output.status == OutputStatus::Ok {
+        output.parse_source().map_or_else(
+            || {
+                Err(output
+                    .metadata
+                    .pointer("/_structtrace_retained_parse_error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("adapter did not return an output")
+                    .to_owned())
+            },
+            |raw| parse_strict(&raw),
+        )
+    } else {
+        Err(output.error.as_ref().map_or_else(
+            || "adapter did not return an output".to_owned(),
+            |error| error.message.clone(),
+        ))
+    };
     let (parsed_output, parse_error) = match parsed_result {
         Ok(value) => (Some(value), None),
         Err(error) => (None, Some(error)),
@@ -1862,6 +1870,7 @@ mod tests {
         let evaluators = vec![EvaluatorConfig {
             id: "priority".to_owned(),
             implementation_version: None,
+            implementation: Default::default(),
             kind: EvaluatorKind::JsonPointerExact {
                 pointer: "/priority".to_owned(),
                 expected_pointer: "/priority".to_owned(),
@@ -1960,6 +1969,7 @@ mod tests {
         let evaluators = vec![EvaluatorConfig {
             id: "external".to_owned(),
             implementation_version: Some("test-v1".to_owned()),
+            implementation: Default::default(),
             kind: EvaluatorKind::Command {
                 command: crate::config::CommandSpec {
                     program: "unused".to_owned(),

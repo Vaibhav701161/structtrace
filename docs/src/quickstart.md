@@ -19,7 +19,11 @@ newer:
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
 structtrace doctor --strict
+structtrace doctor --strict --dry-run 3
 ```
+
+The bounded dry run executes only configured local command, Python, and custom-evaluator
+handshakes. It never contacts an OpenAI-compatible endpoint.
 
 Create and run an offline recorded-output project:
 

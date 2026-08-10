@@ -7,7 +7,7 @@ explicitly model-visible metadata. The dataset case ID, golden expected values, 
 metadata never cross the variant boundary. The process must echo exactly the opaque token:
 
 ```json
-{"protocol":"structtrace.variant","protocol_version":1,"case_id":"stx-opaque-token","status":"ok","output":{"label":"accepted"}}
+{"protocol":"structtrace.variant","protocol_version":2,"case_id":"stx-opaque-token","status":"ok","output":{"label":"accepted"}}
 ```
 
 Application logs belong on stderr. StructTrace drains and caps stderr separately so logging cannot deadlock stdout. A wrong case ID, duplicate response, unsolicited stdout, incompatible protocol version, oversize response, timeout, process crash, or unexpected nonzero exit fails closed.

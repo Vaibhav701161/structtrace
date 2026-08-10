@@ -1,6 +1,9 @@
 //! Matched JSONL dataset ingestion.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,7 +11,7 @@ use serde_json::Value;
 use crate::{
     CoreError, Result,
     config::{DatasetFields, LimitsConfig},
-    hashing::{hash_bytes, read_bounded},
+    hashing::{hash_bytes, hash_canonical_json, read_bounded},
 };
 
 /// One immutable matched case retained inside the evaluation boundary.
@@ -49,8 +52,14 @@ pub struct VariantCase {
 
 impl From<&Case> for VariantCase {
     fn from(case: &Case) -> Self {
+        let stimulus = serde_json::json!({
+            "input": case.input,
+            "model_visible_metadata": case.model_visible_metadata,
+        });
+        let stimulus_hash = hash_canonical_json(&stimulus)
+            .expect("JSON values always have a canonical StructTrace encoding");
         Self {
-            id: format!("stx-{}", &hash_bytes(case.id.as_bytes())[..24]),
+            id: format!("stx-{}", &stimulus_hash[..24]),
             input: case.input.clone(),
             metadata: case.model_visible_metadata.clone(),
         }
@@ -174,12 +183,46 @@ impl Dataset {
                 message: "dataset contains no cases".to_owned(),
             });
         }
+        validate_reference_consistency(&cases)?;
         Ok(Self {
             cases,
             source_hash: hash_bytes(bytes),
             source_bytes: bytes.to_vec(),
         })
     }
+}
+
+/// Reject one model-visible stimulus associated with incompatible references.
+pub fn validate_reference_consistency(cases: &[Case]) -> Result<()> {
+    let mut references = BTreeMap::<String, (BTreeSet<String>, usize)>::new();
+    for case in cases {
+        let stimulus = serde_json::json!({
+            "input": case.input,
+            "model_visible_metadata": case.model_visible_metadata,
+        });
+        let stimulus_hash = hash_canonical_json(&stimulus).map_err(|error| CoreError::Dataset {
+            line: case.source_line,
+            message: format!("could not fingerprint stimulus: {error}"),
+        })?;
+        let reference_hash =
+            hash_canonical_json(&case.expected).map_err(|error| CoreError::Dataset {
+                line: case.source_line,
+                message: format!("could not fingerprint expected reference: {error}"),
+            })?;
+        let (observed, first_line) = references
+            .entry(stimulus_hash)
+            .or_insert_with(|| (BTreeSet::new(), case.source_line));
+        observed.insert(reference_hash);
+        if observed.len() > 1 {
+            return Err(CoreError::Dataset {
+                line: case.source_line,
+                message: format!(
+                    "dataset label conflict: the same model-visible stimulus has incompatible expected references (first observed on line {first_line})"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -252,5 +295,12 @@ mod tests {
         let many =
             Dataset::from_bytes_bounded(bytes, &DatasetFields::default(), 1024, 1).unwrap_err();
         assert!(many.to_string().contains("case limit"));
+    }
+
+    #[test]
+    fn same_stimulus_with_incompatible_references_is_rejected() {
+        let bytes = b"{\"id\":\"a\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"yes\"}}\n{\"id\":\"b\",\"input\":{\"text\":\"same\"},\"expected\":{\"label\":\"no\"}}\n";
+        let error = Dataset::from_bytes(bytes, &DatasetFields::default()).unwrap_err();
+        assert!(error.to_string().contains("dataset label conflict"));
     }
 }

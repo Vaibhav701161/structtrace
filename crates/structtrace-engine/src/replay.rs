@@ -8,7 +8,9 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use structtrace_adapters::evaluator::{evaluator_definition, evaluator_request};
+use structtrace_adapters::evaluator::{
+    evaluator_definition_with_implementation, evaluator_request,
+};
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
     artifact::{ExternalEvaluatorReceipt, PairedCaseRecord, RunManifest, RunSummary},
@@ -428,9 +430,10 @@ fn verified_external_results(
                 return None;
             };
             let request = evaluator_request(&evaluator.id, case, output, variant_id);
-            let definition = evaluator_definition(
+            let definition = evaluator_definition_with_implementation(
                 &evaluator.kind,
                 evaluator.implementation_version.as_deref(),
+                &evaluator.implementation,
             );
             let response = serde_json::to_value(&receipt.result).unwrap_or(Value::Null);
             let checks = [

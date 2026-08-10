@@ -66,3 +66,22 @@ trace IDs and timestamps cannot manufacture independent evidence.
 
 Latency and cost gate blocks accept `min_coverage` in `[0, 1]`, defaulting to `1.0`. Their
 comparisons are computed only from independent evidence units with matched observations for both variants.
+
+OpenAI-compatible `base_url` must be an `http` or `https` API root with a nonempty host. Userinfo,
+passwords, query strings, fragments, file URLs, and a complete `/chat/completions` path are rejected.
+Credentials are named through `api_key_env` only. The focused profile accepts finite temperatures
+from `0` through `2` inclusive.
+
+Command/Python variants and external evaluators may declare provenance inputs:
+
+```yaml
+implementation:
+  sources: [app.py, rules.json]
+  digest: optional-owner-supplied-immutable-digest
+```
+
+At most 256 explicit source files are accepted. Sources must be regular non-symlink files and are
+subject to per-file and aggregate fingerprint bounds. Unrelated files elsewhere in a repository do
+not participate in the run identity. Cross-field rules that JSON Schema cannot safely express,
+including JSON Pointer overlap, evaluator/outcome references, and unique evaluator IDs, remain
+runtime checks.

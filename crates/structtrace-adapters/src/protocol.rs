@@ -72,6 +72,9 @@ pub struct ProtocolError {
     pub kind: String,
     /// Redaction-safe detail.
     pub message: String,
+    /// Stable, redaction-safe error-class fingerprint.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// Validate immutable protocol fields and response shape.

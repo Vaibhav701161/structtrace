@@ -14,7 +14,18 @@ Persistent workers are the only evaluator process mode accepted by the stable ru
 process per evaluator and variant. `process_mode: per_case` is refused until its process-tree and
 reader-shutdown guarantees match the persistent runtime on every supported OS. Every
 external evaluator must declare an immutable `implementation_version`; that value is included in
-the hash-bound replay definition. Treat a source change as a version change. Persistent responses
+the hash-bound replay definition. Declare every source file that can alter evaluator behavior so the
+run fingerprint and replay receipt bind the implementation itself:
+
+```yaml
+implementation_version: rules-v3
+implementation:
+  sources: [evaluators/rules.py, evaluators/policy.json]
+  digest: optional-owner-supplied-immutable-digest
+```
+
+Treat a source change as a version change. Declared sources are regular non-symlink files, are read
+under explicit size limits, and are re-fingerprinted before finalization. Persistent responses
 must echo the request's `evaluator_id` and `case_id`; mismatched identities fail closed.
 
 Command and Python execution remain beta on Windows until descendant termination is backed by Job

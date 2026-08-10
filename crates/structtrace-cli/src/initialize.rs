@@ -341,7 +341,7 @@ for line in sys.stdin:
         label = "accepted"
     response = {
         "protocol": "structtrace.variant",
-        "protocol_version": 1,
+        "protocol_version": 2,
         "case_id": request["case_id"],
         "status": "ok",
         "output": {"label": label, "reason": f"{args.variant} deterministic example."},

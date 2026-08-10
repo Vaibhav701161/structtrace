@@ -4,6 +4,10 @@ Run `structtrace doctor --strict` first. It never contacts a provider. Strict mo
 sources, pointer isolation, semantic duplicates, exact golden-value echoes, Python callable imports,
 and Unix storage permissions in addition to the ordinary environment checks.
 
+Use `structtrace doctor --strict --dry-run 3` to execute bounded local command, Python, and
+custom-evaluator protocol handshakes on the first three cases. Doctor never invokes a network
+provider, including when `--dry-run` is present.
+
 **Configuration refused:** unknown fields, missing baseline/candidate variants, duplicate evaluator IDs, undefined outcome references, and unsupported versions fail closed. Validate against `schemas/structtrace.schema.json` for editor feedback.
 
 **All command cases failed:** confirm the executable is available from the project root, protocol
