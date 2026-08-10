@@ -1172,10 +1172,12 @@ mod tests {
         assert_eq!(runs[0].result.status, EvaluationStatus::Passed);
     }
 
+    #[cfg(unix)]
     fn fixture_case(id: &str) -> Case {
         serde_json::from_value(json!({"id": id, "input": {}, "source_line": 1})).unwrap()
     }
 
+    #[cfg(unix)]
     fn fixture_output(id: &str) -> VariantOutput {
         serde_json::from_value(json!({
             "case_id": id,

@@ -1880,6 +1880,7 @@ fn evidence_unit_value(
 }
 
 fn writable_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
     let existed = path.exists();
     std::fs::create_dir_all(path)
         .with_context(|| format!("could not create storage directory {}", path.display()))?;

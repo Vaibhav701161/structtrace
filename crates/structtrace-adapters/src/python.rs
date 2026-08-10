@@ -52,6 +52,11 @@ mod tests {
 
     use super::*;
 
+    // Windows CI can spend more than one second starting a cold Python
+    // interpreter. These tests exercise bridge semantics, not startup latency;
+    // timeout behavior is covered independently by the command adapter tests.
+    const BRIDGE_TEST_TIMEOUT_MS: u64 = 10_000;
+
     fn python_program() -> &'static str {
         ["python3", "python"]
             .into_iter()
@@ -88,7 +93,7 @@ mod tests {
             let run = run_python(
                 python_program(),
                 callable,
-                1_000,
+                BRIDGE_TEST_TIMEOUT_MS,
                 &[case()],
                 root.path(),
                 &root.path().join("bridge.py"),
@@ -114,7 +119,7 @@ mod tests {
         let run = run_python(
             python_program(),
             "app:fail",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case()],
             root.path(),
             &root.path().join("bridge.py"),
@@ -148,7 +153,7 @@ mod tests {
         let run = run_python(
             python_program(),
             "app:keys",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case()],
             root.path(),
             &root.path().join("bridge.py"),
@@ -173,7 +178,7 @@ mod tests {
         let async_run = run_python(
             python_program(),
             "app:async_ok",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case()],
             root.path(),
             &root.path().join("bridge.py"),
@@ -188,7 +193,7 @@ mod tests {
         let mixed = run_python(
             python_program(),
             "app:mixed",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case(), second],
             root.path(),
             &root.path().join("bridge.py"),
@@ -246,7 +251,7 @@ def ordinary_protocol_field(case):
         let loop_run = run_python(
             python_program(),
             "app:stable_loop",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case(), second],
             root.path(),
             &root.path().join("bridge.py"),
@@ -270,7 +275,7 @@ def ordinary_protocol_field(case):
             let run = run_python(
                 python_program(),
                 callable,
-                1_000,
+                BRIDGE_TEST_TIMEOUT_MS,
                 &[case()],
                 root.path(),
                 &root.path().join("bridge.py"),
@@ -291,7 +296,7 @@ def ordinary_protocol_field(case):
         let run = run_python(
             python_program(),
             "missing_private_module:run",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &[case()],
             root.path(),
             &root.path().join("bridge.py"),
@@ -351,7 +356,7 @@ async def leaves_task(case):
         let run = run_python(
             python_program(),
             "app:values",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &cases,
             root.path(),
             &root.path().join("bridge.py"),
@@ -390,7 +395,7 @@ async def leaves_task(case):
         let pending = run_python(
             python_program(),
             "app:leaves_task",
-            1_000,
+            BRIDGE_TEST_TIMEOUT_MS,
             &cases[..1],
             root.path(),
             &root.path().join("bridge.py"),
