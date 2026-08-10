@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use structtrace_core::{PROTOCOL_VERSION, dataset::VariantCase, output::Usage};
+use structtrace_core::{PROTOCOL_VERSION, dataset::VariantCase, output::Usage, strict_json};
 
 use crate::VARIANT_PROTOCOL;
 
@@ -105,7 +105,7 @@ pub fn validate_response(response: &VariantResponse, case_id: &str) -> anyhow::R
                 "successful response must not contain an error envelope"
             );
             if let (Some(output), Some(raw)) = (&response.output, &response.raw_output) {
-                let parsed: Value = serde_json::from_str(raw)
+                let parsed = strict_json::value_from_str(raw)
                     .map_err(|error| anyhow::anyhow!("raw_output is not JSON: {error}"))?;
                 anyhow::ensure!(
                     &parsed == output,

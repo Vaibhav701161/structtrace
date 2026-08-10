@@ -4,7 +4,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::Write,
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -29,7 +29,7 @@ use structtrace_core::{
 use tempfile::NamedTempFile;
 
 /// The report asset format is versioned independently from stored scores.
-pub const REPORT_FORMAT_VERSION: u32 = 2;
+pub const REPORT_FORMAT_VERSION: u32 = 3;
 
 const CASE_CHUNK_SIZE: usize = 50;
 
@@ -81,7 +81,7 @@ struct ReportView {
     manifest_rows: Vec<(String, String)>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MetricView {
     count: usize,
     total: usize,
@@ -126,7 +126,7 @@ struct TransitionView {
     both_fail: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ResearchStudyView {
     label: String,
     baseline: MetricView,
@@ -212,26 +212,216 @@ pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
         "completed run reports are immutable; use the finalized report or export a copy"
     );
     let config: Config = read_json(&run_dir.join("inputs/configuration.json"))?;
-    let cases: Vec<PairedCaseRecord> = read_jsonl(&run_dir.join("cases.jsonl"))?;
-    let mut view = build_view(&summary, &manifest, &cases, &config)?;
-    let case_views = std::mem::take(&mut view.cases);
+    let report_dir = run_dir.join("report");
+    if report_dir.exists() {
+        anyhow::ensure!(
+            std::fs::read_dir(&report_dir)?.next().is_none(),
+            "refusing to replace a non-empty report directory"
+        );
+        std::fs::remove_dir(&report_dir)?;
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix("report.tmp.")
+        .tempdir_in(run_dir)?;
+    let temporary_report = temporary.path();
+    let streamed = stream_case_chunks(&run_dir.join("cases.jsonl"), temporary_report, &config)?;
+    let mut view = build_view(&summary, &manifest, &[], &config)?;
+    view.research_studies = streamed.research_studies;
     let mut environment = Environment::new();
     environment.set_auto_escape_callback(|_| AutoEscape::Html);
     environment.add_template("report.html", TEMPLATE)?;
     let html = environment.get_template("report.html")?.render(view)?;
-    let report_dir = run_dir.join("report");
-    std::fs::create_dir_all(&report_dir)?;
-    let index_path = report_dir.join("index.html");
+    let index_path = temporary_report.join("index.html");
     atomic_write(&index_path, html.as_bytes())?;
 
+    let conservative_single_estimate = html
+        .len()
+        .saturating_mul(2)
+        .saturating_add(streamed.chunk_bytes.saturating_mul(8))
+        .saturating_add(1024 * 1024);
+    if conservative_single_estimate <= config.limits.max_single_file_report_bytes {
+        let mut single_view = build_view(&summary, &manifest, &[], &config)?;
+        single_view.research_studies = streamed.research_studies_for_single;
+        single_view.embedded_cases_json = Some(read_embedded_chunks(
+            temporary_report,
+            streamed.chunk_count,
+            streamed.case_count,
+        )?);
+        let single_html = environment
+            .get_template("report.html")?
+            .render(single_view)?;
+        anyhow::ensure!(
+            single_html.len() <= config.limits.max_single_file_report_bytes,
+            "single-file report exceeded its conservative pre-render budget"
+        );
+        atomic_write(
+            &temporary_report.join("single.html"),
+            single_html.as_bytes(),
+        )?;
+    }
+
+    let report_bytes = directory_size(temporary_report)?;
+    anyhow::ensure!(
+        report_bytes <= config.limits.max_report_total_bytes as u64,
+        "generated report is {report_bytes} bytes, above limits.max_report_total_bytes ({})",
+        config.limits.max_report_total_bytes
+    );
+    let temporary_path = temporary.keep();
+    std::fs::rename(&temporary_path, &report_dir)?;
+    Ok(GeneratedReport {
+        index_path: report_dir.join("index.html"),
+    })
+}
+
+struct StreamedCases {
+    case_count: usize,
+    chunk_count: usize,
+    chunk_bytes: usize,
+    research_studies: Vec<ResearchStudyView>,
+    research_studies_for_single: Vec<ResearchStudyView>,
+}
+
+fn stream_case_chunks(
+    source: &Path,
+    report_dir: &Path,
+    config: &Config,
+) -> anyhow::Result<StreamedCases> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "cases artifact must be a regular non-symlink file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= config.limits.max_replay_artifact_bytes as u64,
+        "cases artifact exceeds limits.max_replay_artifact_bytes"
+    );
     let cases_dir = report_dir.join("cases");
     std::fs::create_dir_all(&cases_dir)?;
-    let mut case_index = Vec::with_capacity(case_views.len());
-    for (chunk_index, chunk) in case_views.chunks(CASE_CHUNK_SIZE).enumerate() {
-        let chunk_path = cases_dir.join(format!("{chunk_index:05}.json"));
-        atomic_write(&chunk_path, &serde_json::to_vec(chunk)?)?;
-        for (offset, case) in chunk.iter().enumerate() {
-            case_index.push(CaseIndexEntry {
+    let mut source = BufReader::new(std::fs::File::open(source)?);
+    let index_file = std::fs::File::create(report_dir.join("case-index.json"))?;
+    let mut index = BufWriter::new(index_file);
+    index.write_all(b"[")?;
+    let mut first_index = true;
+    let mut line = Vec::new();
+    let mut chunk = Vec::with_capacity(CASE_CHUNK_SIZE);
+    let mut case_count = 0usize;
+    let mut chunk_count = 0usize;
+    let mut chunk_bytes = 0usize;
+    let mut studies = BTreeMap::<String, (String, usize, usize, usize, usize)>::new();
+    loop {
+        line.clear();
+        let read = source.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        anyhow::ensure!(
+            line.len() <= config.limits.max_jsonl_line_bytes,
+            "cases.jsonl line {} exceeds the retained line limit",
+            case_count + 1
+        );
+        anyhow::ensure!(!line.is_empty(), "cases.jsonl contains a blank line");
+        anyhow::ensure!(
+            case_count < config.limits.max_cases,
+            "cases.jsonl exceeds the retained case-count limit"
+        );
+        let text = std::str::from_utf8(&line)
+            .with_context(|| format!("cases.jsonl line {} is not UTF-8", case_count + 1))?;
+        let record: PairedCaseRecord = structtrace_core::strict_json::from_str(text)
+            .with_context(|| format!("invalid cases.jsonl line {}", case_count + 1))?;
+        if let Some(metadata) = record.case.metadata.as_ref() {
+            if let Some(study) = metadata.pointer("/study").and_then(Value::as_str) {
+                let label = metadata
+                    .pointer("/study_label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(study)
+                    .to_owned();
+                let counts = studies
+                    .entry(study.to_owned())
+                    .or_insert((label, 0, 0, 0, 0));
+                match (
+                    record.baseline_evaluation.primary_pass,
+                    record.candidate_evaluation.primary_pass,
+                ) {
+                    (true, true) => counts.1 += 1,
+                    (true, false) => counts.2 += 1,
+                    (false, true) => counts.3 += 1,
+                    (false, false) => counts.4 += 1,
+                }
+            }
+        }
+        chunk.push(case_view(&record, config)?);
+        case_count += 1;
+        if chunk.len() == CASE_CHUNK_SIZE {
+            chunk_bytes += write_case_chunk(
+                &cases_dir,
+                chunk_count,
+                &chunk,
+                &mut index,
+                &mut first_index,
+            )?;
+            chunk.clear();
+            chunk_count += 1;
+        }
+    }
+    if !chunk.is_empty() {
+        chunk_bytes += write_case_chunk(
+            &cases_dir,
+            chunk_count,
+            &chunk,
+            &mut index,
+            &mut first_index,
+        )?;
+        chunk_count += 1;
+    }
+    index.write_all(b"]")?;
+    index.flush()?;
+    let research_studies = studies
+        .into_values()
+        .map(
+            |(label, both_pass, baseline_only, candidate_only, both_fail)| {
+                let total = both_pass + baseline_only + candidate_only + both_fail;
+                ResearchStudyView {
+                    label,
+                    baseline: metric(both_pass + baseline_only, total),
+                    candidate: metric(both_pass + candidate_only, total),
+                    candidate_only,
+                    baseline_only,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    Ok(StreamedCases {
+        case_count,
+        chunk_count,
+        chunk_bytes,
+        research_studies: research_studies.clone(),
+        research_studies_for_single: research_studies,
+    })
+}
+
+fn write_case_chunk(
+    cases_dir: &Path,
+    chunk_index: usize,
+    chunk: &[CaseView],
+    index: &mut BufWriter<std::fs::File>,
+    first_index: &mut bool,
+) -> anyhow::Result<usize> {
+    let bytes = serde_json::to_vec(chunk)?;
+    atomic_write(&cases_dir.join(format!("{chunk_index:05}.json")), &bytes)?;
+    for (offset, case) in chunk.iter().enumerate() {
+        if !*first_index {
+            index.write_all(b",")?;
+        }
+        *first_index = false;
+        serde_json::to_writer(
+            &mut *index,
+            &CaseIndexEntry {
                 id: case.id.clone(),
                 transition: case.transition.clone(),
                 filters: case.filters.clone(),
@@ -242,31 +432,39 @@ pub fn generate(run_dir: &Path) -> anyhow::Result<GeneratedReport> {
                 .to_lowercase(),
                 chunk: chunk_index,
                 offset,
-            });
+            },
+        )?;
+    }
+    Ok(bytes.len())
+}
+
+fn read_embedded_chunks(
+    report_dir: &Path,
+    chunk_count: usize,
+    case_count: usize,
+) -> anyhow::Result<String> {
+    let mut embedded = String::with_capacity(case_count.saturating_mul(256));
+    embedded.push('[');
+    for chunk_index in 0..chunk_count {
+        let bytes = std::fs::read(
+            report_dir
+                .join("cases")
+                .join(format!("{chunk_index:05}.json")),
+        )?;
+        let text = std::str::from_utf8(&bytes)?;
+        let body = text
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .context("generated case chunk was not a JSON array")?;
+        if !body.is_empty() {
+            if embedded.len() > 1 {
+                embedded.push(',');
+            }
+            embedded.push_str(body);
         }
     }
-    atomic_write(
-        &report_dir.join("case-index.json"),
-        &serde_json::to_vec(&case_index)?,
-    )?;
-
-    let mut single_view = build_view(&summary, &manifest, &cases, &config)?;
-    single_view.cases.clear();
-    single_view.embedded_cases_json = Some(serde_json::to_string(&case_views)?);
-    let single_html = environment
-        .get_template("report.html")?
-        .render(single_view)?;
-    if single_html.len() <= config.limits.max_single_file_report_bytes {
-        atomic_write(&report_dir.join("single.html"), single_html.as_bytes())?;
-    }
-
-    let report_bytes = directory_size(&report_dir)?;
-    anyhow::ensure!(
-        report_bytes <= config.limits.max_report_total_bytes as u64,
-        "generated report is {report_bytes} bytes, above limits.max_report_total_bytes ({})",
-        config.limits.max_report_total_bytes
-    );
-    Ok(GeneratedReport { index_path })
+    embedded.push(']');
+    Ok(embedded)
 }
 
 /// Export the generated report as one self-contained HTML file.
@@ -393,6 +591,46 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
         .parent()
         .context("generated report has no directory")?
         .to_owned();
+    serve_assets(load_verified_report_assets(&directory)?, open_browser).await
+}
+
+/// Serve one escaped research index and its separate, verified study reports.
+pub async fn serve_research(
+    index_path: &Path,
+    studies: &[(String, PathBuf)],
+    open_browser: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(index_path.is_file(), "research index is missing");
+    let mut assets = VerifiedReportAssets::new();
+    assets.insert(
+        "index.html".to_owned(),
+        verified_asset(index_path, "text/html; charset=utf-8")?,
+    );
+    for (slug, run_dir) in studies {
+        anyhow::ensure!(
+            !slug.is_empty()
+                && slug
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "unsafe research study slug `{slug}`"
+        );
+        let generated = finalized_report(run_dir)?;
+        let report_dir = generated
+            .index_path
+            .parent()
+            .context("generated study report has no directory")?;
+        for (relative, asset) in load_verified_report_assets(report_dir)? {
+            let key = format!("{slug}/{relative}");
+            anyhow::ensure!(
+                assets.insert(key, asset).is_none(),
+                "duplicate research asset"
+            );
+        }
+    }
+    serve_assets(assets, open_browser).await
+}
+
+async fn serve_assets(assets: VerifiedReportAssets, open_browser: bool) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let token = capability_token();
@@ -409,7 +647,7 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
     let state = Arc::new(ReportServerState {
         token,
         expected_host,
-        assets: load_verified_report_assets(&directory)?,
+        assets,
     });
     let service = axum::Router::new()
         .fallback(serve_verified_asset)
@@ -422,7 +660,14 @@ pub async fn serve(run_dir: &Path, open_browser: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-type VerifiedReportAssets = BTreeMap<String, (String, axum::body::Bytes)>;
+#[derive(Debug)]
+struct VerifiedReportAsset {
+    content_type: String,
+    path: PathBuf,
+    blake3: String,
+}
+
+type VerifiedReportAssets = BTreeMap<String, VerifiedReportAsset>;
 
 #[derive(Debug)]
 struct ReportServerState {
@@ -466,10 +711,11 @@ fn load_verified_report_assets(directory: &Path) -> anyhow::Result<VerifiedRepor
                 };
                 output.insert(
                     relative,
-                    (
-                        content_type.to_owned(),
-                        axum::body::Bytes::from(std::fs::read(path)?),
-                    ),
+                    VerifiedReportAsset {
+                        content_type: content_type.to_owned(),
+                        blake3: hash_file(&path)?,
+                        path,
+                    },
                 );
             }
         }
@@ -478,6 +724,16 @@ fn load_verified_report_assets(directory: &Path) -> anyhow::Result<VerifiedRepor
     let mut assets = BTreeMap::new();
     visit(directory, directory, &mut assets)?;
     Ok(assets)
+}
+
+fn verified_asset(path: &Path, content_type: &str) -> anyhow::Result<VerifiedReportAsset> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink());
+    Ok(VerifiedReportAsset {
+        content_type: content_type.to_owned(),
+        blake3: hash_file(path)?,
+        path: path.to_owned(),
+    })
 }
 
 async fn serve_verified_asset(
@@ -518,14 +774,25 @@ async fn serve_verified_asset(
     if requested.contains("..") || requested.contains('\\') {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
-    let Some((content_type, bytes)) = state.assets.get(requested) else {
+    let Some(asset) = state.assets.get(requested) else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
-    let mut response = bytes.clone().into_response();
+    if hash_file(&asset.path).ok().as_deref() != Some(asset.blake3.as_str()) {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let file = match tokio::fs::File::open(&asset.path).await {
+        Ok(file) => file,
+        Err(_) => return axum::http::StatusCode::NOT_FOUND.into_response(),
+    };
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let mut response = axum::body::Body::from_stream(stream).into_response();
     let response_headers = response.headers_mut();
     response_headers.insert(
         axum::http::header::CONTENT_TYPE,
-        content_type.parse().expect("static content type is valid"),
+        asset
+            .content_type
+            .parse()
+            .expect("static content type is valid"),
     );
     response_headers.insert(
         axum::http::header::CACHE_CONTROL,
@@ -1043,6 +1310,19 @@ fn summary_rows(baseline: &VariantSummary, candidate: &VariantSummary) -> Vec<Co
             baseline.total,
         ),
         comparison(
+            "Primary fully evaluated",
+            baseline.primary_fully_evaluated,
+            candidate.primary_fully_evaluated,
+            baseline.total,
+        ),
+        comparison_with_denominators(
+            "Primary component errors",
+            baseline.primary_component_errors,
+            baseline.primary_required_components,
+            candidate.primary_component_errors,
+            candidate.primary_required_components,
+        ),
+        comparison(
             "Explicit primary failure",
             baseline.primary_failed,
             candidate.primary_failed,
@@ -1070,6 +1350,12 @@ fn summary_rows(baseline: &VariantSummary, candidate: &VariantSummary) -> Vec<Co
             "Valid but wrong",
             baseline.valid_but_wrong,
             candidate.valid_but_wrong,
+            baseline.total,
+        ),
+        comparison(
+            "Fully evaluated valid but wrong",
+            baseline.fully_evaluated_valid_but_wrong,
+            candidate.fully_evaluated_valid_but_wrong,
             baseline.total,
         ),
         comparison(
@@ -1323,19 +1609,28 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
         filters.push("adapter_error".to_owned());
     }
     let primary = &config.analysis.primary_outcome;
-    let primary_statuses = [
+    let primary_results = [
         record.baseline_evaluation.outcomes.get(primary),
         record.candidate_evaluation.outcomes.get(primary),
     ];
-    if primary_statuses.contains(&Some(&structtrace_core::evaluation::OutcomeStatus::Error)) {
+    if primary_results.iter().flatten().any(|result| {
+        result.truth == structtrace_core::evaluation::OutcomeStatus::Error
+            || result.error_components > 0
+    }) {
         filters.push("evaluator_error".to_owned());
     }
-    if primary_statuses.contains(&Some(
-        &structtrace_core::evaluation::OutcomeStatus::NotApplicable,
-    )) {
+    if primary_results.iter().flatten().any(|result| {
+        result.truth == structtrace_core::evaluation::OutcomeStatus::NotApplicable
+            || result.not_applicable_components > 0
+    }) {
         filters.push("not_applicable".to_owned());
     }
-    if primary_statuses.contains(&None) {
+    if primary_results.contains(&None)
+        || primary_results
+            .iter()
+            .flatten()
+            .any(|result| result.unscored_components > 0)
+    {
         filters.push("unscored".to_owned());
     }
     let baseline_parsed = redacted_value
@@ -1513,6 +1808,20 @@ fn comparison(label: &str, baseline: usize, candidate: usize, total: usize) -> C
     }
 }
 
+fn comparison_with_denominators(
+    label: &str,
+    baseline: usize,
+    baseline_total: usize,
+    candidate: usize,
+    candidate_total: usize,
+) -> ComparisonRow {
+    ComparisonRow {
+        label: label.to_owned(),
+        baseline: metric(baseline, baseline_total),
+        candidate: metric(candidate, candidate_total),
+    }
+}
+
 fn metric(count: usize, total: usize) -> MetricView {
     MetricView {
         count,
@@ -1528,19 +1837,8 @@ fn metric(count: usize, total: usize) -> MetricView {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes =
         std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
-}
-
-fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Vec<T>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))
-        })
-        .collect()
+    structtrace_core::strict_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -1678,7 +1976,7 @@ mod tests {
 
     fn report_config(title: &str) -> Config {
         serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "project": {"name": "report-test"},
             "dataset": {"path": "data.jsonl", "format": "jsonl"},
             "schema": {"path": "schema.json"},
@@ -2072,7 +2370,7 @@ mod tests {
     #[test]
     fn case_view_redacts_input_secrets_and_their_output_echoes() {
         let config: Config = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "project": {"name": "privacy"},
             "storage": {
                 "root": ".structtrace",
@@ -2157,7 +2455,7 @@ mod tests {
     #[test]
     fn redaction_never_falls_back_for_typed_or_reserved_values() {
         let config: Config = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "project": {"name": "privacy-adversarial"},
             "storage": {
                 "redaction": {"json_pointers": ["/input/secret"]}
@@ -2218,15 +2516,21 @@ mod tests {
     }
 
     fn server_state() -> Arc<ReportServerState> {
+        let path = std::env::temp_dir().join(format!(
+            "structtrace-report-server-test-{}.html",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"safe").unwrap();
         Arc::new(ReportServerState {
             token: "secret-token".to_owned(),
             expected_host: "127.0.0.1:43210".to_owned(),
             assets: BTreeMap::from([(
                 "index.html".to_owned(),
-                (
-                    "text/html; charset=utf-8".to_owned(),
-                    axum::body::Bytes::from_static(b"safe"),
-                ),
+                VerifiedReportAsset {
+                    content_type: "text/html; charset=utf-8".to_owned(),
+                    blake3: hash_file(&path).unwrap(),
+                    path,
+                },
             )]),
         })
     }

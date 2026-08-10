@@ -10,7 +10,24 @@ files are hardened to `0600`. `structtrace doctor --strict` checks existing stor
 Replay and report verification reject symlinked manifest artifacts and require canonical targets to
 remain beneath the run directory. Windows deployments must apply an equivalent user-only ACL.
 
-Credentials are read from configured environment variables. Manifests retain the variable name and presence, never the value. Authorization headers and secret values are not logged.
+Credentials are read from configured environment variables. Manifests retain the variable name
+and presence, never the value. User-controlled stdout and stderr are not retained by default.
+StructTrace does not claim it can identify every secret a user might print.
+
+Process-log retention is explicit and run-wide bounded:
+
+```yaml
+storage:
+  process_logs:
+    mode: off # off, sanitized, or full_sensitive
+    max_total_bytes: 4194304
+    custom_patterns: []
+```
+
+`sanitized` removes configured credential values, configured literal patterns, and
+Authorization/API-key/Bearer-shaped lines before persistence, then enforces the total budget.
+`full_sensitive` retains bounded original logs, may contain secrets, and produces a doctor warning.
+Process logs are always excluded from aggregate-only share exports.
 
 Disable portable raw-output retention and configure shareable-report redaction:
 

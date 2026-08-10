@@ -98,14 +98,14 @@ git clone https://github.com/Vaibhav701161/structtrace.git
 cd structtrace
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
-structtrace doctor --strict
-structtrace doctor --strict --dry-run 3
+structtrace doctor
 ```
 
-Strict doctor validates configuration and retained inputs without contacting a provider. The
-optional bounded dry run additionally exercises local command, Python, and custom-evaluator
-protocols against the first `N` cases. OpenAI-compatible variants are deliberately never called by
-doctor.
+Run `structtrace doctor --strict` after initializing a project. Strict doctor is static: it
+validates configuration and bounded retained inputs without importing or executing application
+code. `--handshake` imports Python workers and resolves callables without business cases.
+`--execute-cases N` is the deliberate, side-effecting local execution check. OpenAI-compatible
+variants are never called by doctor.
 
 The release workflow and checksum-verifying installers are release-candidate assets. They become
 supported only after clean Linux, macOS, and Windows virtual-machine installation checks have been
@@ -136,15 +136,31 @@ structtrace init my-check --preset extraction
 
 Initialization refuses to overwrite existing StructTrace files.
 
+Existing retained outputs can be onboarded without inventing correctness semantics:
+
+```bash
+structtrace init comparison --from-outputs \
+  --dataset data.jsonl --baseline baseline.jsonl --candidate candidate.jsonl \
+  --schema schema.json --correctness-pointer /invoice_number \
+  --correctness-pointer /total --gate-mode regression
+```
+
+The initializer validates and snapshots each input. You must select whole-object equality or exact
+JSON Pointers; StructTrace never treats schema validity as inferred task correctness.
+
 Bundled demos and research fixtures are isolated from production history. `latest` always means
 the latest completed production run; `latest-demo`, `latest-research`, and `latest-any` are
 explicit opt-in selectors.
+
+Manage retained runs with `structtrace runs list`, `runs show`, `runs latest --kind production`,
+`runs archive`, and confirmed inactive-run deletion. Archives include a BLAKE3 receipt for every
+copied file.
 
 ## Execution sources
 
 | Adapter | Status | Use it when | Execution behavior |
 |---|---|---|---|
-| Recorded JSONL | Stable | outputs already exist | no process, Python, or provider required |
+| Recorded JSONL | Stable candidate | outputs already exist | no process, Python, or provider required |
 | Command | Beta | application is in any language | bounded versioned JSONL over stdin/stdout; no shell |
 | Python callable | Beta | application exposes a Python function | bounded bridge; exceptions retained as failures |
 | OpenAI-compatible | Experimental | comparing models or request settings | explicit endpoint, bounded total case deadline and opt-in backoff |
@@ -207,14 +223,16 @@ Rules are evaluated independently. A schema improvement cannot hide a semantic r
 
 ```yaml
 gate:
+  mode: release
   min_cases: 100
   min_unique_cases: 100
   max_duplicate_case_rate: 0.01
-  min_primary_scored_rate: 0.99
-  max_primary_evaluator_error_rate: 0.01
-  max_primary_not_applicable_rate: 0.0
-  max_primary_unscored_rate: 0.0
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.01
+  max_primary_component_not_applicable_rate: 0.0
+  max_primary_component_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
+  min_candidate_primary_success_rate: 0.95
   max_valid_but_wrong_increase_pp: 0.5
   min_candidate_schema_validity: 1.0
   max_error_rate: 0.0
@@ -253,7 +271,7 @@ cases.jsonl                complete paired case records
 external-evaluator-receipts.jsonl  hash-bound external evaluator facts, when used
 discordances.jsonl         regression and valid-but-wrong slice
 summary.json / summary.md  machine and human summaries
-logs/                      separated adapter diagnostics
+logs/                      optional bounded process diagnostics; off by default
 report/index.html          offline report
 report/case-index.json     redacted search and filter index
 report/cases/              lazy 50-case display chunks
@@ -271,11 +289,16 @@ lockfiles, the Git commit, and the dirty-tree fingerprint.
 
 ## Privacy boundary
 
-StructTrace sends no telemetry and performs no automatic uploads. Provider credentials are read only from named environment variables; secret values are never written into resolved configuration or manifests.
+StructTrace sends no telemetry and performs no automatic uploads. Provider credentials are read
+only from named environment variables; credential values are never written into resolved
+configuration or manifests. User-controlled process logs are off by default.
 
 ```yaml
 storage:
   retain_raw_outputs: false
+  process_logs:
+    mode: off
+    max_total_bytes: 4194304
   redaction:
     json_pointers:
       - /input/customer_email
@@ -366,7 +389,7 @@ External usability evidence is deliberately tracked separately from automated co
 StructTrace does not migrate or rewrite schemas, optimize prompts, execute tool calls, choose a
 winning representation, or guarantee model quality. Its stable scope is paired regression testing
 while the caller-facing output contract stays fixed. It does not require an LLM judge for that
-workflow. Version 1 uses fixed baseline-then-candidate execution and variant-level resume;
+workflow. The stable-candidate path uses fixed baseline-then-candidate execution and variant-level resume;
 interleaved live-provider scheduling and case-level paid-call resume remain explicit future work.
 
 ## Contributing and security

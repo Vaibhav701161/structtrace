@@ -145,6 +145,49 @@ impl OutcomeStatus {
     }
 }
 
+/// Versioned composed truth together with independent evaluation-health facts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutcomeResult {
+    /// Logical result under the configured `all_of` or `any_of` composition.
+    pub truth: OutcomeStatus,
+    /// True only when every required evaluator produced a resolved pass or fail.
+    pub fully_evaluated: bool,
+    /// Number of evaluator components required by this outcome.
+    pub required_components: usize,
+    /// Required components that passed.
+    pub passed_components: usize,
+    /// Required components that failed.
+    pub failed_components: usize,
+    /// Required components that errored.
+    pub error_components: usize,
+    /// Required components that were not applicable.
+    pub not_applicable_components: usize,
+    /// Required components absent from the evaluator result set.
+    pub unscored_components: usize,
+}
+
+impl OutcomeResult {
+    /// Construct a synthetic single-component result for tests and migrations.
+    pub fn from_truth(truth: OutcomeStatus) -> Self {
+        let (passed, failed, error, not_applicable) = match truth {
+            OutcomeStatus::True => (1, 0, 0, 0),
+            OutcomeStatus::False => (0, 1, 0, 0),
+            OutcomeStatus::Error => (0, 0, 1, 0),
+            OutcomeStatus::NotApplicable => (0, 0, 0, 1),
+        };
+        Self {
+            truth,
+            fully_evaluated: matches!(truth, OutcomeStatus::True | OutcomeStatus::False),
+            required_components: 1,
+            passed_components: passed,
+            failed_components: failed,
+            error_components: error,
+            not_applicable_components: not_applicable,
+            unscored_components: 0,
+        }
+    }
+}
+
 /// Full scored output for one variant and case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CaseEvaluation {
@@ -168,11 +211,13 @@ pub struct CaseEvaluation {
     /// Configured evaluator facts.
     pub evaluators: BTreeMap<String, EvaluatorResult>,
     /// Named composed outcomes.
-    pub outcomes: BTreeMap<String, OutcomeStatus>,
+    pub outcomes: BTreeMap<String, OutcomeResult>,
     /// Whether the primary semantic outcome passed.
     pub primary_pass: bool,
     /// Strict parse plus schema validity plus primary failure.
     pub valid_but_wrong: bool,
+    /// Structurally valid, semantically false, and evaluated by every required component.
+    pub fully_evaluated_valid_but_wrong: bool,
 }
 
 /// JSON Schema failure location and explanation.
@@ -188,7 +233,7 @@ pub struct SchemaError {
 
 /// Strictly parse one complete JSON value.
 pub fn parse_strict(raw: &str) -> std::result::Result<Value, String> {
-    serde_json::from_str::<Value>(raw.trim()).map_err(|error| error.to_string())
+    crate::strict_json::value_from_str(raw.trim()).map_err(|error| error.to_string())
 }
 
 /// Evaluate one output without removing failures from the denominator.
@@ -276,8 +321,10 @@ pub fn evaluate_case_with_external(
         .iter()
         .map(|(name, config)| (name.clone(), compose_outcome(config, &evaluator_results)))
         .collect::<BTreeMap<_, _>>();
-    let primary_status = outcome_results.get(primary_outcome).copied();
+    let primary_result = outcome_results.get(primary_outcome);
+    let primary_status = primary_result.map(|result| result.truth);
     let primary_pass = primary_status.is_some_and(OutcomeStatus::is_pass);
+    let primary_fully_evaluated = primary_result.is_some_and(|result| result.fully_evaluated);
     CaseEvaluation {
         case_id: case.id.clone(),
         adapter_status: output.status,
@@ -290,6 +337,9 @@ pub fn evaluate_case_with_external(
         outcomes: outcome_results,
         primary_pass,
         valid_but_wrong: schema_valid && primary_status == Some(OutcomeStatus::False),
+        fully_evaluated_valid_but_wrong: schema_valid
+            && primary_status == Some(OutcomeStatus::False)
+            && primary_fully_evaluated,
     }
 }
 
@@ -1498,7 +1548,7 @@ fn canonical_integer(text: &str) -> Option<String> {
 fn compose_outcome(
     config: &OutcomeConfig,
     results: &BTreeMap<String, EvaluatorResult>,
-) -> OutcomeStatus {
+) -> OutcomeResult {
     let ids = if config.all_of.is_empty() {
         &config.any_of
     } else {
@@ -1508,10 +1558,26 @@ fn compose_outcome(
         .iter()
         .filter_map(|id| results.get(id))
         .collect::<Vec<_>>();
-    if selected.len() != ids.len() {
-        return OutcomeStatus::Error;
-    }
-    if !config.all_of.is_empty() {
+    let passed_components = selected
+        .iter()
+        .filter(|result| result.status == EvaluationStatus::Passed)
+        .count();
+    let failed_components = selected
+        .iter()
+        .filter(|result| result.status == EvaluationStatus::Failed)
+        .count();
+    let error_components = selected
+        .iter()
+        .filter(|result| result.status == EvaluationStatus::Error)
+        .count();
+    let not_applicable_components = selected
+        .iter()
+        .filter(|result| result.status == EvaluationStatus::NotApplicable)
+        .count();
+    let unscored_components = ids.len().saturating_sub(selected.len());
+    let truth = if unscored_components > 0 {
+        OutcomeStatus::Error
+    } else if !config.all_of.is_empty() {
         if selected
             .iter()
             .any(|result| result.status == EvaluationStatus::Failed)
@@ -1547,6 +1613,18 @@ fn compose_outcome(
         OutcomeStatus::NotApplicable
     } else {
         OutcomeStatus::False
+    };
+    OutcomeResult {
+        truth,
+        fully_evaluated: error_components == 0
+            && not_applicable_components == 0
+            && unscored_components == 0,
+        required_components: ids.len(),
+        passed_components,
+        failed_components,
+        error_components,
+        not_applicable_components,
+        unscored_components,
     }
 }
 
@@ -1606,8 +1684,52 @@ mod tests {
                 ("a".to_owned(), result("a", left)),
                 ("b".to_owned(), result("b", right)),
             ]);
-            assert_eq!(compose_outcome(&config, &results), expected);
+            assert_eq!(compose_outcome(&config, &results).truth, expected);
         }
+    }
+
+    #[test]
+    fn all_of_false_plus_error_preserves_error_component() {
+        let config = OutcomeConfig {
+            all_of: vec!["known_failure".to_owned(), "crashed".to_owned()],
+            any_of: Vec::new(),
+        };
+        let results = BTreeMap::from([
+            (
+                "known_failure".to_owned(),
+                EvaluatorResult::failed("known_failure", "wrong", Value::Null),
+            ),
+            (
+                "crashed".to_owned(),
+                EvaluatorResult::error("crashed", "unavailable"),
+            ),
+        ]);
+        let outcome = compose_outcome(&config, &results);
+        assert_eq!(outcome.truth, OutcomeStatus::False);
+        assert!(!outcome.fully_evaluated);
+        assert_eq!(outcome.failed_components, 1);
+        assert_eq!(outcome.error_components, 1);
+    }
+
+    #[test]
+    fn all_of_false_plus_not_applicable_is_not_fully_evaluated() {
+        let config = OutcomeConfig {
+            all_of: vec!["failed".to_owned(), "na".to_owned()],
+            any_of: Vec::new(),
+        };
+        let mut not_applicable = EvaluatorResult::error("na", "not applicable");
+        not_applicable.status = EvaluationStatus::NotApplicable;
+        let results = BTreeMap::from([
+            (
+                "failed".to_owned(),
+                EvaluatorResult::failed("failed", "wrong", Value::Null),
+            ),
+            ("na".to_owned(), not_applicable),
+        ]);
+        let outcome = compose_outcome(&config, &results);
+        assert_eq!(outcome.truth, OutcomeStatus::False);
+        assert!(!outcome.fully_evaluated);
+        assert_eq!(outcome.not_applicable_components, 1);
     }
 
     fn output(raw: &str) -> VariantOutput {
@@ -1622,6 +1744,12 @@ mod tests {
     #[test]
     fn surrounding_prose_fails_scored_parse() {
         assert!(parse_strict("Here: {\"a\":1}").is_err());
+    }
+
+    #[test]
+    fn duplicate_top_level_and_nested_raw_output_keys_are_rejected() {
+        assert!(parse_strict(r#"{"value":1,"value":2}"#).is_err());
+        assert!(parse_strict(r#"{"outer":{"value":1,"value":2}}"#).is_err());
     }
 
     #[test]

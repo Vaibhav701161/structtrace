@@ -11,6 +11,7 @@ use crate::{
     config::LimitsConfig,
     dataset::Dataset,
     hashing::{hash_bytes, read_bounded},
+    strict_json,
 };
 
 /// Success or retained failure.
@@ -171,7 +172,7 @@ impl RecordedOutputs {
                 });
             }
             let row: VariantOutput =
-                serde_json::from_str(line).map_err(|error| CoreError::RecordedOutput {
+                strict_json::from_str(line).map_err(|error| CoreError::RecordedOutput {
                     line: line_number,
                     message: error.to_string(),
                 })?;
@@ -202,7 +203,7 @@ impl RecordedOutputs {
                         });
                     }
                     if let (Some(raw), Some(parsed)) = (&row.raw_output, &row.parsed_output) {
-                        let raw_value: Value = serde_json::from_str(raw).map_err(|error| {
+                        let raw_value = strict_json::value_from_str(raw).map_err(|error| {
                             CoreError::RecordedOutput {
                                 line: line_number,
                                 message: format!(
@@ -310,6 +311,24 @@ mod tests {
         output_file.write_all(&[0xff, b'\n']).unwrap();
         let error = RecordedOutputs::read(output_file.path(), &dataset).unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn duplicate_recorded_output_field_is_rejected() {
+        let mut dataset_file = NamedTempFile::new().unwrap();
+        writeln!(dataset_file, r#"{{"id":"a","input":1}}"#).unwrap();
+        let dataset = Dataset::read(dataset_file.path(), &DatasetFields::default()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outputs.jsonl");
+        std::fs::write(
+            &path,
+            "{\"case_id\":\"a\",\"case_id\":\"b\",\"status\":\"ok\",\"raw_output\":\"{}\"}\n",
+        )
+        .unwrap();
+        let error = RecordedOutputs::read(&path, &dataset)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate object key `case_id`"));
     }
 
     proptest! {

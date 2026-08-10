@@ -280,7 +280,7 @@ async fn run_case_with_retries(
                         );
                     }
                 };
-                let value: Value = match serde_json::from_slice(&payload) {
+                let value = match structtrace_core::strict_json::value_from_slice(&payload) {
                     Ok(value) => value,
                     Err(error) => {
                         return error_output(

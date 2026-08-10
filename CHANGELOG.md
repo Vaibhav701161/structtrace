@@ -5,7 +5,27 @@ here.
 
 ## Unreleased
 
-- Advance the artifact format to version 7 and subprocess protocols to version 2. Evidence is now
+- Advance configuration to version 2, portable artifacts to version 8, reports to version 3,
+  SQLite to version 4, and command/Python/evaluator protocols to version 3.
+- Add explicit advisory, regression, and release gate modes. Only a complete release gate with an
+  absolute semantic floor can authorize deployment.
+- Store outcome truth separately from required-component health, and gate on fully evaluated,
+  error, not-applicable, and unscored component rates.
+- Reject duplicate object keys recursively at dataset, output, protocol, provider, evaluator,
+  configuration, and replay boundaries.
+- Apply retained output and schema limits consistently across initial execution, resume, replay,
+  and strict doctor.
+- Harden Python variant and evaluator bridges for non-finite numbers, mapping keys, common Python
+  values, reserved fields, response consistency, and clean persistent-loop shutdown.
+- Make user process logs off by default; add bounded sanitized and explicit full-sensitive modes.
+- Stream report case records into atomic 50-case chunks, preflight one-file size budgets, and
+  stream hash-verified server assets from disk.
+- Serve all normalized research studies from one capability-protected loopback portal without a
+  pooled effect or release gate.
+- Add safe run listing, inspection, kind-aware latest selection, inactive-run deletion, and
+  hash-receipted directory archives.
+
+- Advance the artifact format to version 7 and subprocess protocols to version 2. Evidence was
   classified as singleton, exact duplicate, repeated trial, or label conflict with separate
   stimulus, reference, scored-observation, and operational hashes.
 - Make retention and raw formatting presentation-only for evidence classification; remove

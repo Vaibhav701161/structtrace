@@ -1,0 +1,29 @@
+[package]
+name = "structtrace-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+structtrace-adapters = { path = "../crates/structtrace-adapters" }
+structtrace-core = { path = "../crates/structtrace-core" }
+
+[[bin]]
+name = "strict_json"
+path = "fuzz_targets/strict_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_json"
+path = "fuzz_targets/protocol_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

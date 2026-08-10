@@ -1,5 +1,10 @@
 # CI integration
 
+The repository CI runs locked formatting, warnings-denied Clippy, the complete all-feature test
+suite, release builds across Linux/macOS/Windows, mdBook, dependency advisories, dependency and
+license policy, CodeQL, and short strict-JSON/protocol fuzz smoke jobs. A defined remote job is not
+local evidence; its status must be read from the corresponding commit checks.
+
 Run the candidate, then gate the most recent completed result:
 
 ```yaml

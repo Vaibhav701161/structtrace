@@ -1,5 +1,20 @@
 # Run storage
 
+Use the explicit management surface instead of editing `.structtrace/runs` by hand:
+
+```bash
+structtrace runs list
+structtrace runs show <run-id>
+structtrace runs latest --kind production
+structtrace runs archive <run-id> <destination>
+structtrace runs delete <run-id> --yes
+```
+
+Deletion refuses active lifecycle states, validates that the target is an immediate child of the
+resolved storage root, and refuses any symlink in the run tree. Without `--yes`, confirmation is
+required. Archive first verifies every manifest-bound artifact, copies only regular entries, and
+writes `archive-verification.json` with a BLAKE3 hash for every copied file.
+
 Local state defaults to `.structtrace`. Each ULID-named run contains a versioned SQLite database and portable files. SQLite tables store runs, cases, variants, outputs, evaluator results, outcomes, paired results, events, and artifact hashes.
 
 Portable JSON and JSONL files make reports and replay inspectable without querying SQLite. Exact

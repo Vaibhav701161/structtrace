@@ -16,8 +16,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 open.workspace = true
+minijinja.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 structtrace-adapters = { path = "../structtrace-adapters" }
 structtrace-core = { path = "../structtrace-core" }
 structtrace-engine = { path = "../structtrace-engine" }

@@ -2,8 +2,8 @@
 
 The top-level fields are `version`, `project`, `storage`, `limits`, `dataset`, `schema`, `variants`, `evaluators`, `outcomes`, `analysis`, `gate`, and `report`.
 
-Version `1` is the only accepted configuration version. `variants.baseline` and
-`variants.candidate` are required and are the only accepted variant keys in v1. Evaluator IDs
+Version `2` is the only accepted configuration version. `variants.baseline` and
+`variants.candidate` are required and are the only accepted variant keys. Evaluator IDs
 must be unique. Every outcome must define exactly one non-empty `all_of` or `any_of` list, and
 every referenced evaluator must exist. `analysis.primary_outcome` must name a configured outcome.
 
@@ -42,6 +42,9 @@ limits:
   max_report_total_bytes: 268435456
   max_single_file_report_bytes: 10485760
 ```
+
+Process-log retention is configured separately under `storage.process_logs`. It defaults to
+`off`, has a run-wide byte ceiling, and does not alter any score, evidence group, statistic, or gate.
 
 The output limit applies to command, Python, and OpenAI-compatible adapter content. Standard error beyond its retained limit is drained but not stored. The report limit truncates only the shareable HTML view; scored artifacts remain unchanged according to the storage-retention policy. Zero values and values above the compiled hard ceilings fail configuration validation before execution.
 

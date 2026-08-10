@@ -4,6 +4,7 @@
 
 /// Adapter-aware run orchestration.
 pub mod configured;
+mod process_logs;
 /// Complete recorded-output comparison workflow.
 pub mod recorded;
 /// Artifact hash verification and complete score recomputation.

@@ -101,7 +101,7 @@ async fn run_configured_inner(
         config.limits.max_schema_bytes,
         "schema",
     )?;
-    let schema_value: Value = serde_json::from_slice(&schema_bytes)
+    let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)
         .with_context(|| format!("schema {} is not valid JSON", schema_path.display()))?;
     compile_schema(&schema_value)?;
     let captured_model_schemas =
@@ -141,14 +141,20 @@ async fn run_configured_inner(
             Some(run_id) => {
                 let run_dir = storage_root.join("runs").join(&run_id);
                 let checkpoint_path = run_dir.join("execution-checkpoint.json");
-                let bytes = std::fs::read(&checkpoint_path).with_context(|| {
+                let bytes = structtrace_core::hashing::read_bounded(
+                    &checkpoint_path,
+                    config.limits.max_replay_artifact_bytes,
+                    "execution checkpoint",
+                )
+                .with_context(|| {
                     format!(
                         "run `{run_id}` has no resumable execution checkpoint at {}",
                         checkpoint_path.display()
                     )
                 })?;
-                let checkpoint: ExecutionCheckpoint = serde_json::from_slice(&bytes)
-                    .context("execution checkpoint is invalid JSON")?;
+                let checkpoint: ExecutionCheckpoint =
+                    structtrace_core::strict_json::from_slice(&bytes)
+                        .context("execution checkpoint is invalid JSON")?;
                 verify_resume_compatibility(&expected, &checkpoint)?;
                 let store = RunStore::open(&run_dir)?;
                 let status = store.status(&run_id)?;
@@ -296,9 +302,10 @@ fn capture_model_facing_schemas(
                 config.limits.max_schema_bytes,
                 "model-facing schema",
             )?;
-            let value = serde_json::from_slice::<Value>(&bytes).with_context(|| {
-                format!("model-facing schema {} is invalid JSON", path.display())
-            })?;
+            let value =
+                structtrace_core::strict_json::value_from_slice(&bytes).with_context(|| {
+                    format!("model-facing schema {} is invalid JSON", path.display())
+                })?;
             (bytes, value)
         } else {
             (external_schema_bytes.to_vec(), external_schema.clone())
@@ -575,14 +582,14 @@ async fn prepare_or_restore(
             &actual_hash == expected_hash,
             "completed {name} output hash changed; resume refused"
         );
-        let outputs = RecordedOutputs::read(&output_path, dataset)?;
+        let outputs = RecordedOutputs::read_bounded(&output_path, dataset, limits)?;
         return Ok(PreparedVariant {
             source_label: checkpoint
                 .source_labels
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| format!("checkpoint:{name}")),
-            source_bytes: std::fs::read(&output_path)?,
+            source_bytes: outputs.source_bytes,
             input_hash: checkpoint
                 .original_input_hashes
                 .get(name)
@@ -607,8 +614,13 @@ async fn prepare_or_restore(
         limits,
     )
     .await?;
+    let retained_config_bytes = structtrace_core::hashing::read_bounded(
+        &run_dir.join("inputs/configuration.json"),
+        limits.max_config_bytes,
+        "retained configuration",
+    )?;
     let retained_config: Config =
-        serde_json::from_slice(&std::fs::read(run_dir.join("inputs/configuration.json"))?)?;
+        structtrace_core::strict_json::from_slice(&retained_config_bytes)?;
     apply_storage_retention(
         &mut prepared,
         retained_config.storage.retain_raw_outputs,
@@ -616,19 +628,36 @@ async fn prepare_or_restore(
         retained_config.report.include_prompts,
     )?;
     atomic_write(output_path, &prepared.source_bytes)?;
-    if !prepared.stderr.is_empty() {
+    let retained_log_bytes = std::fs::read_dir(run_dir.join("logs"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len() as usize)
+        .sum::<usize>();
+    let mut process_log_budget = retained_config
+        .storage
+        .process_logs
+        .max_total_bytes
+        .saturating_sub(retained_log_bytes);
+    if let Some(log) =
+        crate::process_logs::retain(&retained_config, &prepared.stderr, &mut process_log_budget)
+    {
         atomic_write(
             run_dir.join("logs").join(format!("{name}.stderr.log")),
-            &prepared.stderr,
+            &log,
         )?;
     }
     if !prepared.protocol_errors.is_empty() {
-        atomic_write(
-            run_dir
-                .join("logs")
-                .join(format!("{name}.protocol-errors.json")),
-            &serde_json::to_vec_pretty(&prepared.protocol_errors)?,
-        )?;
+        let bytes = serde_json::to_vec_pretty(&prepared.protocol_errors)?;
+        if let Some(log) =
+            crate::process_logs::retain(&retained_config, &bytes, &mut process_log_budget)
+        {
+            atomic_write(
+                run_dir
+                    .join("logs")
+                    .join(format!("{name}.protocol-errors.json")),
+                &log,
+            )?;
+        }
     }
     checkpoint
         .completed_outputs
@@ -660,12 +689,11 @@ async fn prepare_variant(
     match variant {
         VariantConfig::Recorded { path } => {
             let path = resolve(project_root, path);
-            let source_bytes = std::fs::read(&path)
+            let outputs = RecordedOutputs::read_bounded(&path, dataset, limits)
                 .with_context(|| format!("could not read {} output {}", name, path.display()))?;
-            let outputs = RecordedOutputs::read(&path, dataset)?;
             Ok(PreparedVariant {
                 source_label: path.display().to_string(),
-                source_bytes,
+                source_bytes: outputs.source_bytes,
                 input_hash: outputs.source_hash,
                 rows: outputs.rows,
                 stderr: Vec::new(),
@@ -773,7 +801,7 @@ fn from_adapter(source_label: String, run: AdapterRun) -> anyhow::Result<Prepare
 fn materialize_python_bridge(project_root: &Path, config: &Config) -> anyhow::Result<PathBuf> {
     let bridge_path = resolve(project_root, &config.storage.root)
         .join("runtime")
-        .join("python-bridge-v2.py");
+        .join("python-bridge-v3.py");
     let parent = bridge_path.parent().context("bridge path has no parent")?;
     std::fs::create_dir_all(parent)?;
     if std::fs::read(&bridge_path).ok().as_deref() != Some(BRIDGE_SOURCE.as_bytes()) {
@@ -876,7 +904,9 @@ fn read_optional(path: &Path) -> anyhow::Result<Vec<u8>> {
 
 fn read_optional_json(path: &Path) -> anyhow::Result<Vec<String>> {
     if path.is_file() {
-        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        Ok(structtrace_core::strict_json::from_slice(&std::fs::read(
+            path,
+        )?)?)
     } else {
         Ok(Vec::new())
     }
@@ -956,7 +986,7 @@ mod tests {
     fn recorded_run_does_not_scan_unrelated_python_tree() {
         let root = tempdir().unwrap();
         let config: Config = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "project": {"name": "recorded-only"},
             "dataset": {"path": "data.jsonl"},
             "schema": {"path": "schema.json"},
@@ -981,7 +1011,7 @@ mod tests {
 
     fn openai_schema_config() -> Config {
         serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "project": {"name": "schema-snapshot"},
             "dataset": {"path": "data.jsonl"},
             "schema": {"path": "external.json"},
@@ -1106,7 +1136,7 @@ mod tests {
         std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(
             root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: lifecycle-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -1154,13 +1184,13 @@ analysis: {primary_outcome: correct}
         std::fs::write(root.path().join("schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(
             root.path().join("variant.py"),
-            "import json, pathlib, sys\nfor line in sys.stdin:\n request=json.loads(line)\n pathlib.Path('data.jsonl').write_text('{\"id\":\"tampered\",\"input\":{}}\\n')\n print(json.dumps({'protocol':'structtrace.variant','protocol_version':2,'case_id':request['case_id'],'status':'ok','output':{'label':'yes'}}), flush=True)\n",
+            "import json, pathlib, sys\nfor line in sys.stdin:\n request=json.loads(line)\n pathlib.Path('data.jsonl').write_text('{\"id\":\"tampered\",\"input\":{}}\\n')\n print(json.dumps({'protocol':'structtrace.variant','protocol_version': 3,'case_id':request['case_id'],'status':'ok','output':{'label':'yes'}}), flush=True)\n",
         )
         .unwrap();
         std::fs::write(
             root.path().join("structtrace.yaml"),
             format!(
-                r#"version: 1
+                r#"version: 2
 project: {{name: immutable-source}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}

@@ -674,7 +674,7 @@ async fn bounded_reader_task(
 }
 
 fn parse_response(line: &str, case_id: &str, latency_ms: u64) -> anyhow::Result<VariantOutput> {
-    let response: VariantResponse = serde_json::from_str(line)?;
+    let response: VariantResponse = structtrace_core::strict_json::from_str(line)?;
     validate_response(&response, case_id)?;
     let status = if response.status == "ok" {
         OutputStatus::Ok
@@ -824,7 +824,7 @@ for line in sys.stdin:
         continue
     response = {
         "protocol": "structtrace.variant",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "case_id": "wrong" if args.mode == "wrong-id" else case_id,
         "status": "ok",
         "output": {"label": "accepted"},
@@ -1155,5 +1155,13 @@ if args.mode == "delayed-extra-after-complete":
             error_output("id", "kind", "message", None).metadata,
             Value::Object(serde_json::Map::new())
         );
+    }
+
+    #[test]
+    fn duplicate_protocol_case_id_and_status_are_rejected() {
+        let duplicate_case = r#"{"protocol":"structtrace.variant","protocol_version": 3,"case_id":"one","case_id":"two","status":"ok","output":{}}"#;
+        assert!(parse_response(duplicate_case, "one", 0).is_err());
+        let duplicate_status = r#"{"protocol":"structtrace.variant","protocol_version": 3,"case_id":"one","status":"ok","status":"error","output":{}}"#;
+        assert!(parse_response(duplicate_status, "one", 0).is_err());
     }
 }

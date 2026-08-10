@@ -136,7 +136,7 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
         config.limits.max_schema_bytes,
         "retained schema",
     )?;
-    let schema_value: Value = serde_json::from_slice(&schema_bytes)?;
+    let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)?;
     let schema_hash = hash_file(&run_dir.join("inputs/schema.json"))?;
     if schema_hash != manifest.schema_hash {
         artifact_hash_mismatches.push(format!(
@@ -523,7 +523,8 @@ fn transition_name(baseline: bool, candidate: bool) -> &'static str {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes =
         std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+    structtrace_core::strict_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 fn read_json_bounded<T: serde::de::DeserializeOwned>(
@@ -532,7 +533,8 @@ fn read_json_bounded<T: serde::de::DeserializeOwned>(
     label: &str,
 ) -> anyhow::Result<T> {
     let bytes = structtrace_core::hashing::read_bounded(path, max_bytes, label)?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+    structtrace_core::strict_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 fn read_jsonl_bounded<T: serde::de::DeserializeOwned>(
@@ -558,7 +560,7 @@ fn read_jsonl_bounded<T: serde::de::DeserializeOwned>(
                 path.display(),
                 index + 1
             );
-            serde_json::from_str(line)
+            structtrace_core::strict_json::from_str(line)
                 .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))
         })
         .collect()
@@ -624,7 +626,7 @@ mod tests {
         }
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: replay-adversarial}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}

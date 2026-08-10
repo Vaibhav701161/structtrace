@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config::GateConfig, statistics::PairedMetrics};
+use crate::{
+    config::{GateConfig, GateMode},
+    statistics::PairedMetrics,
+};
 
 /// Inputs required by the gate engine.
 #[derive(Debug, Clone)]
@@ -18,19 +21,25 @@ pub struct GateInputs<'a> {
     /// Stimuli with incompatible expected references.
     pub label_conflict_groups: usize,
     /// Minimum explicit pass-or-fail scoring rate across both variants.
-    pub primary_scored_rate: f64,
-    /// Maximum primary evaluator-error rate across both variants.
-    pub primary_evaluator_error_rate: f64,
-    /// Maximum primary not-applicable rate across both variants.
-    pub primary_not_applicable_rate: f64,
-    /// Maximum primary unscored rate across both variants.
-    pub primary_unscored_rate: f64,
+    pub primary_fully_evaluated_rate: f64,
+    /// Maximum primary required-component error rate across both variants.
+    pub primary_component_error_rate: f64,
+    /// Maximum primary required-component not-applicable rate across both variants.
+    pub primary_component_not_applicable_rate: f64,
+    /// Maximum primary required-component unscored rate across both variants.
+    pub primary_component_unscored_rate: f64,
     /// Primary paired metrics.
     pub primary: &'a PairedMetrics,
     /// Baseline valid-but-wrong fraction.
     pub baseline_valid_but_wrong_rate: f64,
     /// Candidate valid-but-wrong fraction.
     pub candidate_valid_but_wrong_rate: f64,
+    /// Candidate primary semantic success fraction.
+    pub candidate_primary_success_rate: f64,
+    /// Candidate strict-parse validity fraction.
+    pub candidate_parse_validity: f64,
+    /// Lower bound of the paired candidate-minus-baseline interval.
+    pub primary_lower_confidence_bound_pp: Option<f64>,
     /// Candidate schema-validity fraction.
     pub candidate_schema_validity: f64,
     /// Candidate adapter-error fraction.
@@ -167,28 +176,28 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
             "exact semantic duplicate rate",
         ),
         required_minimum_rule(
-            "min_primary_scored_rate",
-            config.min_primary_scored_rate,
-            inputs.primary_scored_rate,
-            "primary scored rate",
+            "min_primary_fully_evaluated_rate",
+            config.min_primary_fully_evaluated_rate,
+            inputs.primary_fully_evaluated_rate,
+            "primary fully evaluated rate",
         ),
         required_maximum_rule(
-            "max_primary_evaluator_error_rate",
-            config.max_primary_evaluator_error_rate,
-            inputs.primary_evaluator_error_rate,
-            "primary evaluator error rate",
+            "max_primary_component_error_rate",
+            config.max_primary_component_error_rate,
+            inputs.primary_component_error_rate,
+            "primary required-component error rate",
         ),
         required_maximum_rule(
-            "max_primary_not_applicable_rate",
-            config.max_primary_not_applicable_rate,
-            inputs.primary_not_applicable_rate,
-            "primary not-applicable rate",
+            "max_primary_component_not_applicable_rate",
+            config.max_primary_component_not_applicable_rate,
+            inputs.primary_component_not_applicable_rate,
+            "primary required-component not-applicable rate",
         ),
         required_maximum_rule(
-            "max_primary_unscored_rate",
-            config.max_primary_unscored_rate,
-            inputs.primary_unscored_rate,
-            "primary unscored rate",
+            "max_primary_component_unscored_rate",
+            config.max_primary_component_unscored_rate,
+            inputs.primary_component_unscored_rate,
+            "primary required-component unscored rate",
         ),
         maximum_rule(
             "max_primary_regression_pp",
@@ -203,6 +212,38 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
                 * (inputs.candidate_valid_but_wrong_rate - inputs.baseline_valid_but_wrong_rate)
                     .max(0.0),
             "valid-but-wrong increase",
+        ),
+        minimum_rule(
+            "min_candidate_primary_success_rate",
+            config.min_candidate_primary_success_rate,
+            inputs.candidate_primary_success_rate,
+            "candidate primary success rate",
+        ),
+        maximum_rule(
+            "max_candidate_valid_but_wrong_rate",
+            config.max_candidate_valid_but_wrong_rate,
+            inputs.candidate_valid_but_wrong_rate,
+            "candidate valid-but-wrong rate",
+        ),
+        minimum_rule(
+            "min_candidate_parse_validity",
+            config.min_candidate_parse_validity,
+            inputs.candidate_parse_validity,
+            "candidate strict-parse validity",
+        ),
+        optional_maximum_rule(
+            "max_upper_confidence_bound_regression_pp",
+            config.max_upper_confidence_bound_regression_pp,
+            inputs
+                .primary_lower_confidence_bound_pp
+                .map(|lower| (-lower).max(0.0)),
+            "upper confidence bound on primary regression",
+        ),
+        minimum_rule(
+            "min_discordant_pairs",
+            config.min_discordant_pairs.map(|value| value as f64),
+            (inputs.primary.baseline_only_pass + inputs.primary.candidate_only_pass) as f64,
+            "primary discordant pair count",
         ),
         minimum_rule(
             "min_candidate_schema_validity",
@@ -294,7 +335,7 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
         .collect();
     GateDecision {
         status,
-        deployment_authorized: status == GateStatus::Passed,
+        deployment_authorized: status == GateStatus::Passed && config.mode == GateMode::Release,
         quality_failures,
         evidence_failures,
         runtime_errors,
@@ -381,6 +422,27 @@ fn minimum_rule(name: &str, threshold: Option<f64>, observed: f64, label: &str) 
                 ),
             }
         },
+    )
+}
+
+fn optional_maximum_rule(
+    name: &str,
+    threshold: Option<f64>,
+    observed: Option<f64>,
+    label: &str,
+) -> GateRuleResult {
+    let Some(limit) = threshold else {
+        return not_evaluated(name, format!("No {label} threshold was configured."));
+    };
+    observed.map_or_else(
+        || {
+            unavailable_failure(
+                name,
+                limit,
+                format!("{label} was configured but no paired interval was available."),
+            )
+        },
+        |value| maximum_rule(name, Some(limit), value, label),
     )
 }
 
@@ -482,20 +544,25 @@ fn missing_evidence_requirement(name: &str, label: &str) -> GateRuleResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::{config::GateConfig, statistics::paired_metrics};
+    use crate::{
+        config::{GateConfig, GateMode},
+        statistics::paired_metrics,
+    };
 
     use super::*;
 
     fn release_config() -> GateConfig {
         GateConfig {
+            mode: GateMode::Release,
             min_cases: Some(2),
             min_unique_cases: Some(2),
             max_duplicate_case_rate: Some(0.0),
-            min_primary_scored_rate: Some(1.0),
-            max_primary_evaluator_error_rate: Some(0.0),
-            max_primary_not_applicable_rate: Some(0.0),
-            max_primary_unscored_rate: Some(0.0),
+            min_primary_fully_evaluated_rate: Some(1.0),
+            max_primary_component_error_rate: Some(0.0),
+            max_primary_component_not_applicable_rate: Some(0.0),
+            max_primary_component_unscored_rate: Some(0.0),
             max_primary_regression_pp: Some(1.0),
+            min_candidate_primary_success_rate: Some(0.5),
             ..GateConfig::default()
         }
     }
@@ -507,13 +574,16 @@ mod tests {
             duplicate_case_rate: 0.0,
             repeated_trial_groups: 0,
             label_conflict_groups: 0,
-            primary_scored_rate: 1.0,
-            primary_evaluator_error_rate: 0.0,
-            primary_not_applicable_rate: 0.0,
-            primary_unscored_rate: 0.0,
+            primary_fully_evaluated_rate: 1.0,
+            primary_component_error_rate: 0.0,
+            primary_component_not_applicable_rate: 0.0,
+            primary_component_unscored_rate: 0.0,
             primary,
             baseline_valid_but_wrong_rate: 0.0,
             candidate_valid_but_wrong_rate: 0.0,
+            candidate_primary_success_rate: 1.0,
+            candidate_parse_validity: 1.0,
+            primary_lower_confidence_bound_pp: Some(0.0),
             candidate_schema_validity: 1.0,
             candidate_error_rate: 0.0,
             candidate_timeout_rate: 0.0,
@@ -554,8 +624,8 @@ mod tests {
     fn all_evaluator_errors_cannot_pass_gate() {
         let primary = paired_metrics(&[(true, true), (true, true)]);
         let mut evidence = inputs(&primary);
-        evidence.primary_scored_rate = 0.0;
-        evidence.primary_evaluator_error_rate = 1.0;
+        evidence.primary_fully_evaluated_rate = 0.0;
+        evidence.primary_component_error_rate = 1.0;
         let decision = evaluate_gate(&release_config(), &evidence);
         assert_eq!(decision.status, GateStatus::InsufficientEvidence);
     }
@@ -564,10 +634,10 @@ mod tests {
     fn low_scoring_coverage_is_insufficient_evidence() {
         let primary = paired_metrics(&[(true, true), (false, false)]);
         let mut config = release_config();
-        config.min_primary_scored_rate = Some(0.99);
+        config.min_primary_fully_evaluated_rate = Some(0.99);
         let mut evidence = inputs(&primary);
-        evidence.primary_scored_rate = 0.5;
-        evidence.primary_unscored_rate = 0.5;
+        evidence.primary_fully_evaluated_rate = 0.5;
+        evidence.primary_component_unscored_rate = 0.5;
         let decision = evaluate_gate(&config, &evidence);
         assert_eq!(decision.status, GateStatus::InsufficientEvidence);
     }
@@ -576,8 +646,8 @@ mod tests {
     fn not_applicable_cases_do_not_disappear() {
         let primary = paired_metrics(&[(true, true), (false, false)]);
         let mut evidence = inputs(&primary);
-        evidence.primary_scored_rate = 0.5;
-        evidence.primary_not_applicable_rate = 0.5;
+        evidence.primary_fully_evaluated_rate = 0.5;
+        evidence.primary_component_not_applicable_rate = 0.5;
         let decision = evaluate_gate(&release_config(), &evidence);
         assert_eq!(decision.status, GateStatus::InsufficientEvidence);
     }
@@ -604,5 +674,54 @@ mod tests {
         assert!(decision.rules.iter().any(|rule| {
             rule.rule == "max_primary_regression_pp" && rule.status == GateRuleStatus::Failed
         }));
+    }
+
+    #[test]
+    fn advisory_mode_never_authorizes_and_evidence_only_gate_cannot_authorize() {
+        let primary = paired_metrics(&[(true, true), (false, false)]);
+        let mut config = release_config();
+        config.mode = GateMode::Advisory;
+        config.max_primary_regression_pp = None;
+        config.min_candidate_primary_success_rate = None;
+        let decision = evaluate_gate(&config, &inputs(&primary));
+        assert!(!decision.deployment_authorized);
+    }
+
+    #[test]
+    fn regression_mode_does_not_claim_absolute_safety() {
+        let primary = paired_metrics(&[(true, true), (true, true)]);
+        let mut config = release_config();
+        config.mode = GateMode::Regression;
+        config.min_candidate_primary_success_rate = None;
+        let decision = evaluate_gate(&config, &inputs(&primary));
+        assert_eq!(decision.status, GateStatus::Passed);
+        assert!(!decision.deployment_authorized);
+    }
+
+    #[test]
+    fn zero_percent_baseline_and_candidate_cannot_pass_release_gate() {
+        let primary = paired_metrics(&[(false, false), (false, false)]);
+        let mut observed = inputs(&primary);
+        observed.candidate_primary_success_rate = 0.0;
+        let decision = evaluate_gate(&release_config(), &observed);
+        assert_eq!(decision.status, GateStatus::Failed);
+        assert!(!decision.deployment_authorized);
+        assert!(
+            decision
+                .quality_failures
+                .contains(&"min_candidate_primary_success_rate".to_owned())
+        );
+    }
+
+    #[test]
+    fn wide_harm_interval_can_block_release_when_configured() {
+        let primary = paired_metrics(&[(true, true), (false, false)]);
+        let mut config = release_config();
+        config.max_upper_confidence_bound_regression_pp = Some(2.0);
+        let mut observed = inputs(&primary);
+        observed.primary_lower_confidence_bound_pp = Some(-12.0);
+        let decision = evaluate_gate(&config, &observed);
+        assert_eq!(decision.status, GateStatus::Failed);
+        assert!(!decision.deployment_authorized);
     }
 }

@@ -12,6 +12,7 @@ use crate::{
     CoreError, Result,
     config::{DatasetFields, LimitsConfig},
     hashing::{hash_bytes, hash_canonical_json, read_bounded},
+    strict_json,
 };
 
 /// One immutable matched case retained inside the evaluation boundary.
@@ -141,7 +142,7 @@ impl Dataset {
                     message: "blank lines are not valid cases".to_owned(),
                 });
             }
-            let row: Value = serde_json::from_str(line).map_err(|error| CoreError::Dataset {
+            let row = strict_json::value_from_str(line).map_err(|error| CoreError::Dataset {
                 line: line_number,
                 message: error.to_string(),
             })?;
@@ -270,6 +271,18 @@ mod tests {
         file.write_all(b"\"}\n").unwrap();
         let error = Dataset::read(file.path(), &DatasetFields::default()).unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn duplicate_dataset_id_field_is_rejected() {
+        let error = Dataset::from_bytes(
+            br#"{"id":"one","id":"two","input":{},"expected":{}}
+"#,
+            &DatasetFields::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("duplicate object key `id`"));
     }
 
     #[test]

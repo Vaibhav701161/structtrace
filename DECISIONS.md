@@ -20,6 +20,9 @@ A model output passes JSON parsing only when the entire trimmed output is one
 JSON value. Diagnostic recovery may be displayed later, but cannot alter the
 scored parse outcome.
 
+Every untrusted JSON boundary uses the same duplicate-key-rejecting parser. Duplicate keys fail
+instead of inheriting library-specific first-key or last-key behavior.
+
 ## Complete denominator
 
 Every dataset case remains in each variant denominator. Missing output, adapter
@@ -104,6 +107,22 @@ minimum case count, scored coverage, and evaluator error/not-applicable/unscored
 that lacks those safeguards is `INSUFFICIENT_EVIDENCE` even when its observed point estimate looks
 favorable. Quality failure, missing evidence, and gate execution error retain distinct states and
 exit codes.
+
+Gate intent is also typed. Advisory mode can never authorize deployment. Regression mode proves
+only configured relative non-regression. Release mode additionally requires an absolute semantic
+floor and is the sole mode allowed to authorize deployment.
+
+## Outcome truth and evaluation health are independent
+
+Logical `all_of` and `any_of` truth preserves known pass/fail semantics, but each outcome also
+stores complete component health. A failure cannot hide another required evaluator's error,
+not-applicable state, or missing score. Evidence gates operate on these component counts.
+
+## Process logs require explicit retention
+
+User stdout and stderr are off by default. Sanitized mode removes known credentials, configured
+literals, and header-shaped values under one total byte budget. Full-sensitive mode is bounded but
+may contain secrets and is always warned. Process logs never enter aggregate-only share exports.
 
 ## Stable product scope keeps the external contract fixed
 

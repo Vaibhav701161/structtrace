@@ -210,8 +210,26 @@ pub struct VariantSummary {
     /// Rows without a named primary outcome result.
     #[serde(default)]
     pub primary_unscored: usize,
+    /// Rows whose primary outcome has no errored, not-applicable, or missing component.
+    #[serde(default)]
+    pub primary_fully_evaluated: usize,
+    /// Total required primary evaluator components across rows.
+    #[serde(default)]
+    pub primary_required_components: usize,
+    /// Required primary evaluator components that errored.
+    #[serde(default)]
+    pub primary_component_errors: usize,
+    /// Required primary evaluator components that were not applicable.
+    #[serde(default)]
+    pub primary_component_not_applicable: usize,
+    /// Required primary evaluator components that were absent.
+    #[serde(default)]
+    pub primary_component_unscored: usize,
     /// Structurally valid outputs with an explicit false primary outcome.
     pub valid_but_wrong: usize,
+    /// Valid-but-wrong rows for which every primary component was resolved.
+    #[serde(default)]
+    pub fully_evaluated_valid_but_wrong: usize,
     /// Adapter errors, including missing outputs.
     pub errors: usize,
     /// Explicit timeout errors.

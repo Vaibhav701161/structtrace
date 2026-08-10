@@ -28,7 +28,7 @@ fn strict_doctor_fails_expected_leaf_leakage() {
     std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
     std::fs::write(
         root.path().join("structtrace.yaml"),
-        r#"version: 1
+        r#"version: 2
 project: {name: leakage-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -93,7 +93,7 @@ fn strict_doctor_requires_a_project_but_opaque_case_ids_are_allowed() {
     std::fs::write(root.path().join("candidate.jsonl"), output).unwrap();
     std::fs::write(
         root.path().join("structtrace.yaml"),
-        r#"version: 1
+        r#"version: 2
 project: {name: opaque-id-test}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -119,6 +119,66 @@ gate: {max_primary_regression_pp: 0}
             .status()
             .unwrap()
             .success()
+    );
+}
+
+#[test]
+fn strict_doctor_and_handshake_do_not_execute_business_cases() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("doctor-project");
+    assert!(
+        binary()
+            .args(["init", project.to_str().unwrap(), "--template", "python"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        project.join("variants/app.py"),
+        r#"from pathlib import Path
+def _run(case):
+    Path("business-case-executed").write_text("yes")
+    return {"label": "accepted", "reason": "explicit doctor fixture"}
+def baseline(case): return _run(case)
+def candidate(case): return _run(case)
+"#,
+    )
+    .unwrap();
+    for extra in [vec![], vec!["--handshake"]] {
+        assert!(
+            binary()
+                .args([
+                    "--quiet",
+                    "--project-root",
+                    project.to_str().unwrap(),
+                    "doctor",
+                    "--strict",
+                ])
+                .args(extra)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!project.join("business-case-executed").exists());
+    }
+    let output = binary()
+        .args([
+            "--format",
+            "json",
+            "--project-root",
+            project.to_str().unwrap(),
+            "doctor",
+            "--strict",
+            "--execute-cases",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(project.join("business-case-executed").is_file());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("may make network calls or cause side effects")
     );
 }
 
@@ -278,7 +338,11 @@ fn initialized_recorded_project_runs_reports_replays_and_rejects_small_sample() 
         .unwrap();
     assert_eq!(status.code(), Some(12));
     let github_summary = std::fs::read_to_string(github_summary).unwrap();
-    assert!(github_summary.contains("## StructTrace release gate: insufficient evidence"));
+    assert!(github_summary.contains(
+        "## StructTrace release gate: DO NOT DEPLOY: quality failed and evidence is insufficient"
+    ));
+    assert!(github_summary.contains("Quality thresholds failed"));
+    assert!(github_summary.contains("Evidence requirements are also insufficient"));
     assert!(github_summary.contains("| Metric | Baseline | Candidate |"));
     assert!(github_summary.contains("| Primary outcome |"));
 
@@ -455,7 +519,7 @@ for line in sys.stdin:
     request = json.loads(line)
     text = request["input"]["text"]
     label = "rejected" if "negative" in text else "accepted"
-    response = {"protocol":"structtrace.variant","protocol_version":2,"case_id":request["case_id"],"status":"ok","output":{"label":label,"reason":"resume fixture"}}
+    response = {"protocol":"structtrace.variant","protocol_version": 3,"case_id":request["case_id"],"status":"ok","output":{"label":label,"reason":"resume fixture"}}
     print(json.dumps(response), flush=True)
 "#,
     )
@@ -516,4 +580,84 @@ for line in sys.stdin:
             .unwrap()
             .success()
     );
+}
+
+#[test]
+fn run_management_archives_and_deletes_only_an_inactive_run() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    assert!(
+        binary()
+            .args(["init", project.to_str().unwrap(), "--template", "recorded"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "run",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run_dir = std::fs::read_dir(project.join(".structtrace/runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let run_id = run_dir.file_name().unwrap().to_str().unwrap().to_owned();
+    for args in [
+        vec!["runs", "list"],
+        vec!["runs", "show", run_id.as_str()],
+        vec!["runs", "latest", "--kind", "production"],
+    ] {
+        assert!(
+            binary()
+                .args(["--quiet", "--project-root", project.to_str().unwrap()])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let archive = root.path().join("archive");
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "runs",
+                "archive",
+                &run_id,
+                archive.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(archive.join("archive-verification.json").is_file());
+    assert!(archive.join("run/manifest.json").is_file());
+    assert!(
+        binary()
+            .args([
+                "--quiet",
+                "--project-root",
+                project.to_str().unwrap(),
+                "runs",
+                "delete",
+                &run_id,
+                "--yes",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!run_dir.exists());
 }

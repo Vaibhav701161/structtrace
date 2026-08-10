@@ -16,14 +16,17 @@ Until the first binary release, contributors can install from source with stable
 newer:
 
 ```bash
+git clone https://github.com/Vaibhav701161/structtrace.git
+cd structtrace
 cargo install --path crates/structtrace-cli --locked
 structtrace --help
-structtrace doctor --strict
-structtrace doctor --strict --dry-run 3
+structtrace doctor
 ```
 
-The bounded dry run executes only configured local command, Python, and custom-evaluator
-handshakes. It never contacts an OpenAI-compatible endpoint.
+After creating a project, `structtrace doctor --strict` performs bounded static validation only.
+Use `--handshake` to resolve Python callables without business cases. Use `--execute-cases N` only
+when you deliberately want configured local code to run; it may have network or other side effects.
+Doctor never contacts an OpenAI-compatible endpoint.
 
 Create and run an offline recorded-output project:
 
@@ -42,6 +45,10 @@ For a production-shaped extraction starting point, use:
 structtrace init my-check --preset extraction
 ```
 
-The generated candidate deliberately regresses one of two cases, so the run completes successfully but the gate exits with code `10`. That is different from malformed input or an execution failure.
+The extraction preset contains 12 matched invoices. Both variants pass 9/12 with six discordant
+cases; baseline and candidate schema validity are 10/12 and 12/12. The gate is
+`INSUFFICIENT EVIDENCE` because the fixture does not meet its 100-case evidence floor.
+
+The generic recorded template is separate: it contains two cases and is only a wiring check.
 
 Inspect `data/golden.jsonl`, `schemas/output.schema.json`, both files in `outputs/`, and `structtrace.yaml`. Replace the fixture with your matched cases and configure deterministic evaluators that represent correctness for your application.

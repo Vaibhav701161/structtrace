@@ -1,12 +1,15 @@
 # Troubleshooting
 
-Run `structtrace doctor --strict` first. It never contacts a provider. Strict mode validates bounded
-sources, pointer isolation, semantic duplicates, exact golden-value echoes, Python callable imports,
-and Unix storage permissions in addition to the ordinary environment checks.
+Run `structtrace doctor` at the repository root, or `structtrace doctor --strict` inside an
+initialized project. Strict mode is static and never imports a Python callable or executes a
+business case. It validates bounded sources, pointer isolation, semantic duplicates, exact
+golden-value echoes, executable presence, and Unix storage permissions.
 
-Use `structtrace doctor --strict --dry-run 3` to execute bounded local command, Python, and
-custom-evaluator protocol handshakes on the first three cases. Doctor never invokes a network
-provider, including when `--dry-run` is present.
+Use `structtrace doctor --strict --handshake` to import Python workers, validate protocol version,
+and resolve callables without running cases. Use `structtrace doctor --strict --execute-cases 3`
+only as an explicit opt-in to execute configured local application and evaluator code on three
+cases. That code may make network calls or have side effects. Doctor itself still excludes
+OpenAI-compatible endpoints.
 
 **Configuration refused:** unknown fields, missing baseline/candidate variants, duplicate evaluator IDs, undefined outcome references, and unsupported versions fail closed. Validate against `schemas/structtrace.schema.json` for editor feedback.
 

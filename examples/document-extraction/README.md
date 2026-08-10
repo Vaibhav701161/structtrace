@@ -6,11 +6,15 @@ score invoice identity, vendor, date, currency, exact-decimal financial fields, 
 required-field completeness.
 
 ```bash
-cd examples/document-extraction
-cargo run --manifest-path ../../Cargo.toml -p structtrace-cli -- --project-root . run
+structtrace doctor --strict
+structtrace run
+structtrace report latest --open
+structtrace gate latest
+structtrace replay latest
 ```
 
 The candidate fixes missing currencies and one vendor name, but introduces a tax error, a total
 error, and a missing line item. All candidate rows remain strict JSON; the financially wrong rows
-are visible as valid-but-wrong. The gate reports `FAILED` because the quality regression is real;
-an individual evidence rule also reports that 12 cases cannot authorize a release.
+are visible as valid-but-wrong. Both variants score 9/12 on the primary outcome, with six
+discordant cases. Baseline schema validity is 10/12 and candidate schema validity is 12/12. The
+gate reports `INSUFFICIENT EVIDENCE` because 12 cases cannot satisfy the configured 100-case floor.

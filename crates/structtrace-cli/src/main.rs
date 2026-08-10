@@ -53,6 +53,12 @@ struct Cli {
     /// Project root used to resolve relative paths.
     #[arg(long, global = true, default_value = ".")]
     project_root: PathBuf,
+    /// Override the configured StructTrace storage root.
+    #[arg(long, global = true)]
+    storage_root: Option<PathBuf>,
+    /// Operate on one explicit run directory for report, gate, or replay commands.
+    #[arg(long, global = true)]
+    run_dir: Option<PathBuf>,
     /// Human, JSON, or GitHub Actions output.
     #[arg(long, global = true, value_enum, default_value = "human")]
     format: OutputFormat,
@@ -83,11 +89,47 @@ enum Commands {
         /// New project directory. Defaults to the current project root.
         path: Option<PathBuf>,
         /// Integration template.
-        #[arg(long, value_enum, conflicts_with = "preset")]
+        #[arg(long, value_enum, conflicts_with_all = ["preset", "from_outputs"])]
         template: Option<InitTemplate>,
         /// Opinionated application preset.
-        #[arg(long, value_enum, conflicts_with = "template")]
+        #[arg(long, value_enum, conflicts_with_all = ["template", "from_outputs"])]
         preset: Option<InitPreset>,
+        /// Build a recorded comparison from existing matched artifacts.
+        #[arg(long)]
+        from_outputs: bool,
+        /// Golden dataset used by --from-outputs.
+        #[arg(long, requires = "from_outputs")]
+        dataset: Option<PathBuf>,
+        /// Baseline output JSONL used by --from-outputs.
+        #[arg(long, requires = "from_outputs")]
+        baseline: Option<PathBuf>,
+        /// Candidate output JSONL used by --from-outputs.
+        #[arg(long, requires = "from_outputs")]
+        candidate: Option<PathBuf>,
+        /// Caller-facing JSON Schema used by --from-outputs.
+        #[arg(long, requires = "from_outputs")]
+        schema: Option<PathBuf>,
+        /// JSON Pointer whose exact value defines correctness. Repeat for multiple fields.
+        #[arg(long, requires = "from_outputs")]
+        correctness_pointer: Vec<String>,
+        /// Compare the complete output object to expected instead of selected pointers.
+        #[arg(
+            long,
+            requires = "from_outputs",
+            conflicts_with = "correctness_pointer"
+        )]
+        exact_json: bool,
+        /// Gate intent for the generated project.
+        #[arg(
+            long,
+            value_enum,
+            default_value = "regression",
+            requires = "from_outputs"
+        )]
+        gate_mode: GuidedGateMode,
+        /// Required independent cases for the generated evidence gate.
+        #[arg(long, default_value_t = 100, requires = "from_outputs")]
+        min_cases: usize,
     },
     /// Run a complete deterministic demo without network access or credentials.
     Demo {
@@ -173,10 +215,64 @@ enum Commands {
         /// Fail on insecure storage, duplicate evidence, and leakage-risk values.
         #[arg(long)]
         strict: bool,
-        /// Preflight this many local cases without contacting network providers.
-        #[arg(long, value_name = "CASES", requires = "strict")]
-        dry_run: Option<usize>,
+        /// Import configured Python workers and resolve callables without executing cases.
+        #[arg(long, requires = "strict", conflicts_with = "execute_cases")]
+        handshake: bool,
+        /// Deliberately execute this many local business cases; configured code may have side effects.
+        #[arg(
+            long,
+            value_name = "CASES",
+            requires = "strict",
+            conflicts_with = "handshake"
+        )]
+        execute_cases: Option<usize>,
     },
+    /// Inspect, select, archive, or safely remove local runs.
+    Runs {
+        #[command(subcommand)]
+        command: RunsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RunsCommand {
+    /// List local runs without mixing demo and research fixtures into production selection.
+    List,
+    /// Show one run manifest after strict parsing.
+    Show { run: String },
+    /// Resolve the latest completed run of one kind.
+    Latest {
+        #[arg(long, value_enum, default_value = "production")]
+        kind: RunKindArg,
+    },
+    /// Remove one inactive run beneath the configured storage root.
+    Delete {
+        run: String,
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Copy one complete, hash-verified run into a self-verifying directory bundle.
+    Archive { run: String, destination: PathBuf },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RunKindArg {
+    Production,
+    Demo,
+    Research,
+    Test,
+}
+
+impl RunKindArg {
+    fn value(self) -> RunKind {
+        match self {
+            Self::Production => RunKind::Production,
+            Self::Demo => RunKind::Demo,
+            Self::Research => RunKind::ResearchFixture,
+            Self::Test => RunKind::Test,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -205,6 +301,13 @@ enum InitTemplate {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum InitPreset {
     Extraction,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GuidedGateMode {
+    Advisory,
+    Regression,
+    Release,
 }
 
 #[tokio::main]
@@ -247,6 +350,15 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             path,
             template,
             preset,
+            from_outputs,
+            dataset,
+            baseline,
+            candidate,
+            schema,
+            correctness_pointer,
+            exact_json,
+            gate_mode,
+            min_cases,
         } => {
             let destination = path.as_ref().map_or_else(
                 || cli.project_root.clone(),
@@ -258,12 +370,34 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                     }
                 },
             );
-            let created = match preset {
-                Some(InitPreset::Extraction) => initialize::initialize_extraction(&destination)?,
-                None => initialize::initialize(
-                    &destination,
-                    template.unwrap_or(InitTemplate::Recorded),
-                )?,
+            let created = if *from_outputs {
+                initialize::initialize_from_outputs(initialize::FromOutputsOptions {
+                    destination: &destination,
+                    dataset: &required_init_path(&cli.project_root, dataset, "--dataset")?,
+                    baseline: &required_init_path(&cli.project_root, baseline, "--baseline")?,
+                    candidate: &required_init_path(&cli.project_root, candidate, "--candidate")?,
+                    schema: &required_init_path(&cli.project_root, schema, "--schema")?,
+                    correctness_pointers: correctness_pointer,
+                    exact_json: *exact_json,
+                    gate_mode: match gate_mode {
+                        GuidedGateMode::Advisory => structtrace_core::config::GateMode::Advisory,
+                        GuidedGateMode::Regression => {
+                            structtrace_core::config::GateMode::Regression
+                        }
+                        GuidedGateMode::Release => structtrace_core::config::GateMode::Release,
+                    },
+                    min_cases: *min_cases,
+                })?
+            } else {
+                match preset {
+                    Some(InitPreset::Extraction) => {
+                        initialize::initialize_extraction(&destination)?
+                    }
+                    None => initialize::initialize(
+                        &destination,
+                        template.unwrap_or(InitTemplate::Recorded),
+                    )?,
+                }
             };
             if !cli.quiet {
                 match cli.format {
@@ -297,14 +431,16 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                         "Research index (no pooled effect): {}",
                         research.index_path.display()
                     );
-                    if *open {
-                        if let Err(error) = open::that(&research.index_path) {
-                            eprintln!(
-                                "warning: could not open the research index ({error}); open {} manually",
-                                research.index_path.display()
-                            );
-                        }
-                    }
+                }
+                if *open {
+                    let studies = research
+                        .studies
+                        .iter()
+                        .zip(&research.runs)
+                        .map(|((id, _), run)| (id.clone(), run.run_dir.clone()))
+                        .collect::<Vec<_>>();
+                    structtrace_report::serve_research(&research.index_path, &studies, true)
+                        .await?;
                 }
                 return Ok(0);
             }
@@ -524,8 +660,228 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             })
         }
         Commands::Inspect { schema } => inspect_schema(cli, schema),
-        Commands::Doctor { strict, dry_run } => doctor(cli, *strict, *dry_run).await,
+        Commands::Doctor {
+            strict,
+            handshake,
+            execute_cases,
+        } => doctor(cli, *strict, *handshake, *execute_cases).await,
+        Commands::Runs { command } => manage_runs(cli, command),
     }
+}
+
+fn manage_runs(cli: &Cli, command: &RunsCommand) -> anyhow::Result<u8> {
+    match command {
+        RunsCommand::List => {
+            let manifests = local_run_manifests(cli)?;
+            if !cli.quiet {
+                match cli.format {
+                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&manifests)?),
+                    _ => {
+                        println!(
+                            "RUN ID                       KIND              STATUS       PROJECT"
+                        );
+                        for manifest in manifests {
+                            println!(
+                                "{:<28} {:<17} {:<12} {}",
+                                manifest.run_id,
+                                run_kind_label(manifest.run_kind),
+                                format!("{:?}", manifest.status).to_ascii_lowercase(),
+                                manifest.project_name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        RunsCommand::Show { run } => {
+            let run_dir = resolve_run(cli, run)?;
+            let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+            if !cli.quiet {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            }
+        }
+        RunsCommand::Latest { kind } => {
+            let selector = match kind.value() {
+                RunKind::Production => "latest",
+                RunKind::Demo => "latest-demo",
+                RunKind::ResearchFixture => "latest-research",
+                RunKind::Test => "latest-test",
+            };
+            let run_dir = resolve_run(cli, selector)?;
+            let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+            if !cli.quiet {
+                match cli.format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({"run_id": manifest.run_id, "run_dir": run_dir})
+                    ),
+                    _ => println!("{}\t{}", manifest.run_id, run_dir.display()),
+                }
+            }
+        }
+        RunsCommand::Delete { run, yes } => {
+            let run_dir = resolve_run(cli, run)?;
+            let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+            anyhow::ensure!(
+                !matches!(
+                    manifest.status,
+                    RunStatus::Created
+                        | RunStatus::Validating
+                        | RunStatus::Running
+                        | RunStatus::Analyzing
+                ),
+                "run `{}` is active ({:?}) and cannot be deleted",
+                manifest.run_id,
+                manifest.status
+            );
+            ensure_safe_run_tree(cli, &run_dir)?;
+            if !yes {
+                eprint!(
+                    "Delete inactive run {} permanently? [y/N] ",
+                    manifest.run_id
+                );
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                anyhow::ensure!(
+                    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+                    "deletion cancelled"
+                );
+            }
+            std::fs::remove_dir_all(&run_dir)?;
+            if !cli.quiet {
+                println!("Deleted inactive run {}", manifest.run_id);
+            }
+        }
+        RunsCommand::Archive { run, destination } => {
+            let run_dir = resolve_run(cli, run)?;
+            ensure_complete(&run_dir)?;
+            ensure_safe_run_tree(cli, &run_dir)?;
+            verify_complete_manifest(&run_dir)?;
+            let destination = if destination.is_absolute() {
+                destination.clone()
+            } else {
+                cli.project_root.join(destination)
+            };
+            anyhow::ensure!(!destination.exists(), "archive destination already exists");
+            std::fs::create_dir(&destination)?;
+            let copied_root = destination.join("run");
+            std::fs::create_dir(&copied_root)?;
+            let mut hashes = std::collections::BTreeMap::new();
+            copy_verified_tree(&run_dir, &run_dir, &copied_root, &mut hashes)?;
+            let receipt = serde_json::json!({
+                "format_version": 1,
+                "run_id": run,
+                "hash_algorithm": "blake3",
+                "files": hashes,
+            });
+            std::fs::write(
+                destination.join("archive-verification.json"),
+                serde_json::to_vec_pretty(&receipt)?,
+            )?;
+            if !cli.quiet {
+                println!("Archived verified run to {}", destination.display());
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn local_run_manifests(cli: &Cli) -> anyhow::Result<Vec<RunManifest>> {
+    let runs = storage_root(cli)?.join("runs");
+    let mut manifests: Vec<RunManifest> = Vec::new();
+    for entry in std::fs::read_dir(&runs)
+        .with_context(|| format!("no StructTrace runs found under {}", runs.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("manifest.json");
+        if path.is_file() {
+            manifests.push(read_json(&path)?);
+        }
+    }
+    manifests.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+    Ok(manifests)
+}
+
+fn run_kind_label(kind: RunKind) -> &'static str {
+    match kind {
+        RunKind::Production => "production",
+        RunKind::Demo => "demo",
+        RunKind::ResearchFixture => "research",
+        RunKind::Test => "test",
+    }
+}
+
+fn ensure_safe_run_tree(cli: &Cli, run_dir: &Path) -> anyhow::Result<()> {
+    let root = storage_root(cli)?.canonicalize()?;
+    let runs = root.join("runs").canonicalize()?;
+    let canonical = run_dir.canonicalize()?;
+    anyhow::ensure!(
+        canonical.parent() == Some(runs.as_path()),
+        "run escaped storage root"
+    );
+    fn check(directory: &Path) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            anyhow::ensure!(!file_type.is_symlink(), "run contains a symbolic link");
+            if file_type.is_dir() {
+                check(&entry.path())?;
+            } else {
+                anyhow::ensure!(file_type.is_file(), "run contains a non-regular entry");
+            }
+        }
+        Ok(())
+    }
+    check(&canonical)
+}
+
+fn verify_complete_manifest(run_dir: &Path) -> anyhow::Result<()> {
+    let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
+    for relative in manifest.artifacts.keys() {
+        verify_manifest_artifact(run_dir, relative)?;
+    }
+    Ok(())
+}
+
+fn copy_verified_tree(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    hashes: &mut std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        anyhow::ensure!(
+            !file_type.is_symlink(),
+            "archive source contains a symbolic link"
+        );
+        let relative = entry.path().strip_prefix(source_root)?.to_owned();
+        let destination = destination_root.join(&relative);
+        if file_type.is_dir() {
+            std::fs::create_dir(&destination)?;
+            copy_verified_tree(source_root, &entry.path(), destination_root, hashes)?;
+        } else {
+            anyhow::ensure!(
+                file_type.is_file(),
+                "archive source contains a non-regular entry"
+            );
+            std::fs::copy(entry.path(), &destination)?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let source_hash = hash_file(&entry.path())?;
+            anyhow::ensure!(
+                source_hash == hash_file(&destination)?,
+                "archive copy mismatch"
+            );
+            hashes.insert(relative, source_hash);
+        }
+    }
+    Ok(())
 }
 
 fn inspect_schema(cli: &Cli, schema_path: &Path) -> anyhow::Result<u8> {
@@ -706,7 +1062,7 @@ fn gate(cli: &Cli, run_dir: &Path, verify: GateVerification) -> anyhow::Result<u
 }
 
 fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
-    println!("STRUCTTRACE RELEASE GATE: {}", summary.gate.status.label());
+    println!("STRUCTTRACE RELEASE GATE: {}", gate_headline(summary));
     println!(
         "{}",
         if summary.gate.deployment_authorized {
@@ -770,10 +1126,13 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
 }
 
 fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
-    let mut markdown = format!(
-        "## StructTrace release gate: {}",
-        summary.gate.status.label().to_ascii_lowercase()
-    );
+    let mut markdown = format!("## StructTrace release gate: {}", gate_headline(summary));
+    if !summary.gate.quality_failures.is_empty() {
+        markdown.push_str("\n\n**Quality thresholds failed.**");
+    }
+    if !summary.gate.evidence_failures.is_empty() {
+        markdown.push_str("\n\n**Evidence requirements are also insufficient.**");
+    }
     markdown.push_str("\n\n| Metric | Baseline | Candidate |\n|---|---:|---:|\n");
     markdown.push_str(&format!(
         "| Primary outcome | {:.1}% | {:.1}% |\n",
@@ -837,6 +1196,14 @@ fn print_github_gate(summary: &RunSummary) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gate_headline(summary: &RunSummary) -> String {
+    if !summary.gate.quality_failures.is_empty() && !summary.gate.evidence_failures.is_empty() {
+        "DO NOT DEPLOY: quality failed and evidence is insufficient".to_owned()
+    } else {
+        summary.gate.status.label().to_ascii_lowercase()
+    }
+}
+
 const fn gate_exit_code(status: GateStatus) -> u8 {
     match status {
         GateStatus::Passed => 0,
@@ -847,7 +1214,12 @@ const fn gate_exit_code(status: GateStatus) -> u8 {
     }
 }
 
-async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Result<u8> {
+async fn doctor(
+    cli: &Cli,
+    strict: bool,
+    handshake: bool,
+    execute_cases: Option<usize>,
+) -> anyhow::Result<u8> {
     let root = cli
         .project_root
         .canonicalize()
@@ -959,9 +1331,16 @@ async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Resu
                     }
                 }
                 let schema_path = resolve(&root, &config.schema.path);
-                match std::fs::read(&schema_path)
-                    .with_context(|| format!("could not read {}", schema_path.display()))
-                    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+                match structtrace_core::hashing::read_bounded(
+                    &schema_path,
+                    config.limits.max_schema_bytes,
+                    "schema",
+                )
+                    .map_err(anyhow::Error::from)
+                    .and_then(|bytes| {
+                        structtrace_core::strict_json::value_from_slice(&bytes)
+                            .map_err(anyhow::Error::from)
+                    })
                     .and_then(|schema| {
                         compile_schema(&schema)
                             .map(|_| schema)
@@ -1025,20 +1404,10 @@ async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Resu
                             passed &= exists;
                             checks.push(serde_json::json!({"check": format!("variant.{name}.executable"), "passed": exists, "detail": command.program}));
                         }
-                        VariantConfig::Python {
-                            interpreter,
-                            callable,
-                            ..
-                        } => {
+                        VariantConfig::Python { interpreter, .. } => {
                             let exists = executable_exists(&root, interpreter);
                             passed &= exists;
                             checks.push(serde_json::json!({"check": format!("variant.{name}.python"), "passed": exists, "detail": interpreter}));
-                            if strict && exists {
-                                let importable =
-                                    python_callable_imports(&root, interpreter, callable);
-                                passed &= importable;
-                                checks.push(serde_json::json!({"check": format!("variant.{name}.callable"), "passed": importable, "detail": callable}));
-                            }
                         }
                         VariantConfig::OpenaiCompatible(adapter) => {
                             let present = adapter
@@ -1073,7 +1442,8 @@ async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Resu
                                         .map_err(Into::into)
                                     })
                                     .and_then(|bytes| {
-                                        serde_json::from_slice(&bytes).map_err(Into::into)
+                                        structtrace_core::strict_json::value_from_slice(&bytes)
+                                            .map_err(Into::into)
                                     })
                                     .and_then(|schema| {
                                         compile_schema(&schema).map(|_| ()).map_err(Into::into)
@@ -1086,32 +1456,19 @@ async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Resu
                     }
                 }
                 for evaluator in &config.evaluators {
-                    let (program, kind, callable) = match &evaluator.kind {
+                    let (program, kind) = match &evaluator.kind {
                         structtrace_core::config::EvaluatorKind::Command { command, .. } => {
-                            (Some(command.program.as_str()), "executable", None)
+                            (Some(command.program.as_str()), "executable")
                         }
-                        structtrace_core::config::EvaluatorKind::Python {
-                            interpreter,
-                            callable,
-                            ..
-                        } => (
-                            Some(interpreter.as_str()),
-                            "python",
-                            Some(callable.as_str()),
-                        ),
-                        _ => (None, "builtin", None),
+                        structtrace_core::config::EvaluatorKind::Python { interpreter, .. } => {
+                            (Some(interpreter.as_str()), "python")
+                        }
+                        _ => (None, "builtin"),
                     };
                     if let Some(program) = program {
                         let exists = executable_exists(&root, program);
                         passed &= exists;
                         checks.push(serde_json::json!({"check": format!("evaluator.{}.{}", evaluator.id, kind), "passed": exists, "detail": program}));
-                        if strict && exists {
-                            if let Some(callable) = callable {
-                                let importable = python_callable_imports(&root, program, callable);
-                                passed &= importable;
-                                checks.push(serde_json::json!({"check": format!("evaluator.{}.callable", evaluator.id), "passed": importable, "detail": callable}));
-                            }
-                        }
                     }
                 }
                 checks.push(serde_json::json!({
@@ -1121,23 +1478,47 @@ async fn doctor(cli: &Cli, strict: bool, dry_run: Option<usize>) -> anyhow::Resu
                     "status": "not_checked",
                     "detail": "Browser launch is optional; reports can always be opened or exported by path."
                 }));
-                if let Some(case_count) = dry_run {
-                    anyhow::ensure!(case_count > 0, "--dry-run requires at least one case");
+                if config.storage.process_logs.mode
+                    == structtrace_core::config::ProcessLogMode::FullSensitive
+                {
+                    checks.push(serde_json::json!({
+                        "check": "full_sensitive_process_logs",
+                        "passed": false,
+                        "required": false,
+                        "status": "warning",
+                        "detail": "Process logs may contain secrets because full_sensitive retention is explicitly enabled."
+                    }));
+                }
+                if handshake {
+                    let handshake_checks = local_worker_static_handshake(&root, &config)?;
+                    for check in handshake_checks {
+                        passed &= check["passed"].as_bool() == Some(true);
+                        checks.push(check);
+                    }
+                }
+                if let Some(case_count) = execute_cases {
+                    anyhow::ensure!(case_count > 0, "--execute-cases requires at least one case");
+                    checks.push(serde_json::json!({
+                        "check": "execute_cases_side_effect_warning",
+                        "passed": true,
+                        "required": true,
+                        "detail": "Explicit opt-in accepted: configured user code is being executed and may make network calls or cause side effects. OpenAI-compatible endpoints remain excluded."
+                    }));
                     if let Some(dataset) = loaded_dataset.as_ref() {
-                        let handshake =
+                        let executed =
                             local_worker_handshake(&root, &config, dataset, case_count).await?;
-                        for check in handshake {
+                        for check in executed {
                             passed &= check["passed"].as_bool() == Some(true);
                             checks.push(check);
                         }
                     }
-                } else {
+                } else if !handshake {
                     checks.push(serde_json::json!({
                         "check": "one_case_adapter_handshake",
                         "passed": null,
                         "required": false,
                         "status": "not_checked",
-                        "detail": "Use --strict --dry-run 1 to execute local command, Python, and external-evaluator protocol handshakes. Network providers are never contacted by doctor."
+                        "detail": "Strict doctor is static only. Use --strict --handshake to import Python workers without cases, or --strict --execute-cases 1 to deliberately execute local user code. Network providers are never contacted by doctor."
                     }));
                 }
             }
@@ -1230,8 +1611,8 @@ async fn local_worker_handshake(
     };
     let runtime_root = resolve(root, &config.storage.root).join("runtime");
     std::fs::create_dir_all(&runtime_root)?;
-    let python_bridge = runtime_root.join("doctor-python-bridge-v2.py");
-    let evaluator_bridge = runtime_root.join("doctor-evaluator-bridge-v2.py");
+    let python_bridge = runtime_root.join("doctor-python-bridge-v3.py");
+    let evaluator_bridge = runtime_root.join("doctor-evaluator-bridge-v3.py");
     std::fs::write(&python_bridge, BRIDGE_SOURCE)?;
     std::fs::write(&evaluator_bridge, EVALUATOR_BRIDGE_SOURCE)?;
     let mut checks = Vec::new();
@@ -1349,16 +1730,76 @@ async fn local_worker_handshake(
     Ok(checks)
 }
 
-fn python_callable_imports(root: &Path, interpreter: &str, callable: &str) -> bool {
-    std::process::Command::new(interpreter)
-        .args([
-            "-c",
-            "import importlib,sys; m,n=sys.argv[1].split(':',1); assert callable(getattr(importlib.import_module(m),n))",
+fn local_worker_static_handshake(
+    root: &Path,
+    config: &Config,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let runtime_root = resolve(root, &config.storage.root).join("runtime");
+    std::fs::create_dir_all(&runtime_root)?;
+    let python_bridge = runtime_root.join("doctor-python-bridge-v3.py");
+    let evaluator_bridge = runtime_root.join("doctor-evaluator-bridge-v3.py");
+    std::fs::write(&python_bridge, BRIDGE_SOURCE)?;
+    std::fs::write(&evaluator_bridge, EVALUATOR_BRIDGE_SOURCE)?;
+    let mut checks = Vec::new();
+    for (name, variant) in &config.variants {
+        if let VariantConfig::Python {
+            interpreter,
             callable,
-        ])
-        .current_dir(root)
-        .status()
-        .is_ok_and(|status| status.success())
+            ..
+        } = variant
+        {
+            let passed = std::process::Command::new(interpreter)
+                .args([
+                    python_bridge.as_os_str(),
+                    std::ffi::OsStr::new("--callable"),
+                    std::ffi::OsStr::new(callable),
+                    std::ffi::OsStr::new("--check"),
+                ])
+                .current_dir(root)
+                .status()
+                .is_ok_and(|status| status.success());
+            checks.push(serde_json::json!({
+                "check": format!("variant.{name}.python_handshake"),
+                "passed": passed,
+                "required": true,
+                "detail": {"callable": callable, "business_cases_executed": 0}
+            }));
+        }
+    }
+    for evaluator in &config.evaluators {
+        if let structtrace_core::config::EvaluatorKind::Python {
+            interpreter,
+            callable,
+            ..
+        } = &evaluator.kind
+        {
+            let passed = std::process::Command::new(interpreter)
+                .args([
+                    evaluator_bridge.as_os_str(),
+                    std::ffi::OsStr::new("--callable"),
+                    std::ffi::OsStr::new(callable),
+                    std::ffi::OsStr::new("--check"),
+                ])
+                .current_dir(root)
+                .status()
+                .is_ok_and(|status| status.success());
+            checks.push(serde_json::json!({
+                "check": format!("evaluator.{}.python_handshake", evaluator.id),
+                "passed": passed,
+                "required": true,
+                "detail": {"callable": callable, "business_cases_executed": 0}
+            }));
+        }
+    }
+    if checks.is_empty() {
+        checks.push(serde_json::json!({
+            "check": "local_worker_handshake",
+            "passed": true,
+            "required": true,
+            "detail": "No Python worker is configured; command workers remain statically checked because their v3 protocol has no side-effect-free startup request."
+        }));
+    }
+    Ok(checks)
 }
 
 fn json_contains(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
@@ -1492,25 +1933,34 @@ fn executable_exists(project_root: &Path, program: &str) -> bool {
 }
 
 fn resolve_run(cli: &Cli, selector: &str) -> anyhow::Result<PathBuf> {
-    let root = cli
-        .project_root
-        .canonicalize()
-        .with_context(|| format!("project root {} does not exist", cli.project_root.display()))?;
-    let config_path = resolve(&root, &cli.config);
-    let storage = if config_path.is_file() {
-        resolve(&root, &Config::load(&config_path)?.storage.root)
-    } else {
-        root.join(".structtrace")
-    };
+    if let Some(run_dir) = &cli.run_dir {
+        anyhow::ensure!(
+            matches!(selector, "latest" | "latest-any"),
+            "--run-dir cannot be combined with an explicit run selector"
+        );
+        let path = if run_dir.is_absolute() {
+            run_dir.clone()
+        } else {
+            cli.project_root.join(run_dir)
+        };
+        anyhow::ensure!(path.is_dir(), "explicit run directory does not exist");
+        anyhow::ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "explicit run directory must not be a symlink"
+        );
+        return Ok(path.canonicalize()?);
+    }
+    let storage = storage_root(cli)?;
     let runs = storage.join("runs");
     if matches!(
         selector,
-        "latest" | "latest-any" | "latest-demo" | "latest-research"
+        "latest" | "latest-any" | "latest-demo" | "latest-research" | "latest-test"
     ) {
         let required_kind = match selector {
             "latest" => Some(RunKind::Production),
             "latest-demo" => Some(RunKind::Demo),
             "latest-research" => Some(RunKind::ResearchFixture),
+            "latest-test" => Some(RunKind::Test),
             _ => None,
         };
         let require_complete = selector != "latest-any";
@@ -1550,6 +2000,22 @@ fn resolve_run(cli: &Cli, selector: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+fn storage_root(cli: &Cli) -> anyhow::Result<PathBuf> {
+    let root = cli
+        .project_root
+        .canonicalize()
+        .with_context(|| format!("project root {} does not exist", cli.project_root.display()))?;
+    if let Some(storage) = &cli.storage_root {
+        return Ok(resolve(&root, storage));
+    }
+    let config_path = resolve(&root, &cli.config);
+    Ok(if config_path.is_file() {
+        resolve(&root, &Config::load(&config_path)?.storage.root)
+    } else {
+        root.join(".structtrace")
+    })
+}
+
 fn ensure_complete(run_dir: &Path) -> anyhow::Result<()> {
     let manifest: RunManifest = read_json(&run_dir.join("manifest.json"))?;
     anyhow::ensure!(
@@ -1567,12 +2033,26 @@ fn verify_manifest_artifact(run_dir: &Path, relative: &str) -> anyhow::Result<()
         .artifacts
         .get(relative)
         .with_context(|| format!("manifest does not bind required artifact `{relative}`"))?;
-    let path = run_dir.join(relative);
+    let relative_path = Path::new(relative);
     anyhow::ensure!(
-        !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
-        "artifact `{relative}` must not be a symbolic link"
+        !relative_path.is_absolute()
+            && relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "manifest contains unsafe artifact path `{relative}`"
     );
     let canonical_root = run_dir.canonicalize()?;
+    let mut path = canonical_root.clone();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(component) = component else {
+            unreachable!()
+        };
+        path.push(component);
+        anyhow::ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "artifact `{relative}` contains a symbolic link"
+        );
+    }
     anyhow::ensure!(
         path.canonicalize()?.starts_with(canonical_root),
         "artifact `{relative}` escaped the run directory"
@@ -1588,7 +2068,8 @@ fn verify_manifest_artifact(run_dir: &Path, relative: &str) -> anyhow::Result<()
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes =
         std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+    structtrace_core::strict_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 fn resolve(root: &Path, path: &Path) -> PathBuf {
@@ -1597,6 +2078,17 @@ fn resolve(root: &Path, path: &Path) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+fn required_init_path(root: &Path, path: &Option<PathBuf>, flag: &str) -> anyhow::Result<PathBuf> {
+    let path = path
+        .as_ref()
+        .with_context(|| format!("{flag} is required with --from-outputs"))?;
+    Ok(if path.is_absolute() {
+        path.clone()
+    } else {
+        root.join(path)
+    })
 }
 
 fn percent(count: usize, total: usize) -> f64 {

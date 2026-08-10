@@ -14,6 +14,7 @@ this file is not treated as machine evidence.
 | Installed command surface | installed `structtrace --help` and offline `structtrace doctor --format json` passed |
 | Support-ticket demo | installed binary reproduced baseline 10/12 and candidate 8/12 |
 | Normalized research fixtures | installed binary created three separate per-study runs with exact Qwen, Llama, and tool-call matrices plus a non-inferential index; no pooled gate or effect is produced |
+| Protected research portal | the non-inferential index and all three verified study reports share one random capability-protected loopback server; the index contains only relative study links and no `file://` URL |
 | Research-fixture replay | each separate run had zero artifact, cross-artifact, row-score, and summary mismatches |
 | Recorded workflow | real-binary init, run, bounded report export, aggregate-only share export, insufficient-evidence exit 12, and replay passed |
 | CI gate output | real-binary GitHub mode appended a Markdown metrics table to `$GITHUB_STEP_SUMMARY` and emitted rule annotations |
@@ -31,6 +32,12 @@ this file is not treated as machine evidence.
 | Forced resume | process killed during candidate; resumed ULID reused baseline exactly once and replayed with zero mismatches |
 | Failed lifecycle | an error after run allocation records a failure event and leaves durable state `failed`, never `complete` |
 | Multi-state gate | empty gates are not configured; evaluator errors, low coverage, not-applicable rows, unscored rows, and small samples cannot authorize deployment |
+| Gate intent | advisory never authorizes; regression requires complete evidence safeguards and a relative semantic rule; release additionally requires an absolute semantic floor and is the only authorizing mode |
+| Outcome health | composed logical truth and required-component health are stored separately; mixed failure plus error/not-applicable states remain visible and block fully evaluated evidence |
+| Strict JSON | one recursive parser rejects duplicate keys in datasets, recorded and raw outputs, worker protocols, evaluator responses, provider envelopes, and replayed artifacts |
+| Process logs | default retention is off; sanitized logs redact configured literals and header-shaped values under one total budget; truncation is marked and share exports omit logs |
+| Run management | kind-aware list/show/latest, inactive-run deletion with confirmation and symlink confinement, and hash-receipted directory archives are available |
+| Guided recorded onboarding | `init --from-outputs` validates and snapshots all four inputs, requires explicit exact-object or JSON-Pointer correctness semantics, emits a complete gate mode, and produces a runtime-valid project |
 | Example projects | recorded, Python, command, document extraction, and tool-selection/argument fixtures ran through the shared scoring path |
 | Invoice hero workflow | 12 nested invoices produced 9/12 versus 9/12 with six discordances, schema validity 10/12 versus 12/12, valid-but-wrong 1 versus 3, and an insufficient-evidence gate |
 | Evidence independence | singleton, exact-duplicate, repeated-trial and label-conflict groups are explicit; raw formatting and retention do not define scored equality; repeated trials cannot select an arbitrary representative and block independent inference |

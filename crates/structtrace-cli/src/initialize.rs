@@ -3,6 +3,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use serde_json::json;
+use structtrace_core::{
+    config::{Config, DatasetFields, GateMode, LimitsConfig},
+    dataset::Dataset,
+    evaluation::compile_schema,
+    output::RecordedOutputs,
+};
 
 use crate::InitTemplate;
 
@@ -16,7 +23,192 @@ const EXTRACTION_BASELINE: &str =
     include_str!("../../../examples/document-extraction/outputs/baseline.jsonl");
 const EXTRACTION_CANDIDATE: &str =
     include_str!("../../../examples/document-extraction/outputs/candidate.jsonl");
-const EXTRACTION_README: &str = include_str!("../../../examples/document-extraction/README.md");
+
+/// Explicit inputs for guided recorded-output onboarding.
+pub struct FromOutputsOptions<'a> {
+    pub destination: &'a Path,
+    pub dataset: &'a Path,
+    pub baseline: &'a Path,
+    pub candidate: &'a Path,
+    pub schema: &'a Path,
+    pub correctness_pointers: &'a [String],
+    pub exact_json: bool,
+    pub gate_mode: GateMode,
+    pub min_cases: usize,
+}
+
+/// Validate existing artifacts and create a complete recorded-output project.
+pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(options.min_cases > 0, "--min-cases must be at least one");
+    anyhow::ensure!(
+        options.exact_json || !options.correctness_pointers.is_empty(),
+        "choose semantics explicitly with --exact-json or one or more --correctness-pointer values"
+    );
+    let limits = LimitsConfig::default();
+    let fields = DatasetFields::default();
+    let dataset = Dataset::read_bounded(options.dataset, &fields, &limits)?;
+    let baseline = RecordedOutputs::read_bounded(options.baseline, &dataset, &limits)?;
+    let candidate = RecordedOutputs::read_bounded(options.candidate, &dataset, &limits)?;
+    let schema_bytes =
+        structtrace_core::hashing::read_bounded(options.schema, limits.max_schema_bytes, "schema")?;
+    let schema = structtrace_core::strict_json::value_from_slice(&schema_bytes)?;
+    compile_schema(&schema)?;
+
+    let discovered = candidate_pointers(&candidate)?;
+    for pointer in options.correctness_pointers {
+        anyhow::ensure!(
+            discovered.contains(pointer),
+            "correctness pointer `{pointer}` was not present in any successful candidate output; available pointers: {}",
+            discovered.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    let project_name = options
+        .destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("recorded-output-comparison");
+    let evaluator = if options.exact_json {
+        json!({"id": "semantic_correctness", "kind": "exact_json"})
+    } else {
+        json!({
+            "id": "semantic_correctness",
+            "kind": "json_pointers_exact",
+            "pointers": options.correctness_pointers.iter().map(|pointer| {
+                json!({"pointer": pointer, "expected_pointer": pointer})
+            }).collect::<Vec<_>>()
+        })
+    };
+    let gate = match options.gate_mode {
+        GateMode::Advisory => json!({"mode": "advisory", "min_cases": options.min_cases}),
+        GateMode::Regression | GateMode::Release => {
+            let mut gate = json!({
+                "mode": if options.gate_mode == GateMode::Release {"release"} else {"regression"},
+                "min_cases": options.min_cases,
+                "min_unique_cases": options.min_cases,
+                "max_duplicate_case_rate": 0.01,
+                "min_primary_fully_evaluated_rate": 0.99,
+                "max_primary_component_error_rate": 0.01,
+                "max_primary_component_not_applicable_rate": 0.0,
+                "max_primary_component_unscored_rate": 0.0,
+                "max_primary_regression_pp": 0.0
+            });
+            if options.gate_mode == GateMode::Release {
+                gate["min_candidate_primary_success_rate"] = json!(0.95);
+            }
+            gate
+        }
+    };
+    let value = json!({
+        "version": 2,
+        "project": {"name": project_name, "description": "Recorded baseline and candidate comparison with user-selected correctness semantics"},
+        "storage": {"root": ".structtrace", "process_logs": {"mode": "off"}},
+        "dataset": {"path": "data/golden.jsonl", "format": "jsonl"},
+        "schema": {"path": "schemas/output.schema.json"},
+        "variants": {
+            "baseline": {"kind": "recorded", "path": "outputs/baseline.jsonl"},
+            "candidate": {"kind": "recorded", "path": "outputs/candidate.jsonl"}
+        },
+        "evaluators": [evaluator],
+        "outcomes": {"correct": {"all_of": ["semantic_correctness"]}},
+        "analysis": {"primary_outcome": "correct"},
+        "gate": gate
+    });
+    let config: Config = serde_json::from_value(value)?;
+    Config::validate(config.clone())?;
+    let yaml = serde_yaml_ng::to_string(&config)?;
+
+    for relative in [
+        "structtrace.yaml",
+        "data/golden.jsonl",
+        "schemas/output.schema.json",
+        "outputs/baseline.jsonl",
+        "outputs/candidate.jsonl",
+        "README.md",
+        ".gitignore",
+    ] {
+        anyhow::ensure!(
+            !options.destination.join(relative).exists(),
+            "refusing to overwrite {}",
+            options.destination.join(relative).display()
+        );
+    }
+    write_new_bytes(
+        &options.destination.join("data/golden.jsonl"),
+        &dataset.source_bytes,
+    )?;
+    write_new_bytes(
+        &options.destination.join("outputs/baseline.jsonl"),
+        &baseline.source_bytes,
+    )?;
+    write_new_bytes(
+        &options.destination.join("outputs/candidate.jsonl"),
+        &candidate.source_bytes,
+    )?;
+    write_new_bytes(
+        &options.destination.join("schemas/output.schema.json"),
+        &schema_bytes,
+    )?;
+    write_new(&options.destination.join("structtrace.yaml"), &yaml)?;
+    write_new(
+        &options.destination.join("README.md"),
+        &format!(
+            "# {project_name}\n\nRecorded StructTrace comparison generated from validated artifacts. Correctness semantics were selected explicitly; inspect `structtrace.yaml` before using the gate.\n\n```bash\nstructtrace doctor --strict\nstructtrace run\nstructtrace report latest --open\nstructtrace gate latest\nstructtrace replay latest\n```\n"
+        ),
+    )?;
+    write_new(&options.destination.join(".gitignore"), ".structtrace/\n")?;
+    Config::load(&options.destination.join("structtrace.yaml"))?;
+    options.destination.canonicalize().with_context(|| {
+        format!(
+            "could not resolve initialized project {}",
+            options.destination.display()
+        )
+    })
+}
+
+fn candidate_pointers(
+    outputs: &RecordedOutputs,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    fn visit(
+        value: &serde_json::Value,
+        path: &str,
+        output: &mut std::collections::BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    visit(value, &format!("{path}/{key}"), output);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}/{index}"), output);
+                }
+            }
+            _ => {
+                output.insert(path.to_owned());
+            }
+        }
+    }
+    let mut pointers = std::collections::BTreeSet::new();
+    for row in &outputs.rows {
+        if let Some(source) = row.parse_source() {
+            let value = structtrace_core::strict_json::value_from_str(&source)?;
+            visit(&value, "", &mut pointers);
+        }
+    }
+    Ok(pointers)
+}
+
+fn write_new_bytes(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(!path.exists(), "refusing to overwrite {}", path.display());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("could not create {}", path.display()))
+}
 
 /// Materialize one complete integration template.
 pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<PathBuf> {
@@ -101,13 +293,24 @@ pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<
 
 /// Materialize the production-shaped invoice extraction preset.
 pub fn initialize_extraction(destination: &Path) -> anyhow::Result<PathBuf> {
+    let project_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("invoice-extraction-project");
+    let extraction_config = EXTRACTION_CONFIG.replacen(
+        "name: invoice-extraction-migration",
+        &format!("name: {project_name}"),
+        1,
+    );
+    let extraction_readme = extraction_readme(project_name);
     let files = [
-        ("structtrace.yaml", EXTRACTION_CONFIG),
+        ("structtrace.yaml", extraction_config.as_str()),
         ("schemas/output.schema.json", EXTRACTION_SCHEMA),
         ("data/golden.jsonl", EXTRACTION_DATASET),
         ("outputs/baseline.jsonl", EXTRACTION_BASELINE),
         ("outputs/candidate.jsonl", EXTRACTION_CANDIDATE),
-        ("README.md", EXTRACTION_README),
+        ("README.md", extraction_readme.as_str()),
         (".gitignore", ".structtrace/\n"),
     ];
     let conflicts = files
@@ -183,7 +386,6 @@ fn configuration(project_name: &str, template: InitTemplate) -> String {
         InitTemplate::OpenaiCompatible => r#"  baseline:
     kind: openai_compatible
     base_url: http://127.0.0.1:8000/v1
-    api_key_env: LOCAL_LLM_API_KEY
     model: baseline-model
     request:
       system: Return only the required structured object.
@@ -198,7 +400,6 @@ fn configuration(project_name: &str, template: InitTemplate) -> String {
   candidate:
     kind: openai_compatible
     base_url: http://127.0.0.1:8000/v1
-    api_key_env: LOCAL_LLM_API_KEY
     model: candidate-model
     request:
       system: Return only the required structured object.
@@ -213,7 +414,7 @@ fn configuration(project_name: &str, template: InitTemplate) -> String {
             .to_owned(),
     };
     format!(
-        r#"version: 1
+        r#"version: 2
 
 project:
   name: {project_name}
@@ -264,13 +465,14 @@ analysis:
 
 gate:
   # The generated two-case fixture is a demonstration, not release evidence.
+  mode: regression
   min_cases: 100
   min_unique_cases: 100
   max_duplicate_case_rate: 0.01
-  min_primary_scored_rate: 0.99
-  max_primary_evaluator_error_rate: 0.01
-  max_primary_not_applicable_rate: 0.0
-  max_primary_unscored_rate: 0.0
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.01
+  max_primary_component_not_applicable_rate: 0.0
+  max_primary_component_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
   max_valid_but_wrong_increase_pp: 0.5
   min_candidate_schema_validity: 1.0
@@ -280,13 +482,43 @@ gate:
 
 fn readme(project_name: &str, template: InitTemplate) -> String {
     format!(
-        "# {project_name}\n\nStructTrace paired regression project using the `{}` integration.\n\n```bash\nstructtrace doctor --strict\nstructtrace run\nstructtrace report latest --open\nstructtrace gate latest\n```\n",
+        "# {project_name}\n\nStructTrace paired regression project using the `{}` integration. The generated fixture contains two cases and is not release evidence.\n\n```bash\nstructtrace doctor --strict\nstructtrace run\nstructtrace report latest --open\nstructtrace gate latest\nstructtrace replay latest\n```\n",
         match template {
             InitTemplate::Recorded => "recorded-output",
             InitTemplate::Python => "Python-callable",
             InitTemplate::Command => "command",
             InitTemplate::OpenaiCompatible => "OpenAI-compatible",
         }
+    )
+}
+
+fn extraction_readme(project_name: &str) -> String {
+    format!(
+        r#"# {project_name}
+
+This initialized project is a 12-case invoice-extraction regression fixture. It uses the installed
+`structtrace` binary and deterministic built-in evaluators.
+
+```bash
+structtrace doctor --strict
+structtrace run
+structtrace report latest --open
+structtrace gate latest
+structtrace replay latest
+```
+
+Expected fixture result:
+
+- 12 matched cases
+- baseline primary success: 9/12
+- candidate primary success: 9/12
+- six discordant cases
+- baseline schema validity: 10/12
+- candidate schema validity: 12/12
+- gate: `INSUFFICIENT EVIDENCE`, because 12 cases do not meet the configured 100-case evidence floor
+
+The fixture demonstrates diagnosis and replay. It does not authorize deployment.
+"#
     )
 }
 
@@ -341,7 +573,7 @@ for line in sys.stdin:
         label = "accepted"
     response = {
         "protocol": "structtrace.variant",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "case_id": request["case_id"],
         "status": "ok",
         "output": {"label": label, "reason": f"{args.variant} deterministic example."},
@@ -351,9 +583,9 @@ for line in sys.stdin:
 
 const OPENAI_NOTES: &str = r#"# OpenAI-compatible example
 
-Set `LOCAL_LLM_API_KEY` and edit the endpoint and model names in
-`structtrace.yaml`. StructTrace sends requests only when `structtrace run` is
-explicitly invoked. `structtrace doctor` does not call the endpoint.
+Edit the localhost endpoint and model names in `structtrace.yaml`. The generated template is
+unauthenticated; add `api_key_env` only when your endpoint requires it. StructTrace sends requests
+only when `structtrace run` is explicitly invoked. `structtrace doctor` does not call the endpoint.
 "#;
 
 #[cfg(test)]
@@ -393,6 +625,35 @@ mod tests {
             structtrace_engine::run_recorded(&project, Path::new("structtrace.yaml")).unwrap();
         assert_eq!(run.summary.baseline.total, 12);
         assert_eq!(run.summary.field_hotspots[0].pointer, "/total");
+    }
+
+    #[test]
+    fn init_from_outputs_generates_valid_config() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let project = root.path().join("guided");
+        initialize(&source, InitTemplate::Recorded).unwrap();
+        initialize_from_outputs(FromOutputsOptions {
+            destination: &project,
+            dataset: &source.join("data/golden.jsonl"),
+            baseline: &source.join("outputs/baseline.jsonl"),
+            candidate: &source.join("outputs/candidate.jsonl"),
+            schema: &source.join("schemas/output.schema.json"),
+            correctness_pointers: &["/label".to_owned()],
+            exact_json: false,
+            gate_mode: GateMode::Regression,
+            min_cases: 100,
+        })
+        .unwrap();
+        Config::load(&project.join("structtrace.yaml")).unwrap();
+        let run =
+            structtrace_engine::run_recorded(&project, Path::new("structtrace.yaml")).unwrap();
+        assert_eq!(run.summary.baseline.primary_pass, 2);
+        assert_eq!(run.summary.candidate.primary_pass, 1);
+        assert_eq!(
+            run.summary.gate.status,
+            structtrace_core::gate::GateStatus::InsufficientEvidence
+        );
     }
 
     #[test]

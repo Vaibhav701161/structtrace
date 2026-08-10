@@ -28,7 +28,7 @@ use structtrace_core::{
     config::{Config, EvaluatorKind, EvidenceUnitConfig, VariantConfig},
     dataset::Dataset,
     evaluation::{
-        EvaluationStatus, EvaluatorResult, OutcomeStatus, compile_schema,
+        EvaluationStatus, EvaluatorResult, OutcomeResult, OutcomeStatus, compile_schema,
         evaluate_case_with_external,
     },
     gate::{GateInputs, evaluate_gate},
@@ -382,32 +382,33 @@ pub fn finalize_prepared_for_run(
         &run_dir.join("inputs/candidate.jsonl"),
         &candidate.source_bytes,
     )?;
-    if !baseline.stderr.is_empty() {
-        atomic_write(&run_dir.join("logs/baseline.stderr.log"), &baseline.stderr)?;
+    let mut process_log_budget = config.storage.process_logs.max_total_bytes;
+    if let Some(log) =
+        crate::process_logs::retain(&config, &baseline.stderr, &mut process_log_budget)
+    {
+        atomic_write(&run_dir.join("logs/baseline.stderr.log"), &log)?;
     }
-    if !candidate.stderr.is_empty() {
-        atomic_write(
-            &run_dir.join("logs/candidate.stderr.log"),
-            &candidate.stderr,
-        )?;
+    if let Some(log) =
+        crate::process_logs::retain(&config, &candidate.stderr, &mut process_log_budget)
+    {
+        atomic_write(&run_dir.join("logs/candidate.stderr.log"), &log)?;
     }
     if !baseline.protocol_errors.is_empty() {
-        atomic_write_json(
-            &run_dir.join("logs/baseline.protocol-errors.json"),
-            &baseline.protocol_errors,
-        )?;
+        let bytes = serde_json::to_vec_pretty(&baseline.protocol_errors)?;
+        if let Some(log) = crate::process_logs::retain(&config, &bytes, &mut process_log_budget) {
+            atomic_write(&run_dir.join("logs/baseline.protocol-errors.json"), &log)?;
+        }
     }
     if !candidate.protocol_errors.is_empty() {
-        atomic_write_json(
-            &run_dir.join("logs/candidate.protocol-errors.json"),
-            &candidate.protocol_errors,
-        )?;
+        let bytes = serde_json::to_vec_pretty(&candidate.protocol_errors)?;
+        if let Some(log) = crate::process_logs::retain(&config, &bytes, &mut process_log_budget) {
+            atomic_write(&run_dir.join("logs/candidate.protocol-errors.json"), &log)?;
+        }
     }
-    if !evaluator_stderr.is_empty() {
-        atomic_write(
-            &run_dir.join("logs/evaluators.stderr.log"),
-            &evaluator_stderr,
-        )?;
+    if let Some(log) =
+        crate::process_logs::retain(&config, &evaluator_stderr, &mut process_log_budget)
+    {
+        atomic_write(&run_dir.join("logs/evaluators.stderr.log"), &log)?;
     }
     if !evaluator_receipts.is_empty() {
         atomic_write_jsonl(
@@ -690,7 +691,7 @@ fn execute_external_evaluator_matrix(
 fn materialize_evaluator_bridge(storage_root: &Path) -> anyhow::Result<PathBuf> {
     let path = storage_root
         .join("runtime")
-        .join("python-evaluator-bridge-v2.py");
+        .join("python-evaluator-bridge-v3.py");
     let parent = path
         .parent()
         .context("evaluator bridge path has no parent")?;
@@ -974,27 +975,43 @@ pub(crate) fn build_summary(
             duplicate_case_rate: evidence.exact_duplicate_row_rate,
             repeated_trial_groups: evidence.repeated_trial_groups,
             label_conflict_groups: evidence.label_conflict_groups,
-            primary_scored_rate: rate(
-                jointly_scored_semantic.jointly_scored_cases,
-                evidence.effective_inference_units,
-            ),
-            primary_evaluator_error_rate: rate(
-                baseline.primary_error.max(candidate.primary_error),
-                evidence.effective_inference_units,
-            ),
-            primary_not_applicable_rate: rate(
+            primary_fully_evaluated_rate: rate(
                 baseline
-                    .primary_not_applicable
-                    .max(candidate.primary_not_applicable),
+                    .primary_fully_evaluated
+                    .min(candidate.primary_fully_evaluated),
                 evidence.effective_inference_units,
             ),
-            primary_unscored_rate: rate(
-                baseline.primary_unscored.max(candidate.primary_unscored),
-                evidence.effective_inference_units,
-            ),
+            primary_component_error_rate: rate(
+                baseline.primary_component_errors,
+                baseline.primary_required_components,
+            )
+            .max(rate(
+                candidate.primary_component_errors,
+                candidate.primary_required_components,
+            )),
+            primary_component_not_applicable_rate: rate(
+                baseline.primary_component_not_applicable,
+                baseline.primary_required_components,
+            )
+            .max(rate(
+                candidate.primary_component_not_applicable,
+                candidate.primary_required_components,
+            )),
+            primary_component_unscored_rate: rate(
+                baseline.primary_component_unscored,
+                baseline.primary_required_components,
+            )
+            .max(rate(
+                candidate.primary_component_unscored,
+                candidate.primary_required_components,
+            )),
             primary: &independent_paired,
             baseline_valid_but_wrong_rate: rate(baseline.valid_but_wrong, baseline.total),
             candidate_valid_but_wrong_rate: rate(candidate.valid_but_wrong, candidate.total),
+            candidate_primary_success_rate: rate(candidate.primary_pass, candidate.total),
+            candidate_parse_validity: rate(candidate.parse_valid, candidate.total),
+            primary_lower_confidence_bound_pp: (independent_bootstrap.samples > 0)
+                .then_some(independent_bootstrap.lower_pp),
             candidate_schema_validity: rate(candidate.schema_valid, candidate.total),
             candidate_error_rate: rate(candidate.errors, candidate.total),
             candidate_timeout_rate: rate(candidate.timeouts, candidate.total),
@@ -1309,16 +1326,16 @@ fn semantic_effect(
     })
 }
 
-fn binary_outcome(status: Option<&OutcomeStatus>) -> Option<bool> {
-    match status {
+fn binary_outcome(result: Option<&OutcomeResult>) -> Option<bool> {
+    match result.map(|result| result.truth) {
         Some(OutcomeStatus::True) => Some(true),
         Some(OutcomeStatus::False) => Some(false),
         _ => None,
     }
 }
 
-fn outcome_state(status: Option<&OutcomeStatus>) -> &'static str {
-    match status {
+fn outcome_state(result: Option<&OutcomeResult>) -> &'static str {
+    match result.map(|result| result.truth) {
         Some(OutcomeStatus::True) => "true",
         Some(OutcomeStatus::False) => "false",
         Some(OutcomeStatus::Error) => "error",
@@ -1423,7 +1440,8 @@ fn variant_summary(
         summary.parse_valid += usize::from(evaluation.parse_valid);
         summary.schema_valid += usize::from(evaluation.schema_valid);
         summary.primary_pass += usize::from(evaluation.primary_pass);
-        match evaluation.outcomes.get(primary_outcome) {
+        let primary_result = evaluation.outcomes.get(primary_outcome);
+        match primary_result.map(|result| result.truth) {
             Some(structtrace_core::evaluation::OutcomeStatus::True) => {}
             Some(structtrace_core::evaluation::OutcomeStatus::False) => summary.primary_failed += 1,
             Some(structtrace_core::evaluation::OutcomeStatus::Error) => summary.primary_error += 1,
@@ -1432,7 +1450,19 @@ fn variant_summary(
             }
             None => summary.primary_unscored += 1,
         }
+        if let Some(result) = primary_result {
+            summary.primary_fully_evaluated += usize::from(result.fully_evaluated);
+            summary.primary_required_components += result.required_components;
+            summary.primary_component_errors += result.error_components;
+            summary.primary_component_not_applicable += result.not_applicable_components;
+            summary.primary_component_unscored += result.unscored_components;
+        } else {
+            summary.primary_component_unscored += 1;
+            summary.primary_required_components += 1;
+        }
         summary.valid_but_wrong += usize::from(evaluation.valid_but_wrong);
+        summary.fully_evaluated_valid_but_wrong +=
+            usize::from(evaluation.fully_evaluated_valid_but_wrong);
         summary.errors += usize::from(output.status != OutputStatus::Ok);
         summary.timeouts += usize::from(
             output
@@ -1643,12 +1673,15 @@ fn evaluator_state_counts(
     counts
 }
 
-fn explicit_binary_outcome(status: Option<&OutcomeStatus>) -> bool {
-    matches!(status, Some(OutcomeStatus::True | OutcomeStatus::False))
+fn explicit_binary_outcome(result: Option<&OutcomeResult>) -> bool {
+    matches!(
+        result.map(|result| result.truth),
+        Some(OutcomeStatus::True | OutcomeStatus::False)
+    )
 }
 
 fn count_jointly_scored<'a>(
-    pairs: impl IntoIterator<Item = (Option<&'a OutcomeStatus>, Option<&'a OutcomeStatus>)>,
+    pairs: impl IntoIterator<Item = (Option<&'a OutcomeResult>, Option<&'a OutcomeResult>)>,
 ) -> usize {
     pairs
         .into_iter()
@@ -1800,8 +1833,8 @@ mod tests {
 
     #[test]
     fn joint_scoring_coverage_does_not_use_marginal_minimums() {
-        let passed = OutcomeStatus::True;
-        let error = OutcomeStatus::Error;
+        let passed = OutcomeResult::from_truth(OutcomeStatus::True);
+        let error = OutcomeResult::from_truth(OutcomeStatus::Error);
         let pairs = [(Some(&error), Some(&passed)), (Some(&passed), Some(&error))];
 
         assert_eq!(count_jointly_scored(pairs), 0);
@@ -1826,7 +1859,7 @@ mod tests {
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: joint-coverage}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -1842,10 +1875,10 @@ gate:
   min_cases: 100
   min_unique_cases: 100
   max_duplicate_case_rate: 0
-  min_primary_scored_rate: 0.99
-  max_primary_evaluator_error_rate: 0.02
-  max_primary_not_applicable_rate: 0
-  max_primary_unscored_rate: 0
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.02
+  max_primary_component_not_applicable_rate: 0
+  max_primary_component_unscored_rate: 0
   max_primary_regression_pp: 100
 "#,
         );
@@ -1856,15 +1889,15 @@ gate:
             .map(serde_json::from_str::<PairedCaseRecord>)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        records[0]
-            .baseline_evaluation
-            .outcomes
-            .insert("correct".to_owned(), OutcomeStatus::Error);
+        records[0].baseline_evaluation.outcomes.insert(
+            "correct".to_owned(),
+            OutcomeResult::from_truth(OutcomeStatus::Error),
+        );
         records[0].baseline_evaluation.primary_pass = false;
-        records[1]
-            .candidate_evaluation
-            .outcomes
-            .insert("correct".to_owned(), OutcomeStatus::Error);
+        records[1].candidate_evaluation.outcomes.insert(
+            "correct".to_owned(),
+            OutcomeResult::from_truth(OutcomeStatus::Error),
+        );
         records[1].candidate_evaluation.primary_pass = false;
         let config = Config::load(&root.path().join("structtrace.yaml")).unwrap();
         let summary = build_summary("joint-coverage", &config, &records).unwrap();
@@ -1873,17 +1906,15 @@ gate:
             .gate
             .rules
             .iter()
-            .find(|rule| rule.rule == "min_primary_scored_rate")
+            .find(|rule| rule.rule == "min_primary_fully_evaluated_rate")
             .unwrap();
-        assert_eq!(rule.observed, Some(0.98));
-        assert_eq!(
-            rule.status,
-            structtrace_core::gate::GateRuleStatus::InsufficientEvidence
-        );
+        assert_eq!(rule.observed, Some(0.99));
+        assert_eq!(rule.status, structtrace_core::gate::GateRuleStatus::Passed);
         assert_eq!(
             summary.gate.status,
-            structtrace_core::gate::GateStatus::InsufficientEvidence
+            structtrace_core::gate::GateStatus::Passed
         );
+        assert!(!summary.gate.deployment_authorized);
     }
 
     #[test]
@@ -1907,7 +1938,7 @@ gate:
         );
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project:
   name: test
 dataset:
@@ -1967,7 +1998,7 @@ gate:
         );
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: field-hotspot}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2128,7 +2159,7 @@ analysis:
         write(&root.path().join("candidate.jsonl"), &output);
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: provider-privacy}
 storage: {retain_raw_outputs: false, retain_provider_responses: false}
 dataset: {path: data.jsonl}
@@ -2199,7 +2230,7 @@ analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95,
         write(
             &root.path().join("structtrace.yaml"),
             &format!(
-                r#"version: 1
+                r#"version: 2
 project: {{name: external-evaluator-test}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}
@@ -2268,7 +2299,7 @@ analysis:
         write(
             &root.path().join("structtrace.yaml"),
             &format!(
-                r#"version: 1
+                r#"version: 2
 project: {{name: evaluator-scale}}
 dataset: {{path: data.jsonl}}
 schema: {{path: schema.json}}
@@ -2325,7 +2356,7 @@ analysis: {{primary_outcome: correct, bootstrap: {{samples: 100, confidence: 0.9
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: duplicate-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2340,10 +2371,10 @@ gate:
   min_cases: 2
   min_unique_cases: 2
   max_duplicate_case_rate: 0
-  min_primary_scored_rate: 1
-  max_primary_evaluator_error_rate: 0
-  max_primary_not_applicable_rate: 0
-  max_primary_unscored_rate: 0
+  min_primary_fully_evaluated_rate: 1
+  max_primary_component_error_rate: 0
+  max_primary_component_not_applicable_rate: 0
+  max_primary_component_unscored_rate: 0
   max_primary_regression_pp: 0
 "#,
         );
@@ -2382,7 +2413,7 @@ gate:
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: metamorphic-evidence}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2473,7 +2504,7 @@ gate: {min_cases: 1, min_unique_cases: 1, max_duplicate_case_rate: 1, max_primar
             write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
             write(
                 &root.path().join("structtrace.yaml"),
-                r#"version: 1
+                r#"version: 2
 project: {name: conflict-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}
@@ -2488,10 +2519,10 @@ gate:
   min_cases: 1
   min_unique_cases: 1
   max_duplicate_case_rate: 1
-  min_primary_scored_rate: 1
-  max_primary_evaluator_error_rate: 0
-  max_primary_not_applicable_rate: 0
-  max_primary_unscored_rate: 0
+  min_primary_fully_evaluated_rate: 1
+  max_primary_component_error_rate: 0
+  max_primary_component_not_applicable_rate: 0
+  max_primary_component_unscored_rate: 0
   max_primary_regression_pp: 0
 "#,
             );
@@ -2533,7 +2564,7 @@ gate:
         write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
         write(
             &root.path().join("structtrace.yaml"),
-            r#"version: 1
+            r#"version: 2
 project: {name: metadata-audit}
 dataset: {path: data.jsonl}
 schema: {path: schema.json}

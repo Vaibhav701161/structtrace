@@ -24,7 +24,9 @@ contain no external scripts, CDN assets, analytics, or telemetry. Case bodies ar
 lazy-loaded from bounded local chunks, and an aggregate-only share export omits all case data.
 
 Variant output, provider response envelopes, subprocess standard error, and
-report-embedded raw values are bounded. User-configurable limits cannot exceed
+report-embedded raw values are bounded. Process logs are off by default. Sanitized retention is
+literal and header-pattern based and cannot promise detection of every possible secret; explicit
+`full_sensitive` retention may contain credentials or private data. User-configurable limits cannot exceed
 compiled hard ceilings. Oversized values fail closed or are explicitly
 truncated in the display-only report view; they are never silently scored from
 partial text.
@@ -39,6 +41,10 @@ not copied into user-facing errors when provider-response retention is disabled.
 OpenAI-compatible credentials are read from the environment variable named by
 `api_key_env`. StructTrace persists only the variable name and a presence flag.
 It does not persist the credential, bearer header, or complete request headers.
+
+If process logs are enabled, use `sanitized` with tenant-specific `custom_patterns` and scan the
+final run directory before sharing. Aggregate-only share exports exclude the logs directory. Never
+enable `full_sensitive` for a run whose artifacts may leave the trusted host.
 
 Do not put secret values directly into prompts, model identifiers, command
 arguments, or configuration fields. Those fields are evidence and may appear in

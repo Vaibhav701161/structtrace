@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use anyhow::Context;
-use serde::Deserialize;
+use minijinja::{Environment, context};
+use serde::{Deserialize, Serialize};
 use structtrace_core::artifact::RunKind;
 use structtrace_core::config::{Config, VariantConfig};
 
@@ -27,7 +28,7 @@ const RESEARCH_CONFIG: &str = include_str!("../../../demo/accepted-research/stru
 const RESEARCH_SCHEMA: &str = include_str!("../../../demo/accepted-research/schema.json");
 const RESEARCH_COUNTS: &str = include_str!("../../../demo/accepted-research/expected-counts.json");
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ResearchStudy {
     id: String,
     label: String,
@@ -41,6 +42,7 @@ struct ResearchStudy {
 pub struct ResearchDemo {
     pub runs: Vec<structtrace_engine::CompletedRun>,
     pub index_path: std::path::PathBuf,
+    pub studies: Vec<(String, String)>,
 }
 
 /// Materialize and run the invoice extraction fixture below local state.
@@ -172,19 +174,25 @@ pub fn run_research(project_root: &Path) -> anyhow::Result<ResearchDemo> {
         )?);
     }
     let index_path = fixture_root.join("index.html");
-    let mut index = String::from(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>StructTrace research fixtures</title><style>body{font:16px/1.6 system-ui;max-width:780px;margin:4rem auto;padding:0 1.5rem;color:#172033}li{margin:.8rem 0}code{font-size:.9em}</style><h1>Accepted research fixtures</h1><p><strong>These studies are separate. No pooled effect or release gate is calculated.</strong></p><ul>",
-    );
-    for (study, run) in studies.iter().zip(&runs) {
-        index.push_str(&format!(
-            "<li>{}: <a href=\"{}\">open separate report</a></li>",
-            study.label,
-            run.run_dir.join("report/index.html").display()
-        ));
-    }
-    index.push_str("</ul></html>");
+    let mut environment = Environment::new();
+    environment.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+    environment.add_template(
+        "research.html",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>StructTrace research fixtures</title><style>body{font:16px/1.6 system-ui;max-width:780px;margin:4rem auto;padding:0 1.5rem;color:#172033}li{margin:.8rem 0}a:focus{outline:3px solid #4f46e5;outline-offset:3px}</style></head><body><main><h1>Accepted research fixtures</h1><p><strong>These are separate studies. No pooled effect or release gate is calculated.</strong></p><ul>{% for study in studies %}<li>{{ study.label }}: <a href=\"{{ study.id }}/\">open separate report</a></li>{% endfor %}</ul></main></body></html>",
+    )?;
+    let index = environment
+        .get_template("research.html")?
+        .render(context!(studies => &studies))?;
     write_fixture(&index_path, &index)?;
-    Ok(ResearchDemo { runs, index_path })
+    let study_links = studies
+        .into_iter()
+        .map(|study| (study.id, study.label))
+        .collect();
+    Ok(ResearchDemo {
+        runs,
+        index_path,
+        studies: study_links,
+    })
 }
 
 fn research_jsonl(studies: &[ResearchStudy]) -> anyhow::Result<(String, String, String)> {
@@ -316,6 +324,15 @@ mod tests {
         let research = run_research(root.path()).unwrap();
         assert_eq!(research.runs.len(), 3);
         assert!(research.index_path.is_file());
+        let index = std::fs::read_to_string(&research.index_path).unwrap();
+        assert!(index.contains(
+            "These are separate studies. No pooled effect or release gate is calculated."
+        ));
+        for (id, label) in &research.studies {
+            assert!(index.contains(&format!("href=\"{id}/\"")));
+            assert!(index.contains(label));
+        }
+        assert!(!index.contains("file://"));
         for run in &research.runs {
             assert_eq!(
                 run.summary.gate.status,

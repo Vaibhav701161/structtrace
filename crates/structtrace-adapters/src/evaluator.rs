@@ -508,7 +508,7 @@ fn stable_evaluator_output(output: &VariantOutput) -> VariantOutput {
         stable
             .raw_output
             .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
+            .and_then(|raw| structtrace_core::strict_json::value_from_str(raw).ok())
     });
     stable.parsed_output.clone_from(&parsed);
     stable.raw_output = parsed
@@ -726,7 +726,7 @@ fn parse_response_inner(
             ),
         );
     }
-    let response: EvaluatorResponse = match serde_json::from_str(lines[0]) {
+    let response: EvaluatorResponse = match structtrace_core::strict_json::from_str(lines[0]) {
         Ok(value) => value,
         Err(failure) => {
             return error(
@@ -991,7 +991,7 @@ mod tests {
         let script = root.path().join("evaluator.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":2,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1,\"message\":\"receipt verified\"}'\n",
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":3,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1,\"message\":\"receipt verified\"}'\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1035,7 +1035,7 @@ mod tests {
         let script = root.path().join("evaluator.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":2,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1}'\nexit 9\n",
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"protocol\":\"structtrace.evaluator\",\"protocol_version\":3,\"evaluator_id\":\"business\",\"status\":\"passed\",\"score\":1}'\nexit 9\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1087,7 +1087,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             root.path().join("worker.py"),
-            "import json,sys,time\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':2,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\ntime.sleep(0.1); print('extra',flush=True)\n",
+            "import json,sys,time\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version': 3,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\ntime.sleep(0.1); print('extra',flush=True)\n",
         )
         .unwrap();
         let cases = [fixture_case("one"), fixture_case("two")];
@@ -1138,7 +1138,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             root.path().join("worker.py"),
-            "import json,subprocess,sys\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version':2,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n",
+            "import json,subprocess,sys\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':'structtrace.evaluator','protocol_version': 3,'evaluator_id':r['evaluator_id'],'case_id':r['case_id'],'status':'passed'}),flush=True)\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n",
         )
         .unwrap();
         let cases = [fixture_case("one")];
@@ -1185,5 +1185,14 @@ mod tests {
             "retries": []
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn duplicate_external_evaluator_field_is_rejected() {
+        let bytes = br#"{"protocol":"structtrace.evaluator","protocol_version": 3,"evaluator_id":"business","evaluator_id":"other","case_id":"one","status":"passed"}
+"#;
+        let result = parse_response_for_case("business", "one", bytes);
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert!(result.message.contains("duplicate object key"));
     }
 }

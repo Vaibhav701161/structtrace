@@ -22,3 +22,15 @@ paths but intentionally still loads the current `structtrace.yaml` for project i
 evaluators, outcomes, gate, retention, redaction, and limits. It is not a four-file zero-config
 command. Run `structtrace init --template recorded` first, then review the generated evaluator and
 outcome definitions. Configure `kind: recorded` directly for a repeatable checked-in workflow.
+
+For existing matched artifacts, guided initialization validates and snapshots all sources while
+requiring you to declare correctness explicitly:
+
+```bash
+structtrace init comparison --from-outputs \
+  --dataset data.jsonl --baseline baseline.jsonl --candidate candidate.jsonl \
+  --schema schema.json --correctness-pointer /team --gate-mode regression
+```
+
+Use `--exact-json` instead of pointers only when complete-object equality really is the application
+definition. The command never infers semantics from the schema.

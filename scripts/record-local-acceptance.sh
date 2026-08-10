@@ -13,6 +13,7 @@ printf '[]\n' >"$audit_checks_file"
 record_check() {
   local audit_name="$1"
   local audit_command="$2"
+  local audit_artifact_paths="${3:-}"
   local audit_log="$audit_log_dir/${audit_name}.log"
   local audit_status
   local audit_log_hash
@@ -29,8 +30,9 @@ record_check() {
     --arg name "$audit_name" \
     --arg command "$audit_command" \
     --arg log_sha256 "$audit_log_hash" \
+    --arg artifact_paths "$audit_artifact_paths" \
     --argjson exit_code "$audit_status" \
-    '. + [{name: $name, command: $command, exit_code: $exit_code, log_sha256: $log_sha256}]' \
+    '. + [{name: $name, command: $command, exit_code: $exit_code, log_sha256: $log_sha256, artifact_paths: ($artifact_paths | split(",") | map(select(length > 0)))}]' \
     "$audit_checks_file" >"$audit_next"
   mv "$audit_next" "$audit_checks_file"
   if [[ "$audit_status" -ne 0 ]]; then
@@ -47,10 +49,10 @@ fi
 
 record_check fmt 'cargo fmt --all -- --check'
 record_check clippy 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
-record_check tests 'cargo test --workspace --all-features'
-record_check release_build 'cargo build --release --workspace'
-record_check documentation 'mdbook build docs'
-record_check release_cli_help 'target/release/structtrace --help'
+record_check tests 'cargo test --workspace --all-features --locked'
+record_check release_build 'cargo build --release --workspace --locked' 'target/release/structtrace'
+record_check documentation 'mdbook build docs' 'docs/book/index.html'
+record_check release_cli_help 'target/release/structtrace --help' 'target/release/structtrace'
 
 mkdir -p "$(dirname "$audit_output")"
 jq -n \

@@ -13,7 +13,7 @@ use structtrace_core::{
 };
 
 /// Current SQLite schema migration version.
-pub const DATABASE_VERSION: i64 = 3;
+pub const DATABASE_VERSION: i64 = 4;
 
 /// Durable local run store.
 pub struct RunStore {
@@ -211,10 +211,10 @@ impl RunStore {
                 params![variant_id, evaluation.case_id, evaluator_id, serde_json::to_string(result)?],
             )?;
         }
-        for (outcome_id, status) in &evaluation.outcomes {
+        for (outcome_id, result) in &evaluation.outcomes {
             transaction.execute(
-                "INSERT INTO outcome_results (variant_id, case_id, outcome_id, status) VALUES (?1, ?2, ?3, ?4)",
-                params![variant_id, evaluation.case_id, outcome_id, outcome_status_name(*status)],
+                "INSERT INTO outcome_results (variant_id, case_id, outcome_id, status, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![variant_id, evaluation.case_id, outcome_id, outcome_status_name(result.truth), serde_json::to_string(result)?],
             )?;
         }
         transaction.commit()?;
@@ -369,6 +369,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 case_id TEXT NOT NULL,
                 outcome_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                result_json TEXT NOT NULL,
                 PRIMARY KEY (variant_id, case_id, outcome_id)
             );
             CREATE TABLE paired_results (
@@ -385,7 +386,7 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
                 blake3 TEXT NOT NULL,
                 byte_length INTEGER NOT NULL
             );
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             COMMIT;
             "#,
         )?;
@@ -396,7 +397,8 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             ALTER TABLE cases ADD COLUMN model_visible_metadata_json TEXT;
             ALTER TABLE cases ADD COLUMN source_line INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
-            PRAGMA user_version = 3;
+            ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
+            PRAGMA user_version = 4;
             COMMIT;
             "#,
         )?;
@@ -405,7 +407,17 @@ fn migrate(connection: &Connection) -> anyhow::Result<()> {
             r#"
             BEGIN;
             ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'production';
-            PRAGMA user_version = 3;
+            ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
+            PRAGMA user_version = 4;
+            COMMIT;
+            "#,
+        )?;
+    } else if version == 3 {
+        connection.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE outcome_results ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}';
+            PRAGMA user_version = 4;
             COMMIT;
             "#,
         )?;

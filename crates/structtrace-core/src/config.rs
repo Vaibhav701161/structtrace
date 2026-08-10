@@ -5,13 +5,13 @@ use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result, hashing::read_bounded};
+use crate::{CONFIG_VERSION, CoreError, Result, hashing::read_bounded};
 
 /// Complete `structtrace.yaml` configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Configuration schema version. Only version 1 is accepted.
+    /// Configuration schema version. Only the current version is accepted.
     pub version: u32,
     /// Project identity.
     pub project: ProjectConfig,
@@ -80,6 +80,8 @@ pub const HARD_MAX_BOOTSTRAP_SAMPLES: usize = 1_000_000;
 pub const HARD_MAX_BOOTSTRAP_WORK_UNITS: usize = 100_000_000;
 /// Hard ceiling for explicitly bound implementation source files.
 pub const HARD_MAX_IMPLEMENTATION_SOURCES: usize = 256;
+/// Hard ceiling for all retained process logs in one run.
+pub const HARD_MAX_PROCESS_LOG_BYTES: usize = 64 * 1024 * 1024;
 
 /// Configurable resource limits with conservative defaults and enforced hard ceilings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +155,8 @@ pub struct StorageConfig {
     pub retain_provider_responses: bool,
     /// Pointers redacted before report export.
     pub redaction: RedactionConfig,
+    /// Explicit process stdout/stderr retention policy.
+    pub process_logs: ProcessLogConfig,
 }
 
 impl Default for StorageConfig {
@@ -162,6 +166,42 @@ impl Default for StorageConfig {
             retain_raw_outputs: true,
             retain_provider_responses: false,
             redaction: RedactionConfig::default(),
+            process_logs: ProcessLogConfig::default(),
+        }
+    }
+}
+
+/// Retention mode for user-controlled process logs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessLogMode {
+    /// Persist no user-controlled process logs.
+    #[default]
+    Off,
+    /// Redact known credentials, configured literals, and header-shaped secrets.
+    Sanitized,
+    /// Persist bounded original logs; this may contain secrets.
+    FullSensitive,
+}
+
+/// Bounded process-log retention settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProcessLogConfig {
+    /// Retention and redaction behavior.
+    pub mode: ProcessLogMode,
+    /// Aggregate retained byte ceiling for one run.
+    pub max_total_bytes: usize,
+    /// Additional literal values removed in sanitized mode.
+    pub custom_patterns: Vec<String>,
+}
+
+impl Default for ProcessLogConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProcessLogMode::Off,
+            max_total_bytes: 4 * 1024 * 1024,
+            custom_patterns: Vec::new(),
         }
     }
 }
@@ -696,10 +736,25 @@ impl Default for BootstrapConfig {
     }
 }
 
+/// Intended authority of a configured gate.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateMode {
+    /// Analysis-only rules that can never authorize deployment.
+    #[default]
+    Advisory,
+    /// Evidence-complete relative regression assessment without an absolute safety claim.
+    Regression,
+    /// Evidence-complete release assessment with relative and absolute semantic rules.
+    Release,
+}
+
 /// Independent release-gate rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GateConfig {
+    /// Gate authority and required rule profile.
+    pub mode: GateMode,
     /// Minimum paired case count required for a release decision.
     pub min_cases: Option<usize>,
     /// Minimum distinct semantic evidence units required for a release decision.
@@ -707,17 +762,27 @@ pub struct GateConfig {
     /// Maximum fraction of rows belonging to an exact semantic duplicate group.
     pub max_duplicate_case_rate: Option<f64>,
     /// Minimum fraction explicitly scored pass or fail on both variants.
-    pub min_primary_scored_rate: Option<f64>,
-    /// Maximum evaluator-error fraction on either variant.
-    pub max_primary_evaluator_error_rate: Option<f64>,
-    /// Maximum not-applicable fraction on either variant.
-    pub max_primary_not_applicable_rate: Option<f64>,
-    /// Maximum unscored fraction on either variant.
-    pub max_primary_unscored_rate: Option<f64>,
+    pub min_primary_fully_evaluated_rate: Option<f64>,
+    /// Maximum required-component error fraction on either variant.
+    pub max_primary_component_error_rate: Option<f64>,
+    /// Maximum required-component not-applicable fraction on either variant.
+    pub max_primary_component_not_applicable_rate: Option<f64>,
+    /// Maximum required-component unscored fraction on either variant.
+    pub max_primary_component_unscored_rate: Option<f64>,
     /// Maximum allowed primary-outcome decline in percentage points.
     pub max_primary_regression_pp: Option<f64>,
     /// Maximum allowed increase in valid-but-wrong rate.
     pub max_valid_but_wrong_increase_pp: Option<f64>,
+    /// Minimum absolute candidate semantic success rate.
+    pub min_candidate_primary_success_rate: Option<f64>,
+    /// Maximum absolute candidate known-valid-but-wrong rate.
+    pub max_candidate_valid_but_wrong_rate: Option<f64>,
+    /// Minimum absolute candidate strict-parse validity.
+    pub min_candidate_parse_validity: Option<f64>,
+    /// Maximum upper confidence bound on regression, in percentage points.
+    pub max_upper_confidence_bound_regression_pp: Option<f64>,
+    /// Minimum number of primary discordant pairs, treated as evidence sufficiency.
+    pub min_discordant_pairs: Option<usize>,
     /// Required candidate schema-validity fraction.
     pub min_candidate_schema_validity: Option<f64>,
     /// Maximum candidate error fraction.
@@ -736,12 +801,17 @@ impl GateConfig {
         self.min_cases.is_some()
             || self.min_unique_cases.is_some()
             || self.max_duplicate_case_rate.is_some()
-            || self.min_primary_scored_rate.is_some()
-            || self.max_primary_evaluator_error_rate.is_some()
-            || self.max_primary_not_applicable_rate.is_some()
-            || self.max_primary_unscored_rate.is_some()
+            || self.min_primary_fully_evaluated_rate.is_some()
+            || self.max_primary_component_error_rate.is_some()
+            || self.max_primary_component_not_applicable_rate.is_some()
+            || self.max_primary_component_unscored_rate.is_some()
             || self.max_primary_regression_pp.is_some()
             || self.max_valid_but_wrong_increase_pp.is_some()
+            || self.min_candidate_primary_success_rate.is_some()
+            || self.max_candidate_valid_but_wrong_rate.is_some()
+            || self.min_candidate_parse_validity.is_some()
+            || self.max_upper_confidence_bound_regression_pp.is_some()
+            || self.min_discordant_pairs.is_some()
             || self.min_candidate_schema_validity.is_some()
             || self.max_error_rate.is_some()
             || self.max_timeout_rate.is_some()
@@ -811,7 +881,7 @@ impl Config {
     /// Parse an immutable configuration snapshot captured by the caller.
     pub fn from_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<Self> {
         let config = if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            serde_json::from_slice(bytes)
+            crate::strict_json::from_slice(bytes)
                 .map_err(|error| CoreError::Configuration(format!("{}: {error}", path.display())))?
         } else {
             serde_yaml_ng::from_slice(bytes)
@@ -822,9 +892,9 @@ impl Config {
 
     /// Validate a parsed configuration before any adapter is invoked.
     pub fn validate(config: Self) -> Result<Self> {
-        if config.version != 1 {
+        if config.version != CONFIG_VERSION {
             return Err(CoreError::Configuration(format!(
-                "unsupported version {}; expected 1",
+                "unsupported version {}; expected {CONFIG_VERSION}",
                 config.version
             )));
         }
@@ -980,6 +1050,24 @@ impl Config {
         {
             return Err(CoreError::Configuration(
                 "storage.redaction.custom_patterns must not contain empty strings".to_owned(),
+            ));
+        }
+        if config.storage.process_logs.max_total_bytes == 0
+            || config.storage.process_logs.max_total_bytes > HARD_MAX_PROCESS_LOG_BYTES
+        {
+            return Err(CoreError::Configuration(format!(
+                "storage.process_logs.max_total_bytes must be between 1 and {HARD_MAX_PROCESS_LOG_BYTES} bytes"
+            )));
+        }
+        if config
+            .storage
+            .process_logs
+            .custom_patterns
+            .iter()
+            .any(|pattern| pattern.is_empty())
+        {
+            return Err(CoreError::Configuration(
+                "storage.process_logs.custom_patterns must not contain empty strings".to_owned(),
             ));
         }
         validate_nonempty_path("dataset.path", &config.dataset.path)?;
@@ -1488,9 +1576,12 @@ fn validate_json_pointer(name: &str, pointer: &str) -> Result<()> {
 }
 
 fn validate_gate(gate: &GateConfig) -> Result<()> {
-    if gate.min_cases == Some(0) || gate.min_unique_cases == Some(0) {
+    if gate.min_cases == Some(0)
+        || gate.min_unique_cases == Some(0)
+        || gate.min_discordant_pairs == Some(0)
+    {
         return Err(CoreError::Configuration(
-            "gate.min_cases and gate.min_unique_cases must be at least 1".to_owned(),
+            "gate count thresholds must be at least 1".to_owned(),
         ));
     }
     for (name, value) in [
@@ -1498,6 +1589,10 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
         (
             "max_valid_but_wrong_increase_pp",
             gate.max_valid_but_wrong_increase_pp,
+        ),
+        (
+            "max_upper_confidence_bound_regression_pp",
+            gate.max_upper_confidence_bound_regression_pp,
         ),
     ] {
         if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
@@ -1507,16 +1602,34 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
         }
     }
     for (name, value) in [
-        ("min_primary_scored_rate", gate.min_primary_scored_rate),
         (
-            "max_primary_evaluator_error_rate",
-            gate.max_primary_evaluator_error_rate,
+            "min_primary_fully_evaluated_rate",
+            gate.min_primary_fully_evaluated_rate,
         ),
         (
-            "max_primary_not_applicable_rate",
-            gate.max_primary_not_applicable_rate,
+            "max_primary_component_error_rate",
+            gate.max_primary_component_error_rate,
         ),
-        ("max_primary_unscored_rate", gate.max_primary_unscored_rate),
+        (
+            "max_primary_component_not_applicable_rate",
+            gate.max_primary_component_not_applicable_rate,
+        ),
+        (
+            "max_primary_component_unscored_rate",
+            gate.max_primary_component_unscored_rate,
+        ),
+        (
+            "min_candidate_primary_success_rate",
+            gate.min_candidate_primary_success_rate,
+        ),
+        (
+            "max_candidate_valid_but_wrong_rate",
+            gate.max_candidate_valid_but_wrong_rate,
+        ),
+        (
+            "min_candidate_parse_validity",
+            gate.min_candidate_parse_validity,
+        ),
         ("max_duplicate_case_rate", gate.max_duplicate_case_rate),
         (
             "min_candidate_schema_validity",
@@ -1530,6 +1643,38 @@ fn validate_gate(gate: &GateConfig) -> Result<()> {
                 "gate.{name} must be between 0 and 1"
             )));
         }
+    }
+    if matches!(gate.mode, GateMode::Regression | GateMode::Release) {
+        let safeguards = [
+            gate.min_cases.is_some(),
+            gate.min_unique_cases.is_some(),
+            gate.max_duplicate_case_rate.is_some(),
+            gate.min_primary_fully_evaluated_rate.is_some(),
+            gate.max_primary_component_error_rate.is_some(),
+            gate.max_primary_component_not_applicable_rate.is_some(),
+            gate.max_primary_component_unscored_rate.is_some(),
+        ];
+        if safeguards.iter().any(|configured| !configured) {
+            return Err(CoreError::Configuration(
+                "gate regression/release mode requires min_cases, min_unique_cases, max_duplicate_case_rate, min_primary_fully_evaluated_rate, max_primary_component_error_rate, max_primary_component_not_applicable_rate, and max_primary_component_unscored_rate".to_owned(),
+            ));
+        }
+        if gate.max_primary_regression_pp.is_none()
+            && gate.max_valid_but_wrong_increase_pp.is_none()
+            && gate.max_upper_confidence_bound_regression_pp.is_none()
+        {
+            return Err(CoreError::Configuration(
+                "gate regression/release mode requires at least one relative primary semantic quality rule".to_owned(),
+            ));
+        }
+    }
+    if gate.mode == GateMode::Release
+        && gate.min_candidate_primary_success_rate.is_none()
+        && gate.max_candidate_valid_but_wrong_rate.is_none()
+    {
+        return Err(CoreError::Configuration(
+            "gate release mode requires an absolute semantic quality floor: min_candidate_primary_success_rate or max_candidate_valid_but_wrong_rate".to_owned(),
+        ));
     }
     for (name, value) in [
         (
@@ -1640,7 +1785,7 @@ mod tests {
 
     fn minimal() -> Config {
         Config {
-            version: 1,
+            version: CONFIG_VERSION,
             project: ProjectConfig {
                 name: "tickets".to_owned(),
                 description: None,
@@ -2028,5 +2173,44 @@ mod tests {
         );
         config.analysis.primary_outcome = "bad".to_owned();
         assert!(Config::validate(config).is_err());
+    }
+
+    fn regression_gate(mode: GateMode) -> GateConfig {
+        GateConfig {
+            mode,
+            min_cases: Some(100),
+            min_unique_cases: Some(100),
+            max_duplicate_case_rate: Some(0.01),
+            min_primary_fully_evaluated_rate: Some(0.99),
+            max_primary_component_error_rate: Some(0.01),
+            max_primary_component_not_applicable_rate: Some(0.0),
+            max_primary_component_unscored_rate: Some(0.0),
+            max_primary_regression_pp: Some(1.0),
+            ..GateConfig::default()
+        }
+    }
+
+    #[test]
+    fn quality_only_gate_requires_evidence_safeguards() {
+        let mut config = minimal();
+        config.gate.mode = GateMode::Regression;
+        config.gate.max_primary_regression_pp = Some(1.0);
+        assert!(Config::validate(config).is_err());
+    }
+
+    #[test]
+    fn release_mode_requires_absolute_quality_floor() {
+        let mut config = minimal();
+        config.gate = regression_gate(GateMode::Release);
+        let error = Config::validate(config).unwrap_err().to_string();
+        assert!(error.contains("absolute semantic quality floor"));
+    }
+
+    #[test]
+    fn complete_release_gate_is_accepted() {
+        let mut config = minimal();
+        config.gate = regression_gate(GateMode::Release);
+        config.gate.min_candidate_primary_success_rate = Some(0.95);
+        Config::validate(config).unwrap();
     }
 }

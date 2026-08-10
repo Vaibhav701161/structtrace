@@ -1,6 +1,6 @@
 # Report scale validation
 
-Report format 2 separates the aggregate shell from case data:
+Report format 3 separates the aggregate shell from case data:
 
 ```text
 report/index.html
@@ -33,11 +33,13 @@ harness. These measurements are descriptive and not cross-platform performance p
 
 ## Supported envelope
 
-One thousand paired cases with similarly sized nested outputs is the currently tested report
+One thousand paired cases with similarly sized nested outputs is the currently measured report
 envelope. Per-case raw display values, the optional single-file derivative, and the whole report
-directory each have independently configurable limits with compiled hard ceilings. Larger or much
-more verbose workloads must be validated against their intended environment before relying on the
-interactive report; machine-readable run artifacts remain available for bulk analysis.
+directory each have independently configurable limits with compiled hard ceilings. The generator
+streams one bounded case at a time into 50-case chunks and writes a temporary report directory
+that is atomically renamed only after size and hash checks pass. Larger or much more verbose
+workloads still require validation in their intended environment; machine-readable run artifacts
+remain available for bulk analysis.
 
 Clean-browser open time and interactive filter latency have not yet been recorded across the
 release operating-system matrix. That evidence belongs to release-candidate VM and external-user

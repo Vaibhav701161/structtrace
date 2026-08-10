@@ -12,7 +12,7 @@ for line in sys.stdin:
     label = "rejected" if args.variant == "baseline" and "negative" in text else "accepted"
     response = {
         "protocol": "structtrace.variant",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "case_id": request["case_id"],
         "status": "ok",
         "output": {"label": label, "reason": f"{args.variant} deterministic result."},

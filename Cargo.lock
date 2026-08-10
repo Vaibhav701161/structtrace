@@ -2286,9 +2286,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "minijinja",
  "open",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "structtrace-adapters",
  "structtrace-core",
  "structtrace-engine",
@@ -2352,6 +2354,7 @@ dependencies = [
  "structtrace-core",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

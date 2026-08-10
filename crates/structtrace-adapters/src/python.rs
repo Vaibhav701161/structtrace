@@ -308,4 +308,100 @@ def ordinary_protocol_field(case):
         assert!(error.fingerprint.is_some());
         assert!(!String::from_utf8(run.stderr).unwrap().contains("Traceback"));
     }
+
+    #[tokio::test]
+    async fn python_values_follow_the_documented_json_policy_and_bad_cases_are_isolated() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("bridge.py"), BRIDGE_SOURCE).unwrap();
+        fs::write(
+            root.path().join("app.py"),
+            r#"import asyncio
+import datetime
+import decimal
+import uuid
+
+def values(case):
+    mode = case['input']['mode']
+    if mode == 'nan': return {'value': float('nan')}
+    if mode == 'infinity': return {'value': float('inf')}
+    if mode == 'key': return {1: 'not allowed'}
+    if mode == 'bytes': return {'value': b'private'}
+    if mode == 'datetime': return {'value': datetime.datetime(2026, 8, 10, 12, 30, tzinfo=datetime.timezone.utc)}
+    if mode == 'uuid': return {'value': uuid.UUID('12345678-1234-5678-1234-567812345678')}
+    if mode == 'decimal': return {'value': decimal.Decimal('1.2300')}
+    return {'value': 'later'}
+
+async def leaves_task(case):
+    asyncio.create_task(asyncio.sleep(60))
+    return {'value': 'ok'}
+"#,
+        )
+        .unwrap();
+        let cases = [
+            "nan", "infinity", "key", "bytes", "datetime", "uuid", "decimal", "ok",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, mode)| VariantCase {
+            id: format!("case-{index}"),
+            input: json!({"mode": mode}),
+            metadata: None,
+        })
+        .collect::<Vec<_>>();
+        let run = run_python(
+            python_program(),
+            "app:values",
+            1_000,
+            &cases,
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        for (index, kind) in [
+            "non_finite_number",
+            "non_finite_number",
+            "non_string_key",
+            "bytes_require_wrapper",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(run.rows[index].status, OutputStatus::Error);
+            assert_eq!(run.rows[index].error.as_ref().unwrap().kind, kind);
+        }
+        assert!(
+            run.rows[4..]
+                .iter()
+                .all(|row| row.status == OutputStatus::Ok)
+        );
+        let values = run.rows[4..7]
+            .iter()
+            .map(|row| {
+                structtrace_core::strict_json::value_from_str(row.raw_output.as_deref().unwrap())
+                    .unwrap()["value"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], json!("2026-08-10T12:30:00+00:00"));
+        assert_eq!(values[1], json!("12345678-1234-5678-1234-567812345678"));
+        assert_eq!(values[2], json!("1.2300"));
+
+        let pending = run_python(
+            python_program(),
+            "app:leaves_task",
+            1_000,
+            &cases[..1],
+            root.path(),
+            &root.path().join("bridge.py"),
+            &CommandLimits::default(),
+        )
+        .await;
+        assert_eq!(pending.rows[0].status, OutputStatus::Ok);
+        assert!(
+            !String::from_utf8(pending.stderr)
+                .unwrap()
+                .contains("Task was destroyed")
+        );
+    }
 }

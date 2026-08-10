@@ -6,22 +6,30 @@ and unscored rows. Quality and
 operational limits cover primary-outcome regression, valid-but-wrong growth, candidate schema
 validity, adapter errors, timeouts, p95 latency, and average cost.
 
-An empty gate is `NOT_CONFIGURED`, never passed. Once any release criterion is configured, all
-evidence safeguards are required; missing or inadequate coverage is `INSUFFICIENT_EVIDENCE`.
-If a run has both inadequate evidence and a directly observed quality-rule failure, the headline is
-`FAILED`; every rule remains visible, including the evidence warning. A known regression is never
-hidden behind a weaker evidence label.
+Gate mode is explicit. `advisory` can analyze incomplete rules but never authorizes deployment.
+`regression` requires every evidence safeguard and at least one relative semantic rule; passing it
+means only that configured regression limits passed. `release` also requires an absolute semantic
+quality floor and is the only mode that may set `deployment_authorized=true`.
+
+An empty gate is `NOT_CONFIGURED`, never passed. Incomplete `regression` or `release` definitions
+are rejected during configuration validation and strict doctor. Missing observed coverage is
+`INSUFFICIENT_EVIDENCE`. When quality and evidence both fail, human and GitHub output use the
+composite `DO NOT DEPLOY: quality failed and evidence is insufficient` headline and machine output
+retains both failure arrays. The stable exit status remains evidence-insufficient in that composite
+case so existing automation keeps its documented code.
 
 ```yaml
 gate:
+  mode: release
   min_cases: 100
   min_unique_cases: 100
   max_duplicate_case_rate: 0.01
-  min_primary_scored_rate: 0.99
-  max_primary_evaluator_error_rate: 0.01
-  max_primary_not_applicable_rate: 0.0
-  max_primary_unscored_rate: 0.0
+  min_primary_fully_evaluated_rate: 0.99
+  max_primary_component_error_rate: 0.01
+  max_primary_component_not_applicable_rate: 0.0
+  max_primary_component_unscored_rate: 0.0
   max_primary_regression_pp: 1.0
+  min_candidate_primary_success_rate: 0.95
 ```
 
 ```bash
