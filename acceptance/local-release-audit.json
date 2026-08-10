@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-10T06:12:57Z",
+  "source_commit": "989316044d974304b0b4fe1771f39e6e40a2da08",
+  "worktree_clean_before": true,
+  "environment": {
+    "rustc": "rustc 1.87.0 (17067e9ac 2025-05-09)",
+    "cargo": "cargo 1.87.0 (99624be96 2025-05-06)",
+    "platform": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64"
+  },
+  "checks": [
+    {
+      "name": "fmt",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "f2066ca264b9a8598ecd436c70919e1efe1acea4098ad2a13b5d82d67bc049ec"
+    },
+    {
+      "name": "tests",
+      "command": "cargo test --workspace --all-features",
+      "exit_code": 0,
+      "log_sha256": "011dda722c3b72af57090e1858143ed55c11306f0e4bc0f7b46435f32721a847"
+    },
+    {
+      "name": "release_build",
+      "command": "cargo build --release --workspace",
+      "exit_code": 0,
+      "log_sha256": "5089e1c94f049189c2882fc87c84f7dc7b10bacee71a9d1d0a37f5d69d73d594"
+    },
+    {
+      "name": "documentation",
+      "command": "mdbook build docs",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "release_cli_help",
+      "command": "target/release/structtrace --help",
+      "exit_code": 0,
+      "log_sha256": "a081b0afd94bbac7f2e192d824ac7babc78c1712423934ae0d960e51aaca341a"
+    }
+  ],
+  "passed": true
+}
