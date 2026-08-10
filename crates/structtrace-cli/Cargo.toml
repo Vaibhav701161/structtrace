@@ -20,10 +20,10 @@ minijinja.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-structtrace-adapters = { path = "../structtrace-adapters" }
-structtrace-core = { path = "../structtrace-core" }
-structtrace-engine = { path = "../structtrace-engine" }
-structtrace-report = { path = "../structtrace-report" }
+structtrace-adapters = { path = "../structtrace-adapters", version = "0.1.0" }
+structtrace-core = { path = "../structtrace-core", version = "0.1.0" }
+structtrace-engine = { path = "../structtrace-engine", version = "0.1.0" }
+structtrace-report = { path = "../structtrace-report", version = "0.1.0" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

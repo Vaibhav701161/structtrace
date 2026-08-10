@@ -16,7 +16,7 @@ open.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-structtrace-core = { path = "../structtrace-core" }
+structtrace-core = { path = "../structtrace-core", version = "0.1.0" }
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

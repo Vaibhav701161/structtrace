@@ -16,7 +16,7 @@ reqwest.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-structtrace-core = { path = "../structtrace-core" }
+structtrace-core = { path = "../structtrace-core", version = "0.1.0" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
