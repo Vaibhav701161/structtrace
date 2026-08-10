@@ -364,6 +364,14 @@ is opt-in and is not advertised as measured capacity. Dataset and recorded-outpu
 whole-file but bounded in v1, so memory still scales with the configured source-byte limits; the
 tool does not claim streaming or million-row ingestion.
 
+| Clean-tree Linux measurement | Wall time | Peak RSS |
+|---|---:|---:|
+| 10,000-case run | 153.08 s | 325,640 KiB |
+| Complete replay | 2.16 s | 288,124 KiB |
+
+The exact commit, binary/lockfile digests, source sizes, command results, and artifact size are in
+[`benchmarks/recorded-output-10000/result.json`](benchmarks/recorded-output-10000/result.json).
+
 ## Research foundation, without universal claims
 
 The offline research command produces three separate normalized runs and a non-inferential index

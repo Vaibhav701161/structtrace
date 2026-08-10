@@ -63,6 +63,11 @@ python3 scripts/measure-recorded-scale.py \
 The default `limits.max_cases` is therefore 10,000. The compiled 100,000-case ceiling is an
 explicit opt-in boundary, not a measured promise.
 
+The clean-tree Linux x86-64 measurement for commit `0cd51fe` completed the full 10,000-case run in
+153.08 seconds with 325,640 KiB peak RSS. Complete replay took 2.16 seconds with 288,124 KiB peak
+RSS. The three input sources totalled 2,478,890 bytes and the finalized run artifacts totalled
+72,182,337 bytes. These figures describe one WSL2 host; they are not cross-platform promises.
+
 ## Input-memory boundary
 
 The v1 dataset and recorded-output readers enforce byte, line, and case ceilings before parsing and
