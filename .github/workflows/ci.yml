@@ -97,13 +97,13 @@ jobs:
       - run: structtrace demo research
       - run: structtrace replay --research-fixture
       - run: structtrace --project-root examples/recorded-output-comparison run
-      - name: Deliberate gate regression returns 10
+      - name: Deliberate regression with insufficient evidence returns 12
         shell: bash
         run: |
           set +e
           structtrace --project-root examples/recorded-output-comparison gate latest --verify replay --format github
           code=$?
-          test "$code" -eq 10
+          test "$code" -eq 12
       - run: structtrace --project-root examples/python-callable run
       - run: structtrace --project-root examples/command run
       - run: structtrace --project-root examples/document-extraction run
