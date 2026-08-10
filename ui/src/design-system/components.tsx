@@ -12,11 +12,12 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
+import { appBase } from "../api/client";
 
 export function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <span className="brand" aria-label="StructTrace">
-      <img src="assets/structtrace-logo-mark.svg" alt="" width="38" height="38" />
+      <img src={`${appBase}/assets/structtrace-logo-mark.svg`} alt="" width="38" height="38" />
       {!compact && <span>StructTrace</span>}
     </span>
   );

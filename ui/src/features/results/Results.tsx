@@ -20,6 +20,7 @@ import { acceptRun, getRun } from "../../api/client";
 import type { RunResult } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Skeleton, Status } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
+import { parseArtifact } from "../import/inspect";
 
 export function Results() {
   const { runId } = useParams({ strict: false });
@@ -47,6 +48,7 @@ export function decision(result: RunResult) {
 
 function ResultContent({ result }: { result: RunResult }) {
   const navigate = useNavigate();
+  const { startNextIteration } = useWorkspace();
   const accepted = useMutation({ mutationFn: () => acceptRun(result.runId) });
   const state = decision(result);
   const summary = result.summary;
@@ -62,10 +64,10 @@ function ResultContent({ result }: { result: RunResult }) {
   const improvements = summary.paired.candidate_only_pass;
   const description = regressions > improvements
     ? `Candidate created ${regressions} regressions and ${improvements} improvements. Structural success does not override those semantic losses.`
-    : `Candidate created ${improvements} improvements and ${regressions} regressions. Review the discordant cases before changing an accepted baseline.`;
+    : `Candidate created ${improvements} improvements and ${regressions} regressions. Review every discordant case before changing production behavior.`;
   return (
     <div className="page page-wide result-page">
-      <PageHeader eyebrow={`${result.projectName} · immutable run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} onClick={() => void navigate({ to: "/ci" })}>Add to CI</Button></>} />
+      <PageHeader eyebrow={`${result.projectName} · immutable run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} onClick={() => void navigate({ to: "/ci" })}>Review CI starter</Button></>} />
       <section className={`decision-banner decision-${state.tone}`}>
         <state.icon size={28} aria-hidden="true" />
         <div><span>RELEASE DECISION</span><h2>{state.title}</h2><p>{state.text}</p></div>
@@ -78,7 +80,7 @@ function ResultContent({ result }: { result: RunResult }) {
       </Card>
       <div className="result-grid">
         <Card className="transition-card">
-          <div className="panel-heading"><div><h2>Paired outcomes</h2><p>Every case stays paired across the change.</p></div><Button variant="ghost" icon={ListFilter} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId } })}>Inspect cases</Button></div>
+          <div className="panel-heading"><div><h2>Paired outcomes</h2><p>Every case stays paired across the change.</p></div><Button variant="ghost" icon={ListFilter} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect cases</Button></div>
           <div className="transition-matrix" role="img" aria-label={`${summary.paired.both_pass} both pass, ${regressions} regressions, ${improvements} improvements, ${summary.paired.both_fail} both fail`}>
             <div className="both-pass"><strong>{summary.paired.both_pass}</strong><span>Both pass</span></div><div className="regression"><strong>{regressions}</strong><span>Regressions</span></div><div className="improvement"><strong>{improvements}</strong><span>Improvements</span></div><div className="both-fail"><strong>{summary.paired.both_fail}</strong><span>Both fail</span></div>
           </div>
@@ -86,15 +88,16 @@ function ResultContent({ result }: { result: RunResult }) {
         </Card>
         <Card className="hotspots-card">
           <div className="panel-heading"><div><h2>Top regression fields</h2><p>Primary correctness rules only.</p></div></div>
-          {summary.primary_field_hotspots.length ? <div className="hotspot-list">{summary.primary_field_hotspots.slice(0, 6).map((hotspot) => <button key={`${hotspot.evaluator_id}:${hotspot.pointer}`} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId } })}><code>{hotspot.pointer}</code><span><i style={{ width: `${Math.max(4, hotspot.regressions / Math.max(1, regressions) * 100)}%` }} /></span><strong>{hotspot.regressions}</strong></button>)}</div> : <div className="no-hotspots"><CheckCircle2 size={20} /><strong>No field-level regressions recorded</strong><p>Open case evidence for complete transition details.</p></div>}
+          {summary.primary_field_hotspots.length ? <div className="hotspot-list">{summary.primary_field_hotspots.slice(0, 6).map((hotspot) => <button key={`${hotspot.evaluator_id}:${hotspot.pointer}`} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: hotspot.pointer } })}><code>{hotspot.pointer}</code><span><i style={{ width: `${Math.max(4, hotspot.regressions / Math.max(1, regressions) * 100)}%` }} /></span><strong>{hotspot.regressions}</strong></button>)}</div> : <div className="no-hotspots"><CheckCircle2 size={20} /><strong>No field-level regressions recorded</strong><p>Open case evidence for complete transition details.</p></div>}
         </Card>
       </div>
       <Card className="evidence-card">
         <div className="panel-heading"><div><h2>Evidence quality</h2><p>Inference stays separate from descriptive row counts.</p></div><Status tone="pass" label="Hash-bound artifacts" /></div>
         <div className="evidence-metrics"><div><strong>{summary.evidence.total_rows}</strong><span>Total rows</span></div><div><strong>{summary.evidence.effective_inference_units}</strong><span>Independent cases</span></div><div><strong>{summary.evidence.exact_duplicate_groups}</strong><span>Duplicate groups</span></div><div className={summary.evidence.repeated_trial_groups ? "bad" : ""}><strong>{summary.evidence.repeated_trial_groups}</strong><span>Repeated-trial conflicts</span></div><div className={summary.evidence.label_conflict_groups ? "bad" : ""}><strong>{summary.evidence.label_conflict_groups}</strong><span>Label conflicts</span></div></div>
       </Card>
-      <div className="result-actions"><Button icon={XCircle} variant="secondary" onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Pinned cases</Button><Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={summary.gate.status !== "passed" || accepted.isPending || accepted.isSuccess}>{accepted.isSuccess ? "Acceptance recorded" : accepted.isPending ? "Recording…" : "Record candidate acceptance"}</Button></div>
-      {accepted.error && <InlineNotice tone="danger" title="Candidate could not be accepted">{accepted.error.message}</InlineNotice>}
+      <div className="result-actions"><Button icon={XCircle} variant="secondary" onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Saved cases</Button>{result.projectId && summary.gate.deployment_authorized && !accepted.isSuccess && <Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={accepted.isPending}>{accepted.isPending ? "Promoting…" : "Accept as next baseline"}</Button>}{accepted.data && <Button icon={ArrowRight} onClick={() => { const parsed = parseArtifact("baseline", accepted.data.source.name, accepted.data.source.content); startNextIteration({ ...parsed, sourceId: accepted.data.source.sourceId, hash: accepted.data.source.hash }); void navigate({ to: "/new/source" }); }}>Start next comparison</Button>}</div>
+      {accepted.data && <InlineNotice tone="success" title="Authorized baseline recorded">Candidate bytes from run <code>{accepted.data.accepted.runId}</code> are hash-bound and will be the default baseline for the next comparison in this project.</InlineNotice>}
+      {accepted.error && <InlineNotice tone="danger" title="Baseline promotion failed">{accepted.error.message}</InlineNotice>}
     </div>
   );
 }

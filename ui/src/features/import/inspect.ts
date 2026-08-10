@@ -13,11 +13,11 @@ export function parseArtifact(kind: SourceKind, name: string, content: string): 
   try {
     const rows = parseRows(content, format).length;
     if (rows === 0) throw new Error("The file contains no records.");
-    return { kind, name, format, content, bytes: new Blob([content]).size, rows, status: "ready" };
+    return { kind, name, format, content, bytes: new Blob([content]).size, rows, status: "ready", sourceId: "", hash: "" };
   } catch (error) {
     return {
       kind, name, format, content, bytes: new Blob([content]).size, rows: 0, status: "error",
-      message: error instanceof Error ? error.message : "This file could not be read.",
+      message: error instanceof Error ? error.message : "This file could not be read.", sourceId: "", hash: "",
     };
   }
 }
@@ -139,18 +139,24 @@ export function discoverRules(
       .map((value) => valueAt(value, pointer)).filter((value) => value !== undefined && value !== null);
     const type = values.length ? (Array.isArray(values[0]) ? "array" : typeof values[0]) : "unknown";
     const lower = pointer.toLowerCase();
-    const kind: FieldRule["kind"] = type === "number"
+    const numericStrings = type === "string" && values.every((value) => typeof value === "string" && /^-?(0|[1-9]\d*)(\.\d+)?$/.test(value));
+    const integerStrings = numericStrings && values.every((value) => typeof value === "string" && /^-?(0|[1-9]\d*)$/.test(value));
+    const kind: FieldRule["kind"] = type === "array" ? "keyed_array" : type === "number"
       ? values.every(Number.isInteger) ? "exact_integer" : "decimal_exact"
-      : lower.includes("date") ? "canonical_date" : "exact";
+      : numericStrings ? integerStrings ? "exact_integer" : "decimal_exact"
+      : lower.includes("date") ? "canonical_date"
+        : type === "string" && /(name|title|description|label|text)/.test(lower) ? "normalized_string"
+          : "exact";
     const coverage = (objects: unknown[]) => objects.filter((value) => valueAt(value, pointer) !== undefined).length / total;
     return {
       pointer,
       kind,
-      enabled: true,
+      enabled: false,
       expectedCoverage: coverage(expectedObjects),
       baselineCoverage: coverage(baselineObjects),
       candidateCoverage: coverage(candidateObjects),
       observedType: type,
+      keys: type === "array" ? "/id" : undefined,
     };
   });
 }

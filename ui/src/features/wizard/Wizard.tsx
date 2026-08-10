@@ -14,14 +14,12 @@ import {
   Info,
   LoaderCircle,
   LockKeyhole,
-  Play,
   ShieldCheck,
-  Sparkles,
   Upload,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { runComparison } from "../../api/client";
-import type { ComparisonRequest, FieldRule, GateMode, SourceArtifact, SourceKind } from "../../api/types";
+import { runComparison, stageSource } from "../../api/client";
+import type { ComparisonRequest, FieldRule, GateMode, Mapping, SourceArtifact, SourceKind } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Status, Stepper, WizardActions } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
 import { discoverRules, inferPointer, parseArtifact, parseRows, pointerCandidates, valueAt } from "../import/inspect";
@@ -60,20 +58,19 @@ const sourceDefinitions: Array<{ kind: SourceKind; title: string; description: s
 ];
 
 function SourcesStep() {
-  const { draft, setSource } = useWorkspace();
+  const { draft, setSource, draftStatus, draftError, clearSensitiveDraft } = useWorkspace();
   const navigation = useStepNavigation(0);
   const ready = ["dataset", "baseline", "candidate"].every((kind) => draft.sources[kind as SourceKind]?.status === "ready");
   return (
     <>
       <PageHeader eyebrow="New comparison" title="What are you comparing?" description="Drop matched artifacts. Files are parsed and evaluated on this machine." />
-      <div className="mode-switch" role="group" aria-label="Comparison source mode">
-        <button className="selected"><FileJson size={18} /><span><strong>Recorded outputs</strong><small>Recommended</small></span><CheckCircle2 size={18} /></button>
-        <button disabled title="Available after recorded-output private alpha"><Play size={18} /><span><strong>Run systems locally</strong><small>Beta · coming next</small></span></button>
-      </div>
+      <div className="mode-switch" role="group" aria-label="Comparison source mode"><button className="selected"><FileJson size={18} /><span><strong>Recorded outputs</strong><small>Stable workflow</small></span><CheckCircle2 size={18} /></button></div>
       <div className="source-grid">
         {sourceDefinitions.map((definition) => <SourceDrop key={definition.kind} {...definition} source={draft.sources[definition.kind]} onSource={(source) => setSource(definition.kind, source)} />)}
       </div>
       <InlineNotice title="Local by design"><span>StructTrace reads these files through its loopback-only server. No account, telemetry, provider call, or external upload is involved.</span></InlineNotice>
+      <div className="draft-controls"><Status tone={draftStatus === "error" ? "fail" : draftStatus === "saving" ? "working" : "neutral"} label={draftStatus === "error" ? "Draft not saved" : draftStatus === "saving" ? "Saving references" : "Source references saved"} /><Button variant="ghost" onClick={() => void clearSensitiveDraft()}>Clear active draft</Button></div>
+      {draftError && <InlineNotice tone="danger" title="Draft persistence failed">{draftError}</InlineNotice>}
       <WizardActions next={navigation.next} nextLabel="Continue to field mapping" disabled={!ready} />
     </>
   );
@@ -85,8 +82,15 @@ function SourceDrop({ kind, title, description, required, source, onSource }: {
   const input = useRef<HTMLInputElement>(null);
   const read = (file: File) => {
     const reader = new FileReader();
-    reader.onload = () => onSource(parseArtifact(kind, file.name, String(reader.result ?? "")));
-    reader.onerror = () => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The browser could not read this file." });
+    reader.onload = () => {
+      const parsed = parseArtifact(kind, file.name, String(reader.result ?? ""));
+      if (parsed.status === "error") { onSource({ ...parsed, sourceId: "", hash: "" }); return; }
+      onSource({ ...parsed, status: "staging", message: "Staging and hashing on the local server…" });
+      void stageSource(kind, parsed)
+        .then((staged) => onSource({ ...parsed, sourceId: staged.sourceId, hash: staged.hash }))
+        .catch((error: Error) => onSource({ ...parsed, sourceId: "", hash: "", status: "error", message: error.message }));
+    };
+    reader.onerror = () => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The browser could not read this file.", sourceId: "", hash: "" });
     reader.readAsText(file);
   };
   return (
@@ -95,7 +99,7 @@ function SourceDrop({ kind, title, description, required, source, onSource }: {
       {source ? (
         <div className="file-summary">
           <div><strong>{source.name}</strong><small>{source.status === "ready" ? `${source.rows.toLocaleString()} ${source.rows === 1 ? "record" : "records"} · ${source.format.toUpperCase()} · ${formatBytes(source.bytes)}` : source.message}</small></div>
-          <Status tone={source.status === "ready" ? "pass" : "fail"} label={source.status === "ready" ? "Ready" : "Needs attention"} />
+          <Status tone={source.status === "ready" ? "pass" : source.status === "staging" ? "working" : "fail"} label={source.status === "ready" ? "Ready" : source.status === "staging" ? "Staging" : "Needs attention"} />
           <button onClick={() => input.current?.click()}>Replace</button>
         </div>
       ) : (
@@ -127,6 +131,7 @@ function MappingStep() {
   useEffect(() => {
     if (initialized) return;
     updateDraft({ mapping: {
+      ...draft.mapping,
       datasetId: inferPointer(dataPointers, ["/id", "/case_id", "/document_id", "/invoice_id"], draft.mapping.datasetId),
       datasetInput: inferPointer(dataPointers, ["/input", "/document", "/payload", "/text"], draft.mapping.datasetInput),
       datasetExpected: inferPointer(dataPointers, ["/expected", "/ground_truth", "/reference", "/target"], draft.mapping.datasetExpected),
@@ -134,6 +139,8 @@ function MappingStep() {
       baselineOutput: inferPointer(baselinePointers, ["/output", "/parsed_output", "/raw_output", "/result", "/response", "/prediction"], draft.mapping.baselineOutput),
       candidateId: inferPointer(candidatePointers, ["/id", "/case_id", "/document_id", "/invoice_id"], draft.mapping.candidateId),
       candidateOutput: inferPointer(candidatePointers, ["/output", "/parsed_output", "/raw_output", "/result", "/response", "/prediction"], draft.mapping.candidateOutput),
+      baselineStatus: inferOptionalPointer(baselinePointers, ["/status"], draft.mapping.baselineStatus), baselineError: inferOptionalPointer(baselinePointers, ["/error"], draft.mapping.baselineError), baselineLatency: inferOptionalPointer(baselinePointers, ["/latency_ms", "/latency"], draft.mapping.baselineLatency), baselineUsage: inferOptionalPointer(baselinePointers, ["/usage", "/tokens"], draft.mapping.baselineUsage), baselineCost: inferOptionalPointer(baselinePointers, ["/cost"], draft.mapping.baselineCost), baselineMetadata: inferOptionalPointer(baselinePointers, ["/metadata", "/provider_metadata"], draft.mapping.baselineMetadata),
+      candidateStatus: inferOptionalPointer(candidatePointers, ["/status"], draft.mapping.candidateStatus), candidateError: inferOptionalPointer(candidatePointers, ["/error"], draft.mapping.candidateError), candidateLatency: inferOptionalPointer(candidatePointers, ["/latency_ms", "/latency"], draft.mapping.candidateLatency), candidateUsage: inferOptionalPointer(candidatePointers, ["/usage", "/tokens"], draft.mapping.candidateUsage), candidateCost: inferOptionalPointer(candidatePointers, ["/cost"], draft.mapping.candidateCost), candidateMetadata: inferOptionalPointer(candidatePointers, ["/metadata", "/provider_metadata"], draft.mapping.candidateMetadata),
     }});
     setInitialized(true);
   }, [baselinePointers, candidatePointers, dataPointers, draft.mapping, initialized, updateDraft]);
@@ -159,6 +166,7 @@ function MappingStep() {
         <MappingCard title="Baseline" source={baseline} rows={baselineRows} options={baselinePointers} fields={[["Case ID", "baselineId", draft.mapping.baselineId], ["Output", "baselineOutput", draft.mapping.baselineOutput]]} set={set} />
         <MappingCard title="Candidate" source={candidate} rows={candidateRows} options={candidatePointers} fields={[["Case ID", "candidateId", draft.mapping.candidateId], ["Output", "candidateOutput", draft.mapping.candidateOutput]]} set={set} />
       </div>
+      <Card className="envelope-mapping"><div className="panel-heading"><div><h2>Optional output-envelope fields</h2><p>Preserve provider status, errors, latency, token usage, cost, and metadata in immutable evidence. Leave unavailable fields blank.</p></div></div><div className="envelope-grid"><EnvelopeFields prefix="baseline" title="Baseline envelope" mapping={draft.mapping} options={baselinePointers} set={set} /><EnvelopeFields prefix="candidate" title="Candidate envelope" mapping={draft.mapping} options={candidatePointers} set={set} /></div></Card>
       <Card className="coverage-card">
         <div><strong>{matched.toLocaleString()}</strong><span>matched cases</span></div>
         <div className={duplicates.length ? "metric-bad" : ""}><strong>{duplicates.length}</strong><span>duplicate IDs</span></div>
@@ -173,17 +181,23 @@ function MappingStep() {
   );
 }
 
-type MappingKey = "datasetId" | "datasetInput" | "datasetExpected" | "baselineId" | "baselineOutput" | "candidateId" | "candidateOutput";
+type MappingKey = keyof Mapping;
 function MappingCard({ title, source, rows, options, fields, set }: {
   title: string; source: SourceArtifact; rows: unknown[]; options: string[]; fields: Array<[string, MappingKey, string]>; set: (key: MappingKey, value: string) => void;
 }) {
   return (
     <Card className="mapping-card">
       <div className="mapping-title"><div><h2>{title}</h2><p>{source.name}</p></div><Status tone="pass" label={`${rows.length} rows`} /></div>
-      {fields.map(([label, key, value]) => <label className="field-select" key={key}><span>{label}<small>High confidence</small></span><div><select value={value} onChange={(event) => set(key, event.target.value)}>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select><ChevronDown size={15} /></div></label>)}
+      {fields.map(([label, key, value]) => <label className="field-select" key={key}><span>{label}<small>Suggested · verify</small></span><div><select value={value} onChange={(event) => set(key, event.target.value)}>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select><ChevronDown size={15} /></div></label>)}
       <div className="sample-json"><small>Sample record</small><pre>{JSON.stringify(rows[0], null, 2).slice(0, 620)}</pre></div>
     </Card>
   );
+}
+
+function inferOptionalPointer(options: string[], candidates: string[], previous?: string) { return candidates.find((pointer) => options.includes(pointer)) ?? (previous && options.includes(previous) ? previous : ""); }
+function EnvelopeFields({ prefix, title, mapping, options, set }: { prefix: "baseline" | "candidate"; title: string; mapping: Mapping; options: string[]; set: (key: MappingKey, value: string) => void }) {
+  const suffixes = [["Status", "Status"], ["Error", "Error"], ["Latency", "Latency"], ["Token usage", "Usage"], ["Cost", "Cost"], ["Provider metadata", "Metadata"]] as const;
+  return <fieldset><legend>{title}</legend>{suffixes.map(([label, suffix]) => { const key = `${prefix}${suffix}` as MappingKey; return <label key={key}><span>{label}</span><select value={mapping[key] ?? ""} onChange={(event) => set(key, event.target.value)}><option value="">Not available</option>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select></label>; })}</fieldset>;
 }
 
 function CorrectnessStep() {
@@ -204,7 +218,7 @@ function CorrectnessStep() {
           <thead><tr><th scope="col">Use</th><th scope="col">Field</th><th scope="col">Type</th><th scope="col">Expected</th><th scope="col">Baseline</th><th scope="col">Candidate</th><th scope="col">Comparison</th></tr></thead>
           <tbody>{draft.rules.map((rule) => {
             const missing = rule.candidateCoverage < rule.expectedCoverage;
-            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option></select></td></tr>;
+            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="required_fields">Required presence</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="keyed_array">Keyed array</option></select>{rule.kind === "normalized_string" && <label className="inline-option"><input type="checkbox" checked={rule.caseInsensitive ?? true} onChange={(event) => update(rule.pointer, { caseInsensitive: event.target.checked })} /> Ignore case</label>}{rule.kind === "canonical_date" && <select value={rule.formats ?? "iso"} onChange={(event) => update(rule.pointer, { formats: event.target.value })} aria-label={`Accepted date formats for ${rule.pointer}`}><option value="iso">ISO only</option><option value="iso,dmy_slash">ISO + DMY slash</option><option value="iso,mdy_slash">ISO + MDY slash</option></select>}{rule.kind === "decimal_tolerance" && <input value={rule.tolerance ?? "0.01"} onChange={(event) => update(rule.pointer, { tolerance: event.target.value })} aria-label={`Absolute tolerance for ${rule.pointer}`} />}{rule.kind === "keyed_array" && <div className="keyed-array-options"><input value={rule.keys ?? ""} onChange={(event) => update(rule.pointer, { keys: event.target.value })} placeholder="Item key, e.g. /sku" aria-label={`Item keys for ${rule.pointer}`} /><input value={rule.fields ?? ""} onChange={(event) => update(rule.pointer, { fields: event.target.value })} placeholder="/quantity:exact_integer" aria-label={`Compared fields for ${rule.pointer}`} /></div>}</td></tr>;
           })}</tbody>
         </table>
         {!draft.rules.length && <div className="table-empty"><AlertTriangle size={20} /><strong>No semantic fields were discovered</strong><p>Check the expected and output mappings on the previous step.</p></div>}
@@ -229,10 +243,11 @@ function EvidenceStep() {
   return (
     <>
       <PageHeader eyebrow="Step 4 of 6" title="How should StructTrace judge this comparison?" description="Choose the authority of this result. Evidence checks cannot be bypassed by a quality metric." />
-      <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{text}</p></div></button>)}</div>
+      <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode, minCases: mode === "release" ? Math.max(100, draft.minCases) : draft.minCases })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{text}</p></div></button>)}</div>
       <Card className="evidence-profile">
         <div className="panel-heading"><div><h2>{draft.gateMode === "release" ? "Conservative release profile" : "Balanced evidence profile"}</h2><p>Plain-language thresholds generated into the reproducible configuration.</p></div><ShieldCheck size={22} /></div>
-        <label className="range-field"><span><strong>Required independent cases</strong><small>Current dataset contains {rows.toLocaleString()} rows.</small></span><input type="number" min="1" max="100000" value={draft.minCases} onChange={(event) => updateDraft({ minCases: Math.max(1, Number(event.target.value)) })} /></label>
+        <label className="range-field"><span><strong>Required independent cases</strong><small>Current dataset contains {rows.toLocaleString()} rows.{draft.gateMode === "release" ? " Release authority requires at least 100." : ""}</small></span><input type="number" min={draft.gateMode === "release" ? "100" : "1"} max="100000" value={draft.minCases} onChange={(event) => updateDraft({ minCases: Math.max(draft.gateMode === "release" ? 100 : 1, Number(event.target.value)) })} /></label>
+        <label className="setting-row"><span><strong>Invoice financial invariants</strong><small>Enable only when outputs use /line_items, /subtotal, /tax, and /total. Uses absolute tolerance 0.01.</small></span><input type="checkbox" checked={draft.financialInvariants} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
         <div className="evidence-rules"><span><Check size={15} /> At least 99% fully evaluated</span><span><Check size={15} /> No repeated-trial conflicts</span><span><Check size={15} /> Candidate may regress by at most 0 pp</span>{draft.gateMode === "release" && <><span><Check size={15} /> Candidate deployment success at least 95%</span><span><Check size={15} /> Candidate strict JSON and schema validity 100%</span></>}</div>
       </Card>
       {!sufficient && draft.gateMode !== "advisory" && <InlineNotice tone="warning" title="Analysis available; authority disabled">This dataset has {rows} rows, below the configured minimum of {draft.minCases}. StructTrace will preserve the result as insufficient evidence instead of overstating it.</InlineNotice>}
@@ -262,12 +277,11 @@ function ReviewStep() {
   );
 }
 
-const runStages = ["Validate sources", "Parse structured outputs", "Validate schema", "Run correctness rules", "Build paired evidence", "Generate report", "Verify artifacts"];
 function RunStep() {
   const { draft, setResult } = useWorkspace();
   const navigate = useNavigate();
-  const [visibleStage, setVisibleStage] = useState(0);
   const request = useMemo<ComparisonRequest>(() => ({
+    projectId: draft.projectId,
     name: draft.name,
     baselineName: draft.baselineName,
     candidateName: draft.candidateName,
@@ -278,29 +292,22 @@ function RunStep() {
       schema: draft.sources.schema ? sourcePayload(draft.sources.schema) : undefined,
     },
     mapping: draft.mapping,
-    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance }) => ({ pointer, kind, tolerance })),
+    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance, keys, fields, formats, caseInsensitive }) => ({ pointer, kind, tolerance, keys, fields, formats, caseInsensitive })),
     gateMode: draft.gateMode,
     minCases: draft.minCases,
     financialInvariants: draft.financialInvariants,
   }), [draft]);
   const run = useMutation({ mutationFn: () => runComparison(request), onSuccess: (result) => {
-    setVisibleStage(runStages.length);
     setResult(result);
     window.setTimeout(() => void navigate({ to: "/runs/$runId", params: { runId: result.runId } }), 450);
   }});
   useEffect(() => { if (run.isIdle) run.mutate(); }, [run]);
-  useEffect(() => {
-    if (!run.isPending) return;
-    const timer = window.setInterval(() => setVisibleStage((current) => Math.min(current + 1, runStages.length - 1)), 500);
-    return () => window.clearInterval(timer);
-  }, [run.isPending]);
   return (
     <div className="run-screen">
       <PageHeader eyebrow="Step 6 of 6" title={`Comparing ${draft.sources.dataset?.rows ?? 0} cases`} description="Baseline and candidate outputs are loaded. The Rust engine is building verified paired evidence." />
       <Card className="run-progress">
         <div className="progress-head"><div><LoaderCircle className={run.isPending ? "spin" : ""} /><span><strong>{run.isError ? "Comparison stopped" : run.isSuccess ? "Artifacts verified" : "Comparison running"}</strong><small>{run.isError ? "No decision was produced." : "No network calls or telemetry."}</small></span></div><Status tone={run.isError ? "fail" : run.isSuccess ? "pass" : "working"} label={run.isError ? "Run error" : run.isSuccess ? "Complete" : "In progress"} /></div>
-        <div className="progress-line"><span style={{ width: `${Math.max(8, (visibleStage / runStages.length) * 100)}%` }} /></div>
-        <ol className="stage-list">{runStages.map((stage, index) => <li key={stage} className={index < visibleStage ? "complete" : index === visibleStage && run.isPending ? "active" : "pending"}><span>{index < visibleStage || run.isSuccess ? <Check size={15} /> : index === visibleStage && run.isPending ? <LoaderCircle size={15} className="spin" /> : index + 1}</span><strong>{stage}</strong><small>{index < visibleStage || run.isSuccess ? "Complete" : index === visibleStage && run.isPending ? "Working…" : "Waiting"}</small></li>)}</ol>
+        {run.isPending && <InlineNotice title="Synchronous local evaluation"><span>The Rust engine is working as one bounded operation. This workflow does not claim fabricated stage progress and cannot be cancelled safely after execution begins.</span></InlineNotice>}
       </Card>
       {run.isError && <InlineNotice tone="danger" title="StructTrace could not complete this comparison"><p>{run.error.message}</p><Button variant="secondary" onClick={() => run.mutate()}>Try again</Button></InlineNotice>}
     </div>
@@ -308,5 +315,5 @@ function RunStep() {
 }
 
 function sourcePayload(source: SourceArtifact) {
-  return { name: source.name, format: source.format, content: source.content };
+  return { sourceId: source.sourceId };
 }

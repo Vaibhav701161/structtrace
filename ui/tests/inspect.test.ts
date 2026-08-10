@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectFormat, parseArtifact, parseRows, valueAt } from "../src/features/import/inspect";
+import { detectFormat, discoverRules, parseArtifact, parseRows, valueAt } from "../src/features/import/inspect";
 
 describe("local import inspection", () => {
   it("reports the exact invalid JSONL line", () => {
@@ -16,5 +16,14 @@ describe("local import inspection", () => {
   it("detects arrays as JSON and newline records as JSONL", () => {
     expect(detectFormat("cases.data", "[{}]")).toBe("json");
     expect(detectFormat("cases.data", "{}\n{}\n")).toBe("jsonl");
+  });
+
+  it("suggests numeric-string and keyed-array semantics without enabling them", () => {
+    const dataset = parseArtifact("dataset", "data.jsonl", '{"id":"a","expected":{"amount":"12.50","items":[{"sku":"x"}]}}\n');
+    const baseline = parseArtifact("baseline", "baseline.jsonl", '{"id":"a","output":{"amount":"12.50","items":[{"sku":"x"}]}}\n');
+    const candidate = parseArtifact("candidate", "candidate.jsonl", '{"id":"a","output":{"amount":"12.50","items":[{"sku":"x"}]}}\n');
+    const rules = discoverRules(dataset, baseline, candidate, "/expected", "/output", "/output");
+    expect(rules.find((rule) => rule.pointer === "/amount")).toMatchObject({ kind: "decimal_exact", enabled: false });
+    expect(rules.find((rule) => rule.pointer === "/items")).toMatchObject({ kind: "keyed_array", enabled: false });
   });
 });

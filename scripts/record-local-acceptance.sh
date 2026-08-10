@@ -6,6 +6,7 @@ audit_output="${1:-$audit_root/acceptance/local-release-audit.json}"
 audit_log_dir="$audit_root/target/local-acceptance"
 audit_checks_file="$(mktemp)"
 audit_failed=0
+audit_browser_args="${STRUCTTRACE_ACCEPTANCE_BROWSER_ARGS---project=chromium --project=firefox}"
 
 mkdir -p "$audit_log_dir"
 printf '[]\n' >"$audit_checks_file"
@@ -53,7 +54,12 @@ fi
 record_check fmt 'cargo fmt --all -- --check'
 record_check clippy 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
 record_check tests 'cargo test --workspace --all-features --locked'
+record_check frontend_audit 'cd ui && npm audit --audit-level=high'
+record_check frontend_tests 'cd ui && npm run check'
+record_check frontend_build 'cd ui && npm run build && git diff --exit-code -- dist' 'ui/dist/assets/app.js,ui/dist/assets/app.css'
 record_check release_build 'cargo build --release --workspace --locked' 'target/release/structtrace'
+record_check release_ui_smoke './scripts/smoke-release-ui.sh target/release/structtrace' 'target/release/structtrace,ui/dist/assets/app.js,ui/dist/assets/app.css'
+record_check browser_e2e "./scripts/test-local-ui-e2e.sh $audit_browser_args" 'ui/tests/e2e/accessibility.spec.ts'
 record_check documentation 'mdbook build' 'docs/book/index.html'
 record_check release_cli_help 'target/release/structtrace --help' 'target/release/structtrace'
 audit_binary_digest="$(sha256sum "$audit_root/target/release/structtrace" | awk '{print $1}')"

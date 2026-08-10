@@ -28,12 +28,10 @@ structtrace-core = { path = "../structtrace-core", version = "0.1.0" }
 structtrace-engine = { path = "../structtrace-engine", version = "0.1.0" }
 structtrace-report = { path = "../structtrace-report", version = "0.1.0" }
 tokio.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ulid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

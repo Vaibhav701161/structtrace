@@ -20,9 +20,22 @@ structtrace open
 
 Drop golden, baseline, and candidate JSONL, JSON, or CSV files; confirm mappings visually; select
 deterministic correctness rules; choose the authority of the evidence; and inspect the exact paired
-regressions. StructTrace generates the reproducible project and CI check after the visual setup.
+regressions. StructTrace generates a reproducible local project; its CI screen emits a reviewable
+starter, not a falsely runnable workflow without the project-specific sources and installation step.
 The UI is capability-protected, loopback-only, offline after installation, and has no login,
 telemetry, CDN, or Node.js runtime. See the [local UI guide](docs/src/local-ui.md).
+
+Browser-selected sources are staged once beneath `.structtrace/ui/staged-sources/`, identified by
+opaque IDs, and verified against BLAKE3 digests before use. Autosaved drafts contain references and
+mapping policy, not repeated copies of full source contents. A stable project identity retains
+immutable earlier runs when the same setup is evaluated again. Runs created directly in a project
+with `structtrace --project-root <folder> open` appear in the same comparison history. “Saved cases”
+are review bookmarks only; the UI does not market them as an enforced regression suite.
+An authorizing Release result can promote its exact candidate bytes into the next comparison;
+the project records the source run, manifest hash, staged-source hash, and visible baseline provenance.
+Non-authorizing runs have no promotion action or hidden override.
+The Projects screen can reopen, rename, duplicate, and recoverably archive the saved setup. Archived
+projects move out of active history without deleting their evidence.
 
 **Release status:** private release candidate. Core local engineering checks are passing; public
 binary installation, clean-browser performance across the OS matrix, and independent-user

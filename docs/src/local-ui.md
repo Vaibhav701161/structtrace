@@ -26,7 +26,10 @@ The browser guides a comparison through six explicit stages:
    verification path.
 
 JSON, JSONL, and ordinary CSV sources are accepted. Browser uploads are content-only: the API does
-not accept arbitrary local paths. Each file is capped at 32 MiB and the complete request at 64 MiB.
+not accept arbitrary local paths. Each source is staged exactly once under an opaque ULID and
+BLAKE3 digest. Draft autosaves contain only that reference plus mappings and policy; source bytes
+are reloaded from the staged store only after their digest is verified. The source screen exposes
+save failures and a destructive, explicit clear action. Each file is capped at 32 MiB and the complete request at 64 MiB.
 Duplicate IDs, label leakage, malformed lines, missing outputs, insufficient evidence, and evaluator
 failures remain visible and fail closed.
 
@@ -54,6 +57,15 @@ table. A request can return no more than 500 cases, filters and search execute o
 the complete case artifact remains subject to the existing 64 MiB evidence bound. This avoids
 placing an entire large run in either an API response or the browser DOM.
 
+The case drawer uses JSON Pointer-addressed structural rows, marks failing fields across expected,
+baseline, and candidate values, can collapse to the failed paths, and copies exact pointers. Error,
+not-applicable, and unscored evaluator states remain distinct from a semantic “wrong” result.
+
+The current recorded evaluation executes as one bounded synchronous Rust operation. The browser
+uses an indeterminate working state and explicitly says that cancellation is unavailable; it does
+not animate invented parser/scorer stages. Real background jobs, cancellation, and resume are not
+claimed by this release candidate.
+
 ## Security boundary
 
 Every page, asset, and `/api/v1` endpoint requires the per-process capability path. The server
@@ -61,9 +73,22 @@ rejects foreign Host, Origin, and Referer values. Responses are `no-store` and c
 Content Security Policy, frame denial, referrer denial, and MIME-sniffing protection. Static assets
 are compiled into the Rust binary and have no runtime network dependency.
 
-Drafts and completed projects are retained beneath `.structtrace/ui/`. The browser keeps only
-ephemeral wizard state and presentation preferences. Completed evidence continues to use the same
-hash-bound portable artifacts and replay model as the CLI.
+Draft references, staged sources, and browser-created projects are retained beneath
+`.structtrace/ui/`. Re-running a retained draft updates that stable project definition atomically
+while preserving every prior immutable run. CLI projects opened with
+`structtrace --project-root <folder> open` are discovered alongside UI-created projects. Completed
+evidence continues to use the same hash-bound portable artifacts and replay model as the CLI.
+The Projects screen reopens the saved wizard policy, persists name changes, duplicates a project
+under a new identity, and moves archived projects to `.structtrace/ui/archived-projects/` rather
+than deleting them. A new comparison always receives a new project identity.
+
+Saved cases are local bookmarks and are deliberately not described as a regression suite. The CI
+screen generates a starter template whose missing installation and project binding must be reviewed;
+it does not claim that the fragment is immediately runnable. Candidate-baseline promotion appears
+only for an authorizing Release decision. It copies the immutable candidate input into a separately
+hash-bound staged source, records the accepted run ID and candidate artifact hash, and prepares the
+same persistent project for its next candidate. Advisory, regression, insufficient-evidence, and
+failed decisions cannot promote a baseline; there is no unrecorded override path.
 
 ## Frontend development
 
@@ -79,6 +104,7 @@ cd ..
 ./scripts/test-local-ui-e2e.sh --project=chromium
 ```
 
-Release CI verifies the checked-in embedded build matches the TypeScript source and runs WCAG A/AA
-browser tests across Chromium, Firefox, and WebKit. The local UI does not change the status of live
+Release CI verifies the checked-in embedded build matches the TypeScript source, exercises direct
+result refresh and asset MIME types, and runs light/dark and responsive WCAG A/AA browser tests
+across Chromium, Firefox, and WebKit. The local UI does not change the status of live
 command, Python, or provider adapters; recorded outputs remain the stable private-alpha path.

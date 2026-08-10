@@ -1,8 +1,8 @@
-import { casePageSchema, comparisonDraftSchema, pinnedCaseSchema, runResultSchema, systemResponseSchema, type ComparisonRequest } from "./types";
+import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
 
 function capabilityBase(): string {
   const first = window.location.pathname.split("/").filter(Boolean)[0];
-  if (!first || first === "new" || first === "runs" || first === "regressions" || first === "ci" || first === "settings") {
+  if (!first || first === "new" || first === "runs" || first === "projects" || first === "regressions" || first === "ci" || first === "settings") {
     return "";
   }
   return `/${first}`;
@@ -20,9 +20,19 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
     const message = typeof payload === "object" && payload && "message" in payload
       ? String(payload.message)
       : `Local API returned ${response.status}`;
-    throw new Error(message);
+    const code = typeof payload === "object" && payload && "code" in payload
+      ? String(payload.code)
+      : "http_error";
+    throw new ApiError(code, message, response.status);
   }
   return payload;
+}
+
+export class ApiError extends Error {
+  constructor(public readonly code: string, message: string, public readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 export async function getSystem() {
@@ -40,8 +50,23 @@ export async function runComparison(comparison: ComparisonRequest) {
   }));
 }
 
+export async function stageSource(kind: SourceKind, source: SourceArtifact): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes">> {
+  return await request("/sources", {
+    method: "POST",
+    body: JSON.stringify({ kind, file: { name: source.name, format: source.format, content: source.content } }),
+  }) as Pick<SourceArtifact, "sourceId" | "hash" | "bytes">;
+}
+
 export async function getRun(runId: string) {
   return runResultSchema.parse(await request(`/runs/${encodeURIComponent(runId)}`));
+}
+
+export async function acceptRun(runId: string) {
+  return acceptedBaselineSchema.parse(await request(`/runs/${encodeURIComponent(runId)}/accept`, { method: "POST", body: "{}" }));
+}
+
+export async function getAcceptedBaseline(projectId: string) {
+  return acceptedBaselineSchema.parse(await request(`/projects/${encodeURIComponent(projectId)}/accepted-baseline`));
 }
 
 export async function getRunCases(runId: string, offset: number, filter: string, search: string) {
@@ -53,8 +78,22 @@ export async function getRuns() {
   return runResultSchema.array().parse(await request("/runs"));
 }
 
-export async function acceptRun(runId: string) {
-  return request(`/runs/${encodeURIComponent(runId)}/accept`, { method: "POST", body: "{}" });
+export async function getProjects() {
+  return projectSummarySchema.array().parse(await request("/projects"));
+}
+
+export async function getProject(projectId: string) {
+  const payload = await request(`/projects/${encodeURIComponent(projectId)}`) as { draft?: unknown };
+  return comparisonDraftSchema.parse(payload.draft);
+}
+
+export async function duplicateProject(projectId: string) {
+  const payload = await request(`/projects/${encodeURIComponent(projectId)}/duplicate`, { method: "POST", body: "{}" }) as { draft?: unknown };
+  return comparisonDraftSchema.parse(payload.draft);
+}
+
+export async function archiveProject(projectId: string) {
+  await request(`/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
 }
 
 export async function getPinnedCases() {
@@ -72,13 +111,36 @@ export async function deletePinnedCase(pinId: string) {
   await request(`/regressions/${encodeURIComponent(pinId)}`, { method: "DELETE" });
 }
 
+export async function updatePinnedCase(pinId: string, note: string, status: "open" | "fixed") {
+  return pinnedCaseSchema.parse(await request(`/regressions/${encodeURIComponent(pinId)}`, { method: "PUT", body: JSON.stringify({ note, status }) }));
+}
+
 export async function saveDraft(draft: unknown) {
-  await request("/comparisons/draft", { method: "PUT", body: JSON.stringify(draft) });
+  const value = draftForStorage(draft);
+  await request("/comparisons/draft", { method: "PUT", body: JSON.stringify(value) });
+}
+
+export function draftForStorage(draft: unknown): Record<string, unknown> {
+  const value = structuredClone(draft) as Record<string, unknown>;
+  const sources = value.sources;
+  if (sources && typeof sources === "object") {
+    for (const source of Object.values(sources)) {
+      if (source && typeof source === "object") delete (source as Record<string, unknown>).content;
+    }
+    for (const [kind, source] of Object.entries(sources)) {
+      if (!source || typeof source !== "object" || !(source as Record<string, unknown>).sourceId) delete (sources as Record<string, unknown>)[kind];
+    }
+  }
+  return value;
 }
 
 export async function getDraft() {
   const payload = await request("/comparisons/draft") as { draft?: unknown };
   return payload.draft == null ? null : comparisonDraftSchema.parse(payload.draft);
+}
+
+export async function deleteDraft() {
+  await request("/comparisons/draft", { method: "DELETE" });
 }
 
 export async function generateCi(mode: "regression" | "release") {

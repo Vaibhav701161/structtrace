@@ -7,7 +7,7 @@ import { useWorkspace } from "../../state/workspace";
 
 export function Welcome() {
   const navigate = useNavigate();
-  const { setResult } = useWorkspace();
+  const { setResult, reset } = useWorkspace();
   const demo = useMutation({
     mutationFn: runDemo,
     onSuccess: (result) => { setResult(result); void navigate({ to: "/runs/$runId", params: { runId: result.runId } }); },
@@ -22,12 +22,12 @@ export function Welcome() {
           <h1>Your schema passed.<br /><span>Did the answer?</span></h1>
           <p>Compare two structured-output systems and catch valid-but-wrong regressions before shipping a change.</p>
           <div className="hero-actions">
-            <Button icon={ArrowRight} onClick={() => void navigate({ to: "/new/source" })}>Compare a change</Button>
+            <Button icon={ArrowRight} onClick={() => { reset(); void navigate({ to: "/new/source" }); }}>Compare a change</Button>
             <Button variant="secondary" icon={demo.isPending ? undefined : Play} onClick={() => demo.mutate()} disabled={demo.isPending}>{demo.isPending ? "Running local demo…" : "Try invoice demo"}</Button>
           </div>
           {demo.isError && <InlineNotice tone="danger" title="Demo could not run">{demo.error.message}</InlineNotice>}
           <div className="trust-row"><span><ShieldCheck size={16} /> No account</span><span>No telemetry</span><span>Your data stays on this machine</span></div>
-          <div className="secondary-links"><button disabled title="Folder-based setup import is not part of the current private alpha"><FolderOpen size={16} /> Open an existing setup · coming next</button><a href="https://github.com/Vaibhav701161/structtrace/tree/main/docs"><FileSearch size={16} /> View documentation</a></div>
+          <div className="secondary-links"><button onClick={() => void navigate({ to: "/projects" })}><FolderOpen size={16} /> Open a saved project</button><a href="https://github.com/Vaibhav701161/structtrace/tree/main/docs"><FileSearch size={16} /> View documentation</a></div>
         </div>
         <div className="hero-product" aria-label="Example StructTrace release decision">
           <div className="product-window-bar"><span /><span /><span /><small>invoice-extraction / bundled verified demo</small></div>
@@ -40,7 +40,7 @@ export function Welcome() {
             <div><span>Semantically correct</span><strong>9/12 <em>→</em> 9/12</strong><small className="neutral-change">0.0 pp</small></div>
             <div><span>Valid but wrong</span><strong>1/12 <em>→</em> 3/12</strong><small className="negative">+16.7 pp</small></div>
           </div>
-          <div className="preview-chart"><div><span>Both pass</span><i style={{ width: "100%" }} /><b>6</b></div><div><span>Regressions</span><i style={{ width: "50%" }} /><b>3</b></div><div><span>Improvements</span><i className="improvement-bar" style={{ width: "50%" }} /><b>3</b></div></div>
+          <div className="preview-chart"><div className="both-pass-preview"><span>Both pass</span><i style={{ width: "100%" }} /><b>6</b></div><div><span>Regressions</span><i style={{ width: "50%" }} /><b>3</b></div><div><span>Improvements</span><i className="improvement-bar" style={{ width: "50%" }} /><b>3</b></div></div>
         </div>
       </section>
       <footer className="welcome-footer">Built on a deterministic Rust evidence engine. Works offline after installation.</footer>

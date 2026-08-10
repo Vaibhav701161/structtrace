@@ -123,11 +123,20 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: "1.87.0"
           components: rustfmt, clippy
       - run: cargo install mdbook --version 0.4.43 --locked
+      - run: npm ci
+        working-directory: ui
+      - run: npx playwright install --with-deps chromium firefox webkit
+        working-directory: ui
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo install --path crates/structtrace-cli --locked
       - run: structtrace --help
@@ -150,6 +159,8 @@ jobs:
       - run: structtrace --project-root examples/tool-calling run
       - name: Generate commit-bound acceptance evidence
         run: ./scripts/record-local-acceptance.sh acceptance/ci-release-audit.json
+        env:
+          STRUCTTRACE_ACCEPTANCE_BROWSER_ARGS: ""
       - name: Upload acceptance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
