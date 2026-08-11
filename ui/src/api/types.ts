@@ -36,10 +36,18 @@ export interface FieldRule {
   keys?: string;
   fields?: string;
   keyFields?: string[];
+  keyPolicies?: Array<{
+    pointer: string;
+    kind: "exact" | "normalized_string" | "exact_integer" | "canonical_date";
+    caseInsensitive?: boolean;
+    formats?: string;
+  }>;
   arrayFields?: Array<{
     pointer: string;
     kind: "exact" | "normalized_string" | "canonical_date" | "exact_integer" | "decimal_exact" | "decimal_tolerance";
     tolerance?: string;
+    caseInsensitive?: boolean;
+    formats?: string;
   }>;
   formats?: string;
   caseInsensitive?: boolean;
@@ -47,6 +55,17 @@ export interface FieldRule {
   baselineCoverage: number;
   candidateCoverage: number;
   observedType: string;
+}
+
+export interface FinancialMapping {
+  lineItemsPointer: string;
+  quantityPointer: string;
+  unitPricePointer: string;
+  amountPointer: string;
+  subtotalPointer: string;
+  taxPointer: string;
+  totalPointer: string;
+  absolute: string;
 }
 
 export interface Mapping {
@@ -72,6 +91,7 @@ export interface ComparisonDraft {
   gateMode: GateMode;
   minCases: number;
   financialInvariants: boolean;
+  financialMapping: FinancialMapping;
   activeJobId?: string;
 }
 
@@ -115,7 +135,7 @@ const pairedSchema = z.object({
   baseline_only_pass: z.number(),
   candidate_only_pass: z.number(),
   both_fail: z.number(),
-  difference_pp: z.number(),
+  difference_pp: z.number().nullable(),
   mcnemar_exact_p: z.number(),
 });
 
@@ -137,7 +157,7 @@ export const runResultSchema = z.object({
       excluded_pairs: z.number(),
       paired: pairedSchema,
     }),
-    bootstrap: z.object({ lower_pp: z.number(), upper_pp: z.number() }),
+    bootstrap: z.object({ lower_pp: z.number(), upper_pp: z.number() }).nullable(),
     evidence: z.object({
       total_rows: z.number(),
       effective_inference_units: z.number(),
@@ -257,6 +277,7 @@ export interface ComparisonRequest {
   gateMode: GateMode;
   minCases: number;
   financialInvariants: boolean;
+  financialMapping: FinancialMapping | null;
 }
 
 const sourceArtifactSchema = z.object({
@@ -300,10 +321,18 @@ const fieldRuleSchema = z.object({
   keys: z.string().optional(),
   fields: z.string().optional(),
   keyFields: z.array(z.string()).optional(),
+  keyPolicies: z.array(z.object({
+    pointer: z.string(),
+    kind: z.enum(["exact", "normalized_string", "exact_integer", "canonical_date"]),
+    caseInsensitive: z.boolean().optional(),
+    formats: z.string().optional(),
+  })).optional(),
   arrayFields: z.array(z.object({
     pointer: z.string(),
     kind: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_exact", "decimal_tolerance"]),
     tolerance: z.string().optional(),
+    caseInsensitive: z.boolean().optional(),
+    formats: z.string().optional(),
   })).optional(),
   formats: z.string().optional(),
   caseInsensitive: z.boolean().optional(),
@@ -334,5 +363,14 @@ export const comparisonDraftSchema: z.ZodType<ComparisonDraft> = z.object({
   gateMode: gateModeSchema,
   minCases: z.number(),
   financialInvariants: z.boolean(),
+  financialMapping: z.object({
+    lineItemsPointer: z.string(), quantityPointer: z.string(), unitPricePointer: z.string(),
+    amountPointer: z.string(), subtotalPointer: z.string(), taxPointer: z.string(),
+    totalPointer: z.string(), absolute: z.string(),
+  }).default({
+    lineItemsPointer: "/line_items", quantityPointer: "/quantity", unitPricePointer: "/unit_price",
+    amountPointer: "/amount", subtotalPointer: "/subtotal", taxPointer: "/tax",
+    totalPointer: "/total", absolute: "0.01",
+  }),
   activeJobId: z.string().optional(),
 });

@@ -29,7 +29,7 @@ use structtrace_core::{
     dataset::Dataset,
     evaluation::{
         EvaluationStatus, EvaluatorResult, OutcomeResult, OutcomeStatus, compile_schema,
-        evaluate_case_with_external,
+        evaluate_case_with_external, validate_references,
     },
     gate::{GateInputs, evaluate_gate},
     hashing::{hash_bytes, hash_canonical_json, hash_file},
@@ -206,6 +206,14 @@ fn run_recorded_with_snapshot(
     );
     let dataset_path = resolve(project_root, &config.dataset.path);
     let dataset = Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits)?;
+    let reference_issues = validate_references(&dataset.cases, &config.evaluators);
+    if !reference_issues.is_empty() {
+        anyhow::bail!(
+            "dataset reference preflight failed with {} issue(s); no output loading or candidate scoring occurred: {}",
+            reference_issues.len(),
+            serde_json::to_string(&reference_issues.iter().take(20).collect::<Vec<_>>())?
+        );
+    }
     observe(observer, "loading_inputs", 1, 4)?;
     let schema_path = resolve(project_root, &config.schema.path);
     let schema_bytes = structtrace_core::hashing::read_bounded(
@@ -359,6 +367,15 @@ fn finalize_prepared_for_run_observed(
     let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)
         .context("retained schema is not valid strict JSON")?;
     let schema = compile_schema(&schema_value)?;
+    let reference_issues = validate_references(&dataset.cases, &config.evaluators);
+    if !reference_issues.is_empty() {
+        let shown = reference_issues.iter().take(20).collect::<Vec<_>>();
+        anyhow::bail!(
+            "dataset reference preflight failed with {} issue(s); no candidate scoring occurred: {}",
+            reference_issues.len(),
+            serde_json::to_string(&shown)?
+        );
+    }
     let storage_root = resolve(project_root, &config.storage.root);
     let (run_id, store) = if let Some(run_id) = existing_run_id {
         let store = RunStore::open(&storage_root.join("runs").join(&run_id))?;
@@ -1104,20 +1121,14 @@ pub(crate) fn build_summary(
         .collect::<Vec<_>>();
     let deployment_paired = paired_metrics(&deployment_pairs);
     let independent_bootstrap = if deployment_pairs.is_empty() {
-        structtrace_core::statistics::BootstrapInterval {
-            lower_pp: 0.0,
-            upper_pp: 0.0,
-            confidence: config.analysis.bootstrap.confidence,
-            samples: 0,
-            seed: config.analysis.bootstrap.seed,
-        }
+        None
     } else {
-        paired_bootstrap(
+        Some(paired_bootstrap(
             &deployment_pairs,
             config.analysis.bootstrap.samples,
             config.analysis.bootstrap.confidence,
             config.analysis.bootstrap.seed,
-        )?
+        )?)
     };
     let evidence = EvidenceSummary {
         total_rows: records.len(),
@@ -1194,8 +1205,9 @@ pub(crate) fn build_summary(
                 .bootstrap
                 .as_ref()
                 .map(|interval| interval.lower_pp),
-            deployment_lower_confidence_bound_pp: (independent_bootstrap.samples > 0)
-                .then_some(independent_bootstrap.lower_pp),
+            deployment_lower_confidence_bound_pp: independent_bootstrap
+                .as_ref()
+                .map(|interval| interval.lower_pp),
             candidate_schema_validity: rate(candidate.schema_valid, candidate.total),
             candidate_error_rate: rate(candidate.errors, candidate.total),
             candidate_timeout_rate: rate(candidate.timeouts, candidate.total),
@@ -1731,10 +1743,7 @@ fn field_hotspots(
             for (evaluator_id, result) in evaluations {
                 if evaluator_ids.contains(evaluator_id.as_str()) {
                     for field in &result.fields {
-                        keys.insert((
-                            evaluator_id.clone(),
-                            normalize_hotspot_pointer(&field.pointer),
-                        ));
+                        keys.insert((evaluator_id.clone(), hotspot_pointer(field)));
                     }
                 }
             }
@@ -1802,7 +1811,7 @@ fn field_status(
         let statuses = result
             .fields
             .iter()
-            .filter(|field| normalize_hotspot_pointer(&field.pointer) == pointer)
+            .filter(|field| hotspot_pointer(field) == pointer)
             .map(|field| field.status)
             .collect::<Vec<_>>();
         if statuses.contains(&EvaluationStatus::Error) {
@@ -1829,18 +1838,11 @@ fn increment_field_state(counts: &mut EvaluatorStateCounts, status: Option<Evalu
     }
 }
 
-fn normalize_hotspot_pointer(pointer: &str) -> String {
-    pointer
-        .split('/')
-        .map(|segment| {
-            if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
-                "*"
-            } else {
-                segment
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+fn hotspot_pointer(field: &structtrace_core::evaluation::FieldEvaluationFact) -> String {
+    field
+        .aggregation_pointer
+        .clone()
+        .unwrap_or_else(|| field.pointer.clone())
 }
 
 fn evaluator_state_counts(
@@ -1941,6 +1943,27 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
             summary.gate.status.label()
         ),
     };
+    let deployment_effect = summary.paired.difference_pp.map_or_else(
+        || "Not estimable".to_owned(),
+        |value| format!("{value:+.2} percentage points"),
+    );
+    let deployment_interval = summary.bootstrap.as_ref().map_or_else(
+        || "Not available (no independent evidence units)".to_owned(),
+        |interval| format!("[{:.2}, {:.2}] pp", interval.lower_pp, interval.upper_pp),
+    );
+    let semantic_effect = summary
+        .jointly_scored_semantic
+        .paired
+        .difference_pp
+        .map_or_else(
+            || "Not estimable".to_owned(),
+            |value| format!("{value:+.2} pp"),
+        );
+    let mcnemar = if summary.paired.total > 0 {
+        format!("{:.6}", summary.paired.mcnemar_exact_p)
+    } else {
+        "Not available".to_owned()
+    };
     format!(
         "# StructTrace run: {project_name}\n\n\
          **{gate}**\n\n\
@@ -1959,13 +1982,13 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
          Effective inference denominator: **{}**  \n\
          Inference policy: **{}**  \n\
          Descriptive all-row primary results: baseline **{}/{}**, candidate **{}/{}** (no independence claim)  \n\
-         Deployment-success paired difference: **{:+.2} percentage points**  \n\
+         Deployment-success paired difference: **{}**  \n\
          Candidate-only wins: **{}**  \n\
          Baseline-only wins: **{}**  \n\
-         Exact McNemar p: **{:.6}**  \n\
-         Independent paired bootstrap interval: **[{:.2}, {:.2}] pp**  \n\
+         Exact McNemar p: **{}**  \n\
+         Independent paired bootstrap interval: **{}**  \n\
          Jointly scored semantic pairs: **{}** ({} operational/error pairs excluded)  \n\
-         Jointly scored semantic difference: **{:+.2} pp**\n",
+         Jointly scored semantic difference: **{}**\n",
         summary.baseline.deployment_success,
         summary.baseline.total,
         summary.candidate.deployment_success,
@@ -1993,15 +2016,14 @@ fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {
         summary.descriptive_baseline.total,
         summary.descriptive_candidate.primary_pass,
         summary.descriptive_candidate.total,
-        summary.paired.difference_pp,
+        deployment_effect,
         summary.paired.candidate_only_pass,
         summary.paired.baseline_only_pass,
-        summary.paired.mcnemar_exact_p,
-        summary.bootstrap.lower_pp,
-        summary.bootstrap.upper_pp,
+        mcnemar,
+        deployment_interval,
         summary.jointly_scored_semantic.jointly_scored_cases,
         summary.jointly_scored_semantic.excluded_pairs,
-        summary.jointly_scored_semantic.paired.difference_pp,
+        semantic_effect,
     )
 }
 
@@ -2476,6 +2498,102 @@ analysis:
         assert_eq!(regressions[0].pointer, "/priority");
         assert_eq!(regressions[0].regressions, 1);
         assert_eq!(regressions[0].candidate_failures, 1);
+    }
+
+    #[test]
+    fn numeric_object_keys_are_not_collapsed_as_array_indices() {
+        let object_key = structtrace_core::evaluation::FieldEvaluationFact {
+            pointer: "/rates/2024".to_owned(),
+            aggregation_pointer: None,
+            expected_pointer: Some("/rates/2024".to_owned()),
+            status: EvaluationStatus::Failed,
+            expected: Some(serde_json::json!(1)),
+            actual: Some(serde_json::json!(2)),
+            message: "fixture".to_owned(),
+        };
+        let array_item = structtrace_core::evaluation::FieldEvaluationFact {
+            pointer: "/line_items/3/amount".to_owned(),
+            aggregation_pointer: Some("/line_items/*/amount".to_owned()),
+            expected_pointer: None,
+            status: EvaluationStatus::Failed,
+            expected: Some(serde_json::json!(1)),
+            actual: Some(serde_json::json!(2)),
+            message: "fixture".to_owned(),
+        };
+        assert_eq!(hotspot_pointer(&object_key), "/rates/2024");
+        assert_eq!(hotspot_pointer(&array_item), "/line_items/*/amount");
+    }
+
+    #[test]
+    fn zero_independent_units_has_no_confidence_interval() {
+        let config = Config::from_bytes(
+            Path::new("structtrace.yaml"),
+            br#"version: 3
+project: {name: no-evidence}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - {id: exact, kind: exact_json}
+outcomes:
+  correct: {all_of: [exact]}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+"#,
+        )
+        .unwrap();
+        let summary = build_summary("none", &config, &[]).unwrap();
+        assert_eq!(summary.paired.difference_pp, None);
+        assert_eq!(summary.bootstrap, None);
+        assert_eq!(summary.jointly_scored_semantic.paired.difference_pp, None);
+        assert_eq!(summary.jointly_scored_semantic.bootstrap, None);
+    }
+
+    #[test]
+    fn bad_reference_cannot_create_model_regression() {
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join("data.jsonl"),
+            "{\"id\":\"bad\",\"input\":{},\"expected\":{\"quantity\":\"not-an-integer\"}}\n",
+        );
+        write(&root.path().join("schema.json"), "{\"type\":\"object\"}");
+        write(
+            &root.path().join("baseline.jsonl"),
+            "{\"case_id\":\"bad\",\"status\":\"ok\",\"raw_output\":\"{\\\"quantity\\\":42}\"}\n",
+        );
+        write(
+            &root.path().join("candidate.jsonl"),
+            "{\"case_id\":\"bad\",\"status\":\"ok\",\"raw_output\":\"{\\\"quantity\\\":42}\"}\n",
+        );
+        write(
+            &root.path().join("structtrace.yaml"),
+            r#"version: 3
+project: {name: preflight}
+dataset: {path: data.jsonl}
+schema: {path: schema.json}
+variants:
+  baseline: {kind: recorded, path: baseline.jsonl}
+  candidate: {kind: recorded, path: candidate.jsonl}
+evaluators:
+  - id: quantity
+    kind: numeric_tolerance
+    pointer: /quantity
+    expected_pointer: /quantity
+    exact_integer: true
+outcomes:
+  correct: {all_of: [quantity]}
+analysis: {primary_outcome: correct, bootstrap: {samples: 100, confidence: 0.95, seed: 17}}
+"#,
+        );
+        let error = run_recorded(root.path(), Path::new("structtrace.yaml")).unwrap_err();
+        assert!(error.to_string().contains("reference preflight failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("no output loading or candidate scoring occurred")
+        );
+        assert!(!root.path().join(".structtrace/runs").exists());
     }
 
     #[test]

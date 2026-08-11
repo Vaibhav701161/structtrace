@@ -19,11 +19,11 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cancelComparisonJob, createComparisonJob, getComparisonJob, getFieldInventory, getRun, retryComparisonJob, stageSource } from "../../api/client";
-import type { ComparisonRequest, FieldRule, GateMode, Mapping, SourceArtifact, SourceKind } from "../../api/types";
+import type { ComparisonDraft, ComparisonRequest, FieldRule, GateMode, Mapping, SourceArtifact, SourceKind } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Skeleton, Status, Stepper, WizardActions } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
 import { detectFormat, inferPointer, parseRows, pointerCandidates } from "../import/inspect";
-import { exactJsonStringify } from "../../lib/lossless-json";
+import { exactJsonStringify, isExactJsonNumber, ownValueAt } from "../../lib/lossless-json";
 
 const paths = ["/new/source", "/new/map", "/new/correctness", "/new/evidence", "/new/review", "/new/run"] as const;
 
@@ -229,6 +229,7 @@ function CorrectnessStep() {
       candidateCoverage: field.candidateCoverage, observedType: field.observedType,
       keys: field.suggestedRule === "keyed_array" ? identity?.pointer.slice(field.pointer.length + 2) : undefined,
       keyFields: field.suggestedRule === "keyed_array" ? (identity ? [identity.pointer.slice(field.pointer.length + 2)] : []) : undefined,
+      keyPolicies: field.suggestedRule === "keyed_array" && identity ? [{ pointer: identity.pointer.slice(field.pointer.length + 2), kind: "exact" as const }] : undefined,
       arrayFields: field.suggestedRule === "keyed_array" ? children.filter((item) => item !== identity).map((item) => ({ pointer: item.pointer.slice(field.pointer.length + 2), kind: item.suggestedRule === "keyed_array" ? "exact" as const : item.suggestedRule })) : undefined,
     } satisfies FieldRule;
   }), [inventory.data]);
@@ -255,43 +256,70 @@ function CorrectnessStep() {
           <thead><tr><th scope="col">Use</th><th scope="col">Field</th><th scope="col">Type</th><th scope="col">Expected</th><th scope="col">Baseline</th><th scope="col">Candidate</th><th scope="col">Comparison</th></tr></thead>
           <tbody>{draft.rules.map((rule) => {
             const missing = rule.candidateCoverage < rule.expectedCoverage;
-            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="required_fields">Required presence</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="keyed_array">Keyed array</option></select>{rule.kind === "normalized_string" && <label className="inline-option"><input type="checkbox" checked={rule.caseInsensitive ?? true} onChange={(event) => update(rule.pointer, { caseInsensitive: event.target.checked })} /> Ignore case</label>}{rule.kind === "canonical_date" && <select value={rule.formats ?? "iso"} onChange={(event) => update(rule.pointer, { formats: event.target.value })} aria-label={`Accepted date formats for ${rule.pointer}`}><option value="iso">ISO only</option><option value="iso,dmy_slash">ISO + DMY slash</option><option value="iso,mdy_slash">ISO + MDY slash</option></select>}{rule.kind === "decimal_tolerance" && <input value={rule.tolerance ?? "0.01"} onChange={(event) => update(rule.pointer, { tolerance: event.target.value })} aria-label={`Absolute tolerance for ${rule.pointer}`} />}{rule.kind === "keyed_array" && <small className="configured-label">Configure item matching below</small>}</td></tr>;
+            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="required_fields">Required presence</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="keyed_array">Keyed array</option></select>{rule.kind === "normalized_string" && <label className="inline-option"><input type="checkbox" checked={rule.caseInsensitive ?? true} onChange={(event) => update(rule.pointer, { caseInsensitive: event.target.checked })} /> Unicode lowercase comparison</label>}{rule.kind === "canonical_date" && <select value={rule.formats ?? "iso"} onChange={(event) => update(rule.pointer, { formats: event.target.value })} aria-label={`Accepted date formats for ${rule.pointer}`}><option value="iso">ISO only</option><option value="iso,dmy_slash">ISO + DMY slash</option><option value="iso,mdy_slash">ISO + MDY slash</option></select>}{rule.kind === "decimal_tolerance" && <input value={rule.tolerance ?? "0.01"} onChange={(event) => update(rule.pointer, { tolerance: event.target.value })} aria-label={`Absolute tolerance for ${rule.pointer}`} />}{rule.kind === "keyed_array" && <small className="configured-label">Configure item matching below</small>}</td></tr>;
           })}</tbody>
         </table>
         {!draft.rules.length && <div className="table-empty"><AlertTriangle size={20} /><strong>No semantic fields were discovered</strong><p>Check the expected and output mappings on the previous step.</p></div>}
       </Card>
       {keyedRules.map((rule) => <KeyedArrayBuilder key={rule.pointer} rule={rule} update={(next) => update(rule.pointer, next)} />)}
-      {enabled.length > 0 && <Card className="rule-preview"><div className="panel-heading"><div><h2>Rule behavior preview</h2><p>These examples describe the deterministic result states before the configuration is saved.</p></div><Status tone="info" label={`${enabled.length} active`} /></div><div className="rule-preview-grid">{enabled.slice(0, 6).map((rule) => <div key={rule.pointer}><code>{rule.pointer}</code><span><b className="preview-pass">Pass</b>{passExample(rule)}</span><span><b className="preview-fail">Regression</b>{failureExample(rule)}</span><span><b className="preview-error">Unscored/error</b>Missing expected reference or evaluator failure never counts as a pass.</span></div>)}</div></Card>}
+      {enabled.length > 0 && <Card className="rule-preview"><div className="panel-heading"><div><h2>Rule behavior preview</h2><p>Concrete values come from the attached expected and candidate previews. The complete-source Rust preflight remains authoritative.</p></div><Status tone="info" label={`${enabled.length} active`} /></div><div className="rule-preview-grid">{enabled.slice(0, 6).map((rule) => <RulePreview key={rule.pointer} rule={rule} draft={draft} />)}</div></Card>}
       <InlineNotice title="Why suggestions appear">Suggestions combine complete-source values with JSON Schema type, format, pattern, and enum hints. They are never silently activated or changed after you review them.</InlineNotice>
       <WizardActions back={navigation.back} next={navigation.next} disabled={!enabled.length || !keyedRulesValid} />
     </>
   );
 }
-function passExample(rule: FieldRule) { return rule.kind === "normalized_string" ? "Whitespace and configured case normalization agree." : rule.kind === "canonical_date" ? "Both values resolve to the same declared calendar date." : rule.kind === "decimal_tolerance" ? `Absolute difference is at most ${rule.tolerance ?? "0.01"}.` : rule.kind === "keyed_array" ? "Every keyed item pairs and all selected item fields pass." : "Expected and output values satisfy the selected exact policy."; }
-function failureExample(rule: FieldRule) { return rule.kind === "keyed_array" ? "An item is missing, duplicated, or a compared field differs." : rule.kind === "required_fields" ? "The output omits the required field." : "The candidate value violates the selected field policy."; }
+function RulePreview({ rule, draft }: { rule: FieldRule; draft: ComparisonDraft }) {
+  const expected = previewField(draft.sources.dataset, draft.mapping.datasetExpected, rule.pointer);
+  const baseline = previewField(draft.sources.baseline, draft.mapping.baselineOutput, rule.pointer);
+  const candidate = previewField(draft.sources.candidate, draft.mapping.candidateOutput, rule.pointer);
+  const malformed = expected !== undefined && !referenceShapeValid(rule, expected);
+  return <div><code>{rule.pointer}</code><span><b className="preview-pass">Expected</b><code>{previewText(expected)}</code></span><span><b className="preview-neutral">Baseline → candidate</b><code>{previewText(baseline)} → {previewText(candidate)}</code></span><span><b className={malformed ? "preview-error" : "preview-pass"}>{malformed ? "Reference error" : "Reference preflight"}</b>{malformed ? "This preview value is incompatible and the run will stop before scoring." : "The preview reference is compatible; every row is checked before scoring."}</span></div>;
+}
+
+function previewField(source: SourceArtifact | undefined, rootPointer: string, pointer: string): unknown {
+  const row = source?.preview?.[0];
+  if (row === undefined) return undefined;
+  let root = ownValueAt(row, rootPointer);
+  if (typeof root === "string") {
+    try { root = parseRows(root, "json")[0]; } catch { return root; }
+  }
+  return ownValueAt(root, pointer);
+}
+function previewText(value: unknown) { return value === undefined ? "not present in preview" : exactJsonStringify(value).slice(0, 120); }
+function referenceShapeValid(rule: FieldRule, value: unknown) {
+  if (rule.kind === "normalized_string" || rule.kind === "canonical_date") return typeof value === "string";
+  const numericText = isExactJsonNumber(value) ? value.lexeme : typeof value === "number" || typeof value === "string" ? String(value) : null;
+  if (rule.kind === "exact_integer") return numericText !== null && /^-?\d+$/.test(numericText);
+  if (rule.kind === "decimal_exact" || rule.kind === "decimal_tolerance") return numericText !== null && /^-?(0|[1-9]\d*)(\.\d+)?(?:[eE][+-]?\d+)?$/.test(numericText);
+  if (rule.kind === "keyed_array") return Array.isArray(value);
+  return value !== undefined;
+}
 
 function KeyedArrayBuilder({ rule, update }: { rule: FieldRule; update: (next: Partial<FieldRule>) => void }) {
   const fields = rule.arrayFields ?? [];
   const keys = new Set(rule.keyFields ?? (rule.keys ? rule.keys.split(",").filter(Boolean) : []));
   const allPointers = [...new Set([...keys, ...fields.map((field) => field.pointer)])].sort();
   const comparison = (pointer: string) => fields.find((field) => field.pointer === pointer);
-  const setRole = (pointer: string, role: string) => {
+  const keyPolicy = (pointer: string) => rule.keyPolicies?.find((policy) => policy.pointer === pointer) ?? { pointer, kind: "exact" as const };
+  const setKey = (pointer: string, enabled: boolean) => {
     const nextKeys = new Set(keys);
-    let nextFields = fields.filter((field) => field.pointer !== pointer);
-    if (role === "key") nextKeys.add(pointer); else nextKeys.delete(pointer);
-    if (role !== "key" && role !== "ignore") {
-      nextFields = [...nextFields, { pointer, kind: role as NonNullable<FieldRule["arrayFields"]>[number]["kind"], tolerance: role === "decimal_tolerance" ? "0.01" : undefined }].sort((left, right) => left.pointer.localeCompare(right.pointer));
-    }
-    update({ keyFields: [...nextKeys].sort(), arrayFields: nextFields });
+    if (enabled) nextKeys.add(pointer); else nextKeys.delete(pointer);
+    const policies = (rule.keyPolicies ?? []).filter((policy) => policy.pointer !== pointer);
+    if (enabled) policies.push(keyPolicy(pointer));
+    update({ keyFields: [...nextKeys].sort(), keyPolicies: policies.sort((left, right) => left.pointer.localeCompare(right.pointer)) });
   };
+  const setKeyPolicy = (pointer: string, kind: NonNullable<FieldRule["keyPolicies"]>[number]["kind"]) => update({ keyPolicies: [...(rule.keyPolicies ?? []).filter((policy) => policy.pointer !== pointer), { pointer, kind }].sort((left, right) => left.pointer.localeCompare(right.pointer)) });
+  const setComparison = (pointer: string, kind: string) => update({ arrayFields: kind === "ignore"
+    ? fields.filter((field) => field.pointer !== pointer)
+    : [...fields.filter((field) => field.pointer !== pointer), { pointer, kind: kind as NonNullable<FieldRule["arrayFields"]>[number]["kind"], tolerance: kind === "decimal_tolerance" ? "0.01" : undefined }].sort((left, right) => left.pointer.localeCompare(right.pointer)) });
   return <Card className="array-builder">
-    <div className="panel-heading"><div><h2>Match items in <code>{rule.pointer}</code></h2><p>Choose stable identity fields, then define how each remaining item field is compared. Array order is ignored.</p></div><Status tone={keys.size ? "pass" : "warning"} label={keys.size ? `${keys.size} match ${keys.size === 1 ? "key" : "keys"}` : "Match key required"} /></div>
+    <div className="panel-heading"><div><h2>Match items in <code>{rule.pointer}</code></h2><p>Identity matching and correctness comparison are independent. A field may participate in both. Array order is ignored.</p></div><Status tone={keys.size ? "pass" : "warning"} label={keys.size ? `${keys.size} identity ${keys.size === 1 ? "field" : "fields"}` : "Identity required"} /></div>
     <div className="array-field-grid" role="group" aria-label={`Item rules for ${rule.pointer}`}>
-      <div className="array-field-head"><span>Item field</span><span>Role and comparison</span><span>Policy</span></div>
+      <div className="array-field-head"><span>Item field</span><span>Identity matching</span><span>Correctness comparison</span></div>
       {allPointers.map((pointer) => {
         const field = comparison(pointer);
-        const role = keys.has(pointer) ? "key" : field?.kind ?? "ignore";
-        return <div className="array-field-row" key={pointer}><code>{pointer}</code><select value={role} onChange={(event) => setRole(pointer, event.target.value)} aria-label={`Role for ${pointer}`}><option value="key">Match key</option><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="ignore">Do not compare</option></select><span>{role === "key" ? "Pairs the same item across variants" : role === "ignore" ? "Excluded from correctness" : role === "decimal_tolerance" ? <label>± <input value={field?.tolerance ?? "0.01"} onChange={(event) => update({ arrayFields: fields.map((item) => item.pointer === pointer ? { ...item, tolerance: event.target.value } : item) })} aria-label={`Tolerance for ${pointer}`} /></label> : "Deterministic evaluator"}</span></div>;
+        const policy = keyPolicy(pointer);
+        return <div className="array-field-row" key={pointer}><code>{pointer}</code><span className="identity-policy"><label><input type="checkbox" checked={keys.has(pointer)} onChange={(event) => setKey(pointer, event.target.checked)} /> Use for identity</label>{keys.has(pointer) && <select value={policy.kind} onChange={(event) => setKeyPolicy(pointer, event.target.value as typeof policy.kind)} aria-label={`Identity normalization for ${pointer}`}><option value="exact">Exact identity</option><option value="normalized_string">NFKC + whitespace + lowercase</option><option value="exact_integer">Canonical integer</option><option value="canonical_date">Canonical date</option></select>}</span><span className="comparison-policy"><select value={field?.kind ?? "ignore"} onChange={(event) => setComparison(pointer, event.target.value)} aria-label={`Comparison for ${pointer}`}><option value="ignore">Do not score</option><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option></select>{field?.kind === "decimal_tolerance" && <label>± <input value={field.tolerance ?? "0.01"} onChange={(event) => update({ arrayFields: fields.map((item) => item.pointer === pointer ? { ...item, tolerance: event.target.value } : item) })} aria-label={`Tolerance for ${pointer}`} /></label>}</span></div>;
       })}
     </div>
     {!keys.size && <InlineNotice tone="danger" title="Choose at least one stable item key">A keyed array cannot pair items safely without an identity such as SKU, product code, or ID.</InlineNotice>}
@@ -311,14 +339,34 @@ function EvidenceStep() {
   const rows = draft.sources.dataset?.rows ?? 0;
   const sufficient = rows >= draft.minCases;
   const releaseAvailable = Boolean(draft.sources.schema);
-  const financialReady = ["/line_items", "/subtotal", "/tax", "/total"].every((pointer) => draft.rules.some((rule) => rule.pointer === pointer));
+  const arrayRules = draft.rules.filter((rule) => rule.observedType === "array");
+  const scalarPointers = draft.rules.filter((rule) => rule.observedType !== "array").map((rule) => rule.pointer);
+  const selectedItems = arrayRules.find((rule) => rule.pointer === draft.financialMapping.lineItemsPointer);
+  const itemPointers = [...new Set([
+    ...(selectedItems?.keyFields ?? []),
+    ...(selectedItems?.arrayFields?.map((field) => field.pointer) ?? []),
+  ])].sort();
+  const financialReady = Boolean(selectedItems)
+    && [draft.financialMapping.quantityPointer, draft.financialMapping.unitPricePointer, draft.financialMapping.amountPointer].every((pointer) => itemPointers.includes(pointer))
+    && [draft.financialMapping.subtotalPointer, draft.financialMapping.taxPointer, draft.financialMapping.totalPointer].every((pointer) => scalarPointers.includes(pointer));
+  const updateFinancial = (field: keyof typeof draft.financialMapping, value: string) => updateDraft({ financialMapping: { ...draft.financialMapping, [field]: value } });
   return (
     <>
       <PageHeader eyebrow="Step 4 of 6" title="How should StructTrace judge this comparison?" description="Choose the authority of this result. Evidence checks cannot be bypassed by a quality metric." />
       <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} disabled={mode === "release" && !releaseAvailable} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode, minCases: mode === "release" ? Math.max(100, draft.minCases) : draft.minCases })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{mode === "release" && !releaseAvailable ? "Unavailable until you provide the caller-facing JSON Schema." : text}</p></div></button>)}</div>
       <Card className="evidence-profile">
         <div className="panel-heading"><div><h2>{draft.gateMode === "release" ? "Conservative release profile" : "Balanced evidence profile"}</h2><p>Plain-language thresholds generated into the reproducible configuration.</p></div><ShieldCheck size={22} /></div>
-        <label className={`setting-row ${!financialReady ? "disabled-row" : ""}`}><span><strong>Invoice financial invariants</strong><small>{financialReady ? "Cross-checks line amounts, subtotal, tax, and total with absolute tolerance 0.01." : "Unavailable because /line_items, /subtotal, /tax, and /total were not all discovered."}</small></span><input type="checkbox" disabled={!financialReady} checked={draft.financialInvariants && financialReady} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
+        <label className={`setting-row ${!financialReady ? "disabled-row" : ""}`}><span><strong>Mapped financial invariants</strong><small>{financialReady ? "Cross-checks mapped line amounts, subtotal, tax, and total using exact decimal arithmetic." : "Map every financial role below before enabling this invariant."}</small></span><input type="checkbox" disabled={!financialReady} checked={draft.financialInvariants && financialReady} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
+        <div className="financial-mapping" aria-label="Financial field role mapping">
+          <label>Line-items array<select value={draft.financialMapping.lineItemsPointer} onChange={(event) => updateFinancial("lineItemsPointer", event.target.value)}><option value="">Choose array</option>{arrayRules.map((rule) => <option value={rule.pointer} key={rule.pointer}>{rule.pointer}</option>)}</select></label>
+          <label>Quantity<select value={draft.financialMapping.quantityPointer} onChange={(event) => updateFinancial("quantityPointer", event.target.value)}><option value="">Choose item field</option>{itemPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Unit price<select value={draft.financialMapping.unitPricePointer} onChange={(event) => updateFinancial("unitPricePointer", event.target.value)}><option value="">Choose item field</option>{itemPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Line amount<select value={draft.financialMapping.amountPointer} onChange={(event) => updateFinancial("amountPointer", event.target.value)}><option value="">Choose item field</option>{itemPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Subtotal<select value={draft.financialMapping.subtotalPointer} onChange={(event) => updateFinancial("subtotalPointer", event.target.value)}><option value="">Choose field</option>{scalarPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Tax<select value={draft.financialMapping.taxPointer} onChange={(event) => updateFinancial("taxPointer", event.target.value)}><option value="">Choose field</option>{scalarPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Total<select value={draft.financialMapping.totalPointer} onChange={(event) => updateFinancial("totalPointer", event.target.value)}><option value="">Choose field</option>{scalarPointers.map((pointer) => <option value={pointer} key={pointer}>{pointer}</option>)}</select></label>
+          <label>Absolute tolerance<input value={draft.financialMapping.absolute} onChange={(event) => updateFinancial("absolute", event.target.value)} inputMode="decimal" /></label>
+        </div>
         <div className="evidence-rules"><span><Check size={15} /> At least 99% fully evaluated</span><span><Check size={15} /> No repeated-trial conflicts</span><span><Check size={15} /> Candidate may regress by at most 0 pp</span>{draft.gateMode === "release" && <><span><Check size={15} /> Candidate deployment success at least 95%</span><span><Check size={15} /> Candidate strict JSON and schema validity 100%</span></>}</div>
       </Card>
       {!sufficient && draft.gateMode !== "advisory" && <InlineNotice tone="warning" title="Analysis available; authority disabled">This dataset has {rows} rows, below the configured minimum of {draft.minCases}. StructTrace will preserve the result as insufficient evidence instead of overstating it.</InlineNotice>}
@@ -366,15 +414,16 @@ function RunStep() {
       schema: draft.sources.schema ? sourcePayload(draft.sources.schema) : undefined,
     },
     mapping: draft.mapping,
-    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance, keys, fields, keyFields, arrayFields, formats, caseInsensitive }) => ({
+    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance, keys, fields, keyFields, keyPolicies, arrayFields, formats, caseInsensitive }) => ({
       pointer, kind, tolerance,
-      keys: keyFields?.join(",") || keys,
+      keys: keyFields?.map((key) => { const policy = keyPolicies?.find((item) => item.pointer === key); return `${key}:${policy?.kind ?? "exact"}`; }).join(",") || keys,
       fields: arrayFields?.map((field) => `${field.pointer}:${field.kind === "decimal_tolerance" ? `decimal_tolerance:${field.tolerance ?? "0.01"}` : field.kind}`).join(",") || fields,
       formats, caseInsensitive,
     })),
     gateMode: draft.gateMode,
     minCases: draft.minCases,
     financialInvariants: draft.financialInvariants,
+    financialMapping: draft.financialInvariants ? draft.financialMapping : null,
     });
   }, [draft]);
   const create = useMutation({

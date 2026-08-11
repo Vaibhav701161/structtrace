@@ -551,15 +551,24 @@ fn write_share_directory(
         ),
         (
             "Exact McNemar p-value".to_owned(),
-            format!("{:.6}", summary.paired.mcnemar_exact_p),
+            if summary.paired.total > 0 {
+                format!("{:.6}", summary.paired.mcnemar_exact_p)
+            } else {
+                "Not available".to_owned()
+            },
         ),
         (
             "Bootstrap".to_owned(),
-            format!(
-                "{} samples, {:.1}% interval, seed {}",
-                summary.bootstrap.samples,
-                summary.bootstrap.confidence * 100.0,
-                summary.bootstrap.seed
+            summary.bootstrap.as_ref().map_or_else(
+                || "Not available (no independent evidence units)".to_owned(),
+                |interval| {
+                    format!(
+                        "{} samples, {:.1}% interval, seed {}",
+                        interval.samples,
+                        interval.confidence * 100.0,
+                        interval.seed
+                    )
+                },
             ),
         ),
         (
@@ -1110,10 +1119,13 @@ fn build_view(
             | "discordant" => config.report.default_case_filter.clone(),
             _ => "all".to_owned(),
         },
-        difference: format!("{:+.2} pp", summary.paired.difference_pp),
-        interval: format!(
-            "[{:.2}, {:.2}] pp",
-            summary.bootstrap.lower_pp, summary.bootstrap.upper_pp
+        difference: summary.paired.difference_pp.map_or_else(
+            || "Not estimable".to_owned(),
+            |effect| format!("{effect:+.2} pp"),
+        ),
+        interval: summary.bootstrap.as_ref().map_or_else(
+            || "Not available".to_owned(),
+            |interval| format!("[{:.2}, {:.2}] pp", interval.lower_pp, interval.upper_pp),
         ),
         total_rows: summary.evidence.total_rows,
         unique_cases: summary.evidence.singleton_evidence_units
@@ -1127,10 +1139,14 @@ fn build_view(
         evidence_denominator: summary.evidence.effective_inference_units,
         semantic_jointly_scored: summary.jointly_scored_semantic.jointly_scored_cases,
         semantic_excluded: summary.jointly_scored_semantic.excluded_pairs,
-        semantic_difference: format!(
-            "{:+.2} pp",
-            summary.jointly_scored_semantic.paired.difference_pp
-        ),
+        semantic_difference: summary
+            .jointly_scored_semantic
+            .paired
+            .difference_pp
+            .map_or_else(
+                || "Not estimable".to_owned(),
+                |effect| format!("{effect:+.2} pp"),
+            ),
         baseline_primary: metric(summary.baseline.deployment_success, summary.baseline.total),
         candidate_primary: metric(
             summary.candidate.deployment_success,
@@ -1274,15 +1290,24 @@ fn build_view(
             ),
             (
                 "Exact McNemar p-value".to_owned(),
-                format!("{:.6}", summary.paired.mcnemar_exact_p),
+                if summary.paired.total > 0 {
+                    format!("{:.6}", summary.paired.mcnemar_exact_p)
+                } else {
+                    "Not available".to_owned()
+                },
             ),
             (
                 "Bootstrap".to_owned(),
-                format!(
-                    "{} samples, {:.1}% interval, seed {}",
-                    summary.bootstrap.samples,
-                    summary.bootstrap.confidence * 100.0,
-                    summary.bootstrap.seed
+                summary.bootstrap.as_ref().map_or_else(
+                    || "Not available (no independent evidence units)".to_owned(),
+                    |interval| {
+                        format!(
+                            "{} samples, {:.1}% interval, seed {}",
+                            interval.samples,
+                            interval.confidence * 100.0,
+                            interval.seed
+                        )
+                    },
                 ),
             ),
             (
@@ -2166,13 +2191,13 @@ mod tests {
             },
             independent_paired: paired.clone(),
             deployment_paired: paired.clone(),
-            independent_bootstrap: BootstrapInterval {
+            independent_bootstrap: Some(BootstrapInterval {
                 lower_pp: 0.0,
                 upper_pp: 0.0,
                 confidence: 0.95,
                 samples: 100,
                 seed: 17,
-            },
+            }),
             jointly_scored_semantic: structtrace_core::artifact::SemanticEffectSummary {
                 jointly_scored_cases: total,
                 excluded_pairs: 0,
@@ -2183,13 +2208,13 @@ mod tests {
             matched_operational: Default::default(),
             descriptive_matched_operational: Default::default(),
             paired,
-            bootstrap: BootstrapInterval {
+            bootstrap: Some(BootstrapInterval {
                 lower_pp: 0.0,
                 upper_pp: 0.0,
                 confidence: 0.95,
                 samples: 100,
                 seed: 17,
-            },
+            }),
             gate: GateDecision {
                 gate_mode: structtrace_core::config::GateMode::Release,
                 status: GateStatus::Passed,

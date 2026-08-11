@@ -10,11 +10,18 @@ regressions. Field hotspots identify evaluator pointers associated with those tr
 explorer searches redacted IDs and metadata, filters outcome, validity, adapter, evaluator-error,
 not-applicable, and unscored states, and paginates 25 cases at a time.
 
+The main case outcome is the engine's selected primary-outcome projection, not a scan across every
+diagnostic evaluator. `Correct`, `Wrong`, `Evaluation error`, `N/A`, `Unscored`, and `Incomplete`
+remain distinct. A diagnostic-only evaluator error appears as a separate warning and cannot
+override a fully evaluated primary pass.
+
 Case detail shows input, expected value, raw and parsed outputs, JSON-aware changes, schema errors,
 evaluator evidence, case metadata, adapter metadata, and explicit execution panels for status,
 timeout or adapter error, latency, retries, token usage, cost, and finish reason. Evaluator errors
 and not-applicable results remain distinct from semantic false. Rendered prompts appear inside
-adapter metadata only when `report.include_prompts: true`; the default is false. Operational
+adapter metadata only when `report.include_prompts: true`; the default is false. Hotspots link to
+the matching case filter and focused JSON Pointer; expected, baseline, and candidate evidence
+scroll together, while regression drawers collapse unchanged branches by default. Operational
 measurements are descriptive unless their gate rule is configured; coverage and matched-pair
 counts are shown separately.
 

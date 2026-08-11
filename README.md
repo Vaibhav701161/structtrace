@@ -209,8 +209,16 @@ structtrace init comparison --from-outputs \
   --field-evaluator /vendor_name=normalized_string \
   --field-evaluator /invoice_date=canonical_date:iso,dmy_slash \
   --field-evaluator /total=decimal_exact \
-  --keyed-array '/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01' \
-  --financial-invariants --gate-mode regression
+  --keyed-array '/line_items=/sku:exact;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01' \
+  --financial-invariants \
+  --financial-line-items-pointer /line_items \
+  --financial-quantity-pointer /quantity \
+  --financial-unit-price-pointer /unit_price \
+  --financial-amount-pointer /amount \
+  --financial-subtotal-pointer /subtotal \
+  --financial-tax-pointer /tax \
+  --financial-total-pointer /total \
+  --gate-mode regression
 ```
 
 The importer accepts canonical StructTrace envelopes and ordinary JSONL such as
@@ -221,8 +229,10 @@ sources, so a field newly omitted by the candidate remains visible. In a termina
 and field semantics are prompted; automation uses the explicit flags above.
 
 Supported guided choices include exact JSON or pointers, normalized strings, canonical dates,
-exact integers, exact/tolerant decimals, keyed arrays with per-field comparators, and opt-in invoice
-financial invariants. Suggestions never become semantic truth silently. A new imported workload
+exact integers, exact/tolerant decimals, keyed arrays with independent identity normalization and
+per-field comparators, and opt-in mapped financial invariants. Suggestions never become semantic
+truth silently. Every deterministic golden value is preflighted before output loading or live
+adapter execution, so malformed reference data cannot become a model regression. A new imported workload
 defaults to a Regression gate; Release mode still requires the complete safe release profile.
 
 Bundled demos and research fixtures are isolated from production history. `latest` always means
@@ -261,7 +271,7 @@ Built-in deterministic evaluators cover:
 - Unicode-normalized strings and calendar-aware canonical dates;
 - arbitrary-length exact integers and exact-decimal numeric tolerance;
 - keyed array identity matching with nested normalized, integer, decimal, and date field evidence;
-- exact-decimal invoice financial invariants with path-specific diagnostics;
+- exact-decimal mapped financial invariants with dependency-safe path diagnostics;
 - required fields;
 - tool selection;
 - selected tool arguments;

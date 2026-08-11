@@ -19,7 +19,7 @@ use structtrace_core::{
     artifact::{RunKind, RunStatus},
     config::{Config, VariantConfig},
     dataset::{Dataset, ExecutionToken, VariantCase},
-    evaluation::compile_schema,
+    evaluation::{compile_schema, validate_references},
     hashing::{hash_bytes, hash_canonical_json, hash_file},
     output::RecordedOutputs,
 };
@@ -92,6 +92,14 @@ async fn run_configured_inner(
     );
     let dataset_path = resolve(&project_root, &config.dataset.path);
     let dataset = Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits)?;
+    let reference_issues = validate_references(&dataset.cases, &config.evaluators);
+    if !reference_issues.is_empty() {
+        anyhow::bail!(
+            "dataset reference preflight failed with {} issue(s); no adapter execution or candidate scoring occurred: {}",
+            reference_issues.len(),
+            serde_json::to_string(&reference_issues.iter().take(20).collect::<Vec<_>>())?
+        );
+    }
     let schema_path = resolve(&project_root, &config.schema.path);
     let schema_bytes = structtrace_core::hashing::read_bounded(
         &schema_path,

@@ -23,6 +23,44 @@ Samples are capped at 1,000,000. At runtime, `samples × evidence units` is capp
 
 Unknown keys, unsupported dataset formats, invalid confidence levels, and missing cross-references fail before execution. See `schemas/structtrace.schema.json` for the complete machine-readable shape and the generated `structtrace.yaml` for a working configuration.
 
+Keyed-array identity and correctness are configured independently:
+
+```yaml
+evaluators:
+  - id: items
+    kind: keyed_array
+    pointer: /items
+    expected_pointer: /items
+    keys: [/description]
+    key_fields:
+      - pointer: /description
+        evaluator: normalized_string
+        case_insensitive: true
+    fields:
+      - pointer: /amount
+        evaluator: decimal_tolerance
+        absolute: "0.01"
+```
+
+Financial roles are explicit rather than bound to invoice-specific names:
+
+```yaml
+  - id: financial_consistency
+    kind: financial_invariants
+    line_items_pointer: /items
+    quantity_pointer: /qty
+    unit_price_pointer: /price
+    amount_pointer: /line_total
+    subtotal_pointer: /net_amount
+    tax_pointer: /vat
+    total_pointer: /grand_total
+    absolute: "0.01"
+```
+
+`canonical_date` accepts calendar dates only. JSON Schema `date-time` fields are not suggested for
+that evaluator. `normalized_string.case_insensitive` means Unicode lowercasing after NFKC and
+whitespace collapse; it does not claim Unicode default case folding.
+
 Runtime validation enforces the same operational boundaries even when the YAML file is not processed by an editor-side JSON Schema validator. Empty paths and executable names, malformed JSON Pointers or Python callables, zero or excessive timeouts, invalid provider concurrency/retry/token limits, negative prices or tolerances, non-finite gate values, and unsupported report filters are rejected before an adapter is invoked.
 
 Resource limits are configurable within hard safety ceilings:

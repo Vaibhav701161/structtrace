@@ -136,11 +136,12 @@ function keyedItemRules(values: unknown[]): Pick<FieldRule, "keyFields" | "array
     const lower = pointer.toLowerCase();
     const integerLike = observed.length > 0 && observed.every((value) => isExactJsonNumber(value) ? /^-?(0|[1-9]\d*)$/.test(value.lexeme) : (typeof value === "number" && Number.isInteger(value)) || (typeof value === "string" && /^-?(0|[1-9]\d*)$/.test(value)));
     const decimalLike = observed.length > 0 && observed.every((value) => isExactJsonNumber(value) || typeof value === "number" || (typeof value === "string" && /^-?(0|[1-9]\d*)(\.\d+)?$/.test(value)));
+    const dateTimeLike = observed.length > 0 && observed.every((value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value));
     const kind = integerLike
       ? "exact_integer"
       : decimalLike
         ? "decimal_tolerance"
-        : /(date|_at$)/.test(lower)
+        : !dateTimeLike && /date/.test(lower)
           ? "canonical_date"
           : /(name|title|description|label|text)/.test(lower)
             ? "normalized_string"
@@ -177,10 +178,11 @@ export function discoverRules(
     const lower = pointer.toLowerCase();
     const numericStrings = type === "string" && values.every((value) => typeof value === "string" && /^-?(0|[1-9]\d*)(\.\d+)?$/.test(value));
     const integerStrings = numericStrings && values.every((value) => typeof value === "string" && /^-?(0|[1-9]\d*)$/.test(value));
+    const dateTimeStrings = type === "string" && values.length > 0 && values.every((value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value));
     const kind: FieldRule["kind"] = type === "array" ? "keyed_array" : type === "integer" ? "exact_integer" : type === "number"
       ? "decimal_exact"
       : numericStrings ? integerStrings ? "exact_integer" : "decimal_exact"
-      : lower.includes("date") ? "canonical_date"
+      : lower.includes("date") && !dateTimeStrings ? "canonical_date"
         : type === "string" && /(name|title|description|label|text)/.test(lower) ? "normalized_string"
           : "exact";
     const coverage = (objects: unknown[]) => objects.filter((value) => valueAt(value, pointer) !== undefined).length / total;

@@ -82,7 +82,7 @@ structtrace init invoice-check --from-outputs \
   --field-evaluator /vendor_name=normalized_string \
   --field-evaluator /invoice_date=canonical_date:iso,dmy_slash \
   --field-evaluator /total=decimal_exact \
-  --keyed-array '/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01' \
+  --keyed-array '/line_items=/sku:exact;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01' \
   --financial-invariants
 ```
 

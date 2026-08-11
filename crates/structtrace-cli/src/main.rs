@@ -240,12 +240,36 @@ struct FromOutputsArgs {
     /// Deterministic field evaluator as POINTER=KIND.
     #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
     field_evaluator: Vec<String>,
-    /// Keyed-array evaluator as ARRAY_POINTER=KEYS;FIELD:EVALUATOR.
+    /// Keyed-array evaluator as ARRAY=KEY[:IDENTITY_NORMALIZER];FIELD:EVALUATOR.
     #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
     keyed_array: Vec<String>,
     /// Add opt-in invoice arithmetic invariants.
     #[arg(long, requires = "from_outputs", conflicts_with = "exact_json")]
     financial_invariants: bool,
+    /// Line-items array JSON Pointer for financial invariants.
+    #[arg(long, default_value = "/line_items", requires = "financial_invariants")]
+    financial_line_items_pointer: String,
+    /// Quantity pointer relative to each line item.
+    #[arg(long, default_value = "/quantity", requires = "financial_invariants")]
+    financial_quantity_pointer: String,
+    /// Unit-price pointer relative to each line item.
+    #[arg(long, default_value = "/unit_price", requires = "financial_invariants")]
+    financial_unit_price_pointer: String,
+    /// Line-amount pointer relative to each line item.
+    #[arg(long, default_value = "/amount", requires = "financial_invariants")]
+    financial_amount_pointer: String,
+    /// Subtotal JSON Pointer for financial invariants.
+    #[arg(long, default_value = "/subtotal", requires = "financial_invariants")]
+    financial_subtotal_pointer: String,
+    /// Tax JSON Pointer for financial invariants.
+    #[arg(long, default_value = "/tax", requires = "financial_invariants")]
+    financial_tax_pointer: String,
+    /// Total JSON Pointer for financial invariants.
+    #[arg(long, default_value = "/total", requires = "financial_invariants")]
+    financial_total_pointer: String,
+    /// Exact-decimal absolute tolerance for financial invariants.
+    #[arg(long, default_value = "0.01", requires = "financial_invariants")]
+    financial_absolute_tolerance: String,
     /// Dataset case-ID JSON Pointer.
     #[arg(long, default_value = "/id", requires = "from_outputs")]
     dataset_id_pointer: String,
@@ -467,6 +491,18 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
                     field_evaluators: &import.field_evaluator,
                     keyed_arrays: &import.keyed_array,
                     financial_invariants: import.financial_invariants,
+                    financial_mapping: import.financial_invariants.then(|| {
+                        initialize::FinancialInvariantMapping {
+                            line_items_pointer: import.financial_line_items_pointer.clone(),
+                            quantity_pointer: import.financial_quantity_pointer.clone(),
+                            unit_price_pointer: import.financial_unit_price_pointer.clone(),
+                            amount_pointer: import.financial_amount_pointer.clone(),
+                            subtotal_pointer: import.financial_subtotal_pointer.clone(),
+                            tax_pointer: import.financial_tax_pointer.clone(),
+                            total_pointer: import.financial_total_pointer.clone(),
+                            absolute: import.financial_absolute_tolerance.clone(),
+                        }
+                    }),
                     exact_json: import.exact_json,
                     gate_mode: match import.gate_mode {
                         GuidedGateMode::Advisory => structtrace_core::config::GateMode::Advisory,
@@ -1128,10 +1164,10 @@ fn print_completed(cli: &Cli, run: &structtrace_engine::CompletedRun) -> anyhow:
                     run.summary.candidate.total
                 )
             );
-            println!(
-                "Difference:   {:+.2} percentage points",
-                run.summary.paired.difference_pp
-            );
+            match run.summary.paired.difference_pp {
+                Some(effect) => println!("Difference:   {effect:+.2} percentage points"),
+                None => println!("Difference:   NOT ESTIMABLE (no independent evidence units)"),
+            }
             println!(
                 "Transitions:  {} candidate-only, {} baseline-only",
                 run.summary.paired.candidate_only_pass, run.summary.paired.baseline_only_pass
@@ -1255,10 +1291,10 @@ fn print_human_gate(summary: &RunSummary, run_dir: &Path) {
             summary.candidate.total
         )
     );
-    println!(
-        "  Difference: {:+.2} percentage points",
-        summary.paired.difference_pp
-    );
+    match summary.paired.difference_pp {
+        Some(effect) => println!("  Difference: {effect:+.2} percentage points"),
+        None => println!("  Difference: NOT ESTIMABLE (no independent evidence units)"),
+    }
     println!();
     println!("Paired transitions");
     println!(

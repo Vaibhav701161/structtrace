@@ -20,7 +20,7 @@ pub mod strict_json;
 pub use error::{CoreError, Result};
 
 /// Current on-disk artifact format.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 10;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 11;
 
 /// Current project configuration schema.
 pub const CONFIG_VERSION: u32 = 3;

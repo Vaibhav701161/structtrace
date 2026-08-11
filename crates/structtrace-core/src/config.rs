@@ -538,7 +538,7 @@ pub enum EvaluatorKind {
         pointer: String,
         /// Pointer in expected value.
         expected_pointer: String,
-        /// Compare case-insensitively after normalization.
+        /// Compare after Unicode lowercasing following normalization.
         #[serde(default = "default_true")]
         case_insensitive: bool,
     },
@@ -595,6 +595,9 @@ pub enum EvaluatorKind {
         expected_pointer: String,
         /// Relative JSON Pointers that form each item's identity.
         keys: Vec<String>,
+        /// Identity-only normalization policies, independent of compared-field semantics.
+        #[serde(default)]
+        key_fields: Vec<KeyedArrayField>,
         /// Optional field-specific comparators applied after identity matching.
         #[serde(default)]
         fields: Vec<KeyedArrayField>,
@@ -604,6 +607,15 @@ pub enum EvaluatorKind {
         /// Line-item array pointer.
         #[serde(default = "default_line_items_pointer")]
         line_items_pointer: String,
+        /// Quantity pointer relative to each line item.
+        #[serde(default = "default_quantity_pointer")]
+        quantity_pointer: String,
+        /// Unit-price pointer relative to each line item.
+        #[serde(default = "default_unit_price_pointer")]
+        unit_price_pointer: String,
+        /// Line-amount pointer relative to each line item.
+        #[serde(default = "default_amount_pointer")]
+        amount_pointer: String,
         /// Subtotal pointer.
         #[serde(default = "default_subtotal_pointer")]
         subtotal_pointer: String,
@@ -656,7 +668,7 @@ pub struct KeyedArrayField {
     /// Absolute tolerance for `decimal_tolerance`.
     #[serde(default)]
     pub absolute: Option<String>,
-    /// Case folding for `normalized_string`.
+    /// Unicode lowercasing for `normalized_string` (not full Unicode case folding).
     #[serde(default = "default_true")]
     pub case_insensitive: bool,
     /// Accepted formats for `canonical_date`.
@@ -678,6 +690,18 @@ fn default_date_formats() -> Vec<String> {
 
 fn default_line_items_pointer() -> String {
     "/line_items".to_owned()
+}
+
+fn default_quantity_pointer() -> String {
+    "/quantity".to_owned()
+}
+
+fn default_unit_price_pointer() -> String {
+    "/unit_price".to_owned()
+}
+
+fn default_amount_pointer() -> String {
+    "/amount".to_owned()
 }
 
 fn default_subtotal_pointer() -> String {
@@ -1392,6 +1416,7 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             pointer,
             expected_pointer,
             keys,
+            key_fields,
             fields,
         } => {
             validate_json_pointer(&format!("{name}.pointer"), pointer)?;
@@ -1408,6 +1433,36 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
             }
             for key in keys {
                 validate_json_pointer(&format!("{name}.keys"), key)?;
+            }
+            for field in key_fields {
+                validate_json_pointer(&format!("{name}.key_fields.pointer"), &field.pointer)?;
+                if !keys.contains(&field.pointer) {
+                    return Err(CoreError::Configuration(format!(
+                        "{name}.key_fields pointer `{}` must also appear in keys",
+                        field.pointer
+                    )));
+                }
+                if !matches!(
+                    field.evaluator.as_str(),
+                    "exact" | "normalized_string" | "exact_integer" | "canonical_date"
+                ) {
+                    return Err(CoreError::Configuration(format!(
+                        "{name}.key_fields evaluator `{}` is unsupported",
+                        field.evaluator
+                    )));
+                }
+                if field.evaluator == "canonical_date"
+                    && (field.formats.is_empty()
+                        || field.formats.iter().any(|format| {
+                            !matches!(format.as_str(), "iso" | "dmy_slash" | "mdy_slash")
+                        })
+                        || (field.formats.iter().any(|format| format == "dmy_slash")
+                            && field.formats.iter().any(|format| format == "mdy_slash")))
+                {
+                    return Err(CoreError::Configuration(format!(
+                        "{name}.key_fields canonical_date formats must be non-ambiguous and supported"
+                    )));
+                }
             }
             for field in fields {
                 validate_json_pointer(&format!("{name}.fields.pointer"), &field.pointer)?;
@@ -1459,6 +1514,9 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
         }
         EvaluatorKind::FinancialInvariants {
             line_items_pointer,
+            quantity_pointer,
+            unit_price_pointer,
+            amount_pointer,
             subtotal_pointer,
             tax_pointer,
             total_pointer,
@@ -1466,6 +1524,9 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
         } => {
             for (field, pointer) in [
                 ("line_items_pointer", line_items_pointer),
+                ("quantity_pointer", quantity_pointer),
+                ("unit_price_pointer", unit_price_pointer),
+                ("amount_pointer", amount_pointer),
                 ("subtotal_pointer", subtotal_pointer),
                 ("tax_pointer", tax_pointer),
                 ("total_pointer", total_pointer),
@@ -2122,6 +2183,7 @@ mod tests {
             pointer: "/items".to_owned(),
             expected_pointer: "/items".to_owned(),
             keys: vec!["/id".to_owned()],
+            key_fields: Vec::new(),
             fields: Vec::new(),
         };
         assert!(Config::validate(keyed).is_err());

@@ -40,9 +40,38 @@ pub struct FromOutputsOptions<'a> {
     pub field_evaluators: &'a [String],
     pub keyed_arrays: &'a [String],
     pub financial_invariants: bool,
+    pub financial_mapping: Option<FinancialInvariantMapping>,
     pub exact_json: bool,
     pub gate_mode: GateMode,
     pub min_cases: usize,
+}
+
+/// Explicit role mapping for the invoice-style deterministic financial invariant.
+#[derive(Debug, Clone)]
+pub struct FinancialInvariantMapping {
+    pub line_items_pointer: String,
+    pub quantity_pointer: String,
+    pub unit_price_pointer: String,
+    pub amount_pointer: String,
+    pub subtotal_pointer: String,
+    pub tax_pointer: String,
+    pub total_pointer: String,
+    pub absolute: String,
+}
+
+impl Default for FinancialInvariantMapping {
+    fn default() -> Self {
+        Self {
+            line_items_pointer: "/line_items".to_owned(),
+            quantity_pointer: "/quantity".to_owned(),
+            unit_price_pointer: "/unit_price".to_owned(),
+            amount_pointer: "/amount".to_owned(),
+            subtotal_pointer: "/subtotal".to_owned(),
+            tax_pointer: "/tax".to_owned(),
+            total_pointer: "/total".to_owned(),
+            absolute: "0.01".to_owned(),
+        }
+    }
 }
 
 /// Pointer mapping for ordinary `{id, output}` JSONL exports.
@@ -443,15 +472,48 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
         let (keys, field_specs) = semantics
             .split_once(';')
             .map_or((semantics, ""), |(keys, fields)| (keys, fields));
-        let keys = keys
+        let key_specs = keys
             .split(',')
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .collect::<Vec<_>>();
         anyhow::ensure!(
-            !keys.is_empty(),
+            !key_specs.is_empty(),
             "keyed array requires at least one item key"
         );
+        let mut keys = Vec::with_capacity(key_specs.len());
+        let mut key_fields = Vec::new();
+        for specification in key_specs {
+            let (key, comparator) = specification
+                .split_once(':')
+                .map_or((specification, None), |(key, comparator)| {
+                    (key, Some(comparator))
+                });
+            anyhow::ensure!(!key.is_empty(), "keyed-array key pointer must not be empty");
+            keys.push(key);
+            if let Some(comparator) = comparator {
+                anyhow::ensure!(
+                    matches!(
+                        comparator,
+                        "exact" | "normalized_string" | "exact_integer" | "canonical_date"
+                    ),
+                    "unsupported keyed-array identity comparator `{comparator}`"
+                );
+                key_fields.push(match comparator {
+                    "normalized_string" => json!({
+                        "pointer": key,
+                        "evaluator": comparator,
+                        "case_insensitive": true
+                    }),
+                    "canonical_date" => json!({
+                        "pointer": key,
+                        "evaluator": comparator,
+                        "formats": ["iso"]
+                    }),
+                    _ => json!({"pointer": key, "evaluator": comparator}),
+                });
+            }
+        }
         let mut fields = if field_specs.is_empty() {
             keys.iter()
                 .map(|key| json!({"pointer": key, "evaluator": "exact"}))
@@ -492,18 +554,23 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
             "pointer": pointer,
             "expected_pointer": pointer,
             "keys": keys,
+            "key_fields": key_fields,
             "fields": fields
         }));
     }
     if options.financial_invariants {
+        let mapping = options.financial_mapping.unwrap_or_default();
         evaluators.push(json!({
             "id": "financial_invariants",
             "kind": "financial_invariants",
-            "line_items_pointer": "/line_items",
-            "subtotal_pointer": "/subtotal",
-            "tax_pointer": "/tax",
-            "total_pointer": "/total",
-            "absolute": "0.01"
+            "line_items_pointer": mapping.line_items_pointer,
+            "quantity_pointer": mapping.quantity_pointer,
+            "unit_price_pointer": mapping.unit_price_pointer,
+            "amount_pointer": mapping.amount_pointer,
+            "subtotal_pointer": mapping.subtotal_pointer,
+            "tax_pointer": mapping.tax_pointer,
+            "total_pointer": mapping.total_pointer,
+            "absolute": mapping.absolute
         }));
     }
     let outcome_evaluators = evaluators
@@ -1187,6 +1254,7 @@ mod tests {
             field_evaluators: &[],
             keyed_arrays: &[],
             financial_invariants: false,
+            financial_mapping: None,
             exact_json: false,
             gate_mode: GateMode::Regression,
             min_cases: 100,
@@ -1243,6 +1311,7 @@ mod tests {
             field_evaluators: &[],
             keyed_arrays: &[],
             financial_invariants: false,
+            financial_mapping: None,
             exact_json: false,
             gate_mode: GateMode::Regression,
             min_cases: 100,
@@ -1304,6 +1373,7 @@ mod tests {
             ],
             keyed_arrays: &[],
             financial_invariants: false,
+            financial_mapping: None,
             exact_json: false,
             gate_mode: GateMode::Regression,
             min_cases: 100,
@@ -1337,8 +1407,9 @@ mod tests {
             },
             correctness_pointers: &[],
             field_evaluators: &[],
-            keyed_arrays: &["/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/unit_price:decimal_exact,/amount:decimal_tolerance:0.01".to_owned()],
+            keyed_arrays: &["/line_items=/description:normalized_string;/description:normalized_string,/quantity:exact_integer,/unit_price:decimal_exact,/amount:decimal_tolerance:0.01".to_owned()],
             financial_invariants: true,
+            financial_mapping: None,
             exact_json: false,
             gate_mode: GateMode::Regression,
             min_cases: 100,
@@ -1370,6 +1441,96 @@ mod tests {
             structtrace_engine::run_recorded(&project, Path::new("structtrace.yaml")).unwrap();
         assert_eq!(run.summary.baseline.total, 12);
         assert_eq!(run.summary.candidate.total, 12);
+    }
+
+    #[test]
+    fn keyed_identity_normalization_and_financial_roles_are_independent_and_mapped() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let project = root.path().join("guided");
+        initialize_extraction(&source).unwrap();
+        initialize_from_outputs(FromOutputsOptions {
+            destination: &project,
+            dataset: &source.join("data/golden.jsonl"),
+            baseline: &source.join("outputs/baseline.jsonl"),
+            candidate: &source.join("outputs/candidate.jsonl"),
+            schema: &source.join("schemas/output.schema.json"),
+            dataset_fields: DatasetFields::default(),
+            output_fields: SimpleOutputFields {
+                id: "/id".to_owned(),
+                output: "/output".to_owned(),
+            },
+            correctness_pointers: &[],
+            field_evaluators: &[],
+            keyed_arrays: &[
+                "/line_items=/description:normalized_string;/amount:decimal_exact".to_owned(),
+            ],
+            financial_invariants: true,
+            financial_mapping: Some(FinancialInvariantMapping {
+                line_items_pointer: "/items".to_owned(),
+                quantity_pointer: "/qty".to_owned(),
+                unit_price_pointer: "/price".to_owned(),
+                amount_pointer: "/line_total".to_owned(),
+                subtotal_pointer: "/net_amount".to_owned(),
+                tax_pointer: "/vat".to_owned(),
+                total_pointer: "/grand_total".to_owned(),
+                absolute: "0.005".to_owned(),
+            }),
+            exact_json: false,
+            gate_mode: GateMode::Regression,
+            min_cases: 100,
+        })
+        .unwrap();
+        let config = Config::load(&project.join("structtrace.yaml")).unwrap();
+        let keyed = config
+            .evaluators
+            .iter()
+            .find_map(|evaluator| match &evaluator.kind {
+                structtrace_core::config::EvaluatorKind::KeyedArray {
+                    key_fields, fields, ..
+                } => Some((key_fields, fields)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(keyed.0[0].pointer, "/description");
+        assert_eq!(keyed.0[0].evaluator, "normalized_string");
+        assert!(keyed.0[0].case_insensitive);
+        assert_eq!(keyed.1.len(), 1);
+        assert_eq!(keyed.1[0].pointer, "/amount");
+        let financial = config
+            .evaluators
+            .iter()
+            .find_map(|evaluator| match &evaluator.kind {
+                structtrace_core::config::EvaluatorKind::FinancialInvariants {
+                    line_items_pointer,
+                    quantity_pointer,
+                    unit_price_pointer,
+                    amount_pointer,
+                    subtotal_pointer,
+                    tax_pointer,
+                    total_pointer,
+                    absolute,
+                } => Some((
+                    line_items_pointer,
+                    quantity_pointer,
+                    unit_price_pointer,
+                    amount_pointer,
+                    subtotal_pointer,
+                    tax_pointer,
+                    total_pointer,
+                    absolute,
+                )),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(financial.0, "/items");
+        assert_eq!(financial.1, "/qty");
+        assert_eq!(financial.2, "/price");
+        assert_eq!(financial.3, "/line_total");
+        assert_eq!(financial.4, "/net_amount");
+        assert_eq!(financial.5, "/vat");
+        assert_eq!(financial.6, "/grand_total");
+        assert_eq!(financial.7, "0.005");
     }
 
     #[test]

@@ -372,7 +372,7 @@ pub struct RunSummary {
     /// Complete-denominator paired deployment effect.
     pub deployment_paired: PairedMetrics,
     /// Deployment-success bootstrap interval over independent evidence units.
-    pub independent_bootstrap: BootstrapInterval,
+    pub independent_bootstrap: Option<BootstrapInterval>,
     /// Paired semantic effect restricted to explicitly scored pass/fail pairs.
     pub jointly_scored_semantic: SemanticEffectSummary,
     /// Pair-matched operational measurements used by operational gates.
@@ -383,7 +383,7 @@ pub struct RunSummary {
     /// Backward-compatible alias for the complete-denominator deployment transition matrix.
     pub paired: PairedMetrics,
     /// Seeded deployment-success paired bootstrap interval.
-    pub bootstrap: BootstrapInterval,
+    pub bootstrap: Option<BootstrapInterval>,
     /// Release-gate decision.
     pub gate: GateDecision,
     /// Per-evaluator pass counts by variant.

@@ -60,4 +60,11 @@ describe("local import inspection", () => {
     expect(rules.find((rule) => rule.pointer === "/items")).toMatchObject({ kind: "keyed_array", enabled: false });
     expect(rules.find((rule) => rule.pointer === "/items")).toMatchObject({ keyFields: ["/sku"] });
   });
+
+  it("does not suggest a calendar-date comparator for date-time values", () => {
+    const dataset = parseArtifact("dataset", "data.jsonl", '{"id":"a","expected":{"created_at":"2026-08-11T15:30:00Z"}}\n');
+    const output = parseArtifact("baseline", "baseline.jsonl", '{"id":"a","output":{"created_at":"2026-08-11T15:30:00Z"}}\n');
+    const rules = discoverRules(dataset, output, output, "/expected", "/output", "/output");
+    expect(rules.find((rule) => rule.pointer === "/created_at")?.kind).not.toBe("canonical_date");
+  });
 });

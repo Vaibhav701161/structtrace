@@ -31,7 +31,9 @@ use structtrace_core::{
 };
 use ulid::Ulid;
 
-use crate::initialize::{FromOutputsOptions, SimpleOutputFields, initialize_from_outputs};
+use crate::initialize::{
+    FinancialInvariantMapping, FromOutputsOptions, SimpleOutputFields, initialize_from_outputs,
+};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -288,6 +290,19 @@ struct RuleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinancialMappingRequest {
+    line_items_pointer: String,
+    quantity_pointer: String,
+    unit_price_pointer: String,
+    amount_pointer: String,
+    subtotal_pointer: String,
+    tax_pointer: String,
+    total_pointer: String,
+    absolute: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ComparisonRequest {
     project_id: String,
     name: String,
@@ -299,6 +314,7 @@ struct ComparisonRequest {
     gate_mode: GateMode,
     min_cases: usize,
     financial_invariants: bool,
+    financial_mapping: Option<FinancialMappingRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -422,7 +438,7 @@ struct RunIntegrityReceipt {
 struct RunListMetrics {
     project_name: String,
     created_at: u64,
-    difference_pp: f64,
+    difference_pp: Option<f64>,
     independent_cases: usize,
     gate: GateDecision,
 }
@@ -2748,6 +2764,18 @@ fn materialize_and_run_comparison_inner(
         field_evaluators: &field_evaluators,
         keyed_arrays: &keyed_arrays,
         financial_invariants: request.financial_invariants,
+        financial_mapping: request
+            .financial_mapping
+            .map(|mapping| FinancialInvariantMapping {
+                line_items_pointer: mapping.line_items_pointer,
+                quantity_pointer: mapping.quantity_pointer,
+                unit_price_pointer: mapping.unit_price_pointer,
+                amount_pointer: mapping.amount_pointer,
+                subtotal_pointer: mapping.subtotal_pointer,
+                tax_pointer: mapping.tax_pointer,
+                total_pointer: mapping.total_pointer,
+                absolute: mapping.absolute,
+            }),
         exact_json: false,
         gate_mode: request.gate_mode,
         min_cases: request.min_cases,
@@ -3087,9 +3115,9 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
                     .sum::<usize>()
                     == string_values;
             let schema_hint = schema_fields.get(&pointer);
-            let schema_date = schema_hint
-                .and_then(|hint| hint.format.as_deref())
-                .is_some_and(|format| matches!(format, "date" | "date-time"));
+            let schema_date = schema_hint.and_then(|hint| hint.format.as_deref()) == Some("date");
+            let schema_date_time =
+                schema_hint.and_then(|hint| hint.format.as_deref()) == Some("date-time");
             let suggested_rule = match observed_type.as_str() {
                 "array" => "keyed_array",
                 "integer" => "exact_integer",
@@ -3099,8 +3127,7 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
                 "string"
                     if schema_date
                         || date_like
-                        || lower.contains("date")
-                        || lower.ends_with("_at") =>
+                        || (lower.contains("date") && !schema_date_time) =>
                 {
                     "canonical_date"
                 }
@@ -3121,6 +3148,8 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
             }
             if date_like || schema_date {
                 semantic_hints.push("date".to_owned());
+            } else if schema_date_time {
+                semantic_hints.push("date_time_exact".to_owned());
             }
             if uuid_like || schema_hint.and_then(|hint| hint.format.as_deref()) == Some("uuid") {
                 semantic_hints.push("uuid".to_owned());
@@ -3710,7 +3739,7 @@ fn response_from_run_cached(
                     == receipt.summary_hash =>
         {
             let detail = format!(
-                "Cached immutable receipt from {} binds the manifest and summary after a full replay of {} cases. Open the run to reverify all artifacts.",
+                "Previously verified at {}. A cached immutable receipt binds the manifest and summary after a full replay of {} cases. Open the run to freshly reverify every bound artifact.",
                 receipt.verified_at, receipt.cases_replayed
             );
             (
@@ -3754,7 +3783,7 @@ fn response_from_run_cached(
             (
                 metrics.project_name,
                 metrics.created_at,
-                Some(metrics.difference_pp),
+                metrics.difference_pp,
                 Some(metrics.independent_cases),
                 Some(metrics.gate),
             )

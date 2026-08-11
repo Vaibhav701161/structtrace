@@ -208,16 +208,22 @@ pub fn evaluate_gate(config: &GateConfig, inputs: &GateInputs<'_>) -> GateDecisi
             inputs.primary_component_unscored_rate,
             "primary required-component unscored rate",
         ),
-        maximum_rule(
+        optional_maximum_rule(
             "max_primary_regression_pp",
             config.max_primary_regression_pp,
-            (-inputs.primary.difference_pp).max(0.0),
+            inputs
+                .primary
+                .difference_pp
+                .map(|effect| (-effect).max(0.0)),
             "primary outcome regression",
         ),
-        maximum_rule(
+        optional_maximum_rule(
             "max_deployment_regression_pp",
             config.max_deployment_regression_pp,
-            (-inputs.deployment.difference_pp).max(0.0),
+            inputs
+                .deployment
+                .difference_pp
+                .map(|effect| (-effect).max(0.0)),
             "deployment-success regression",
         ),
         maximum_rule(
@@ -469,7 +475,7 @@ fn optional_maximum_rule(
             unavailable_failure(
                 name,
                 limit,
-                format!("{label} was configured but no paired interval was available."),
+                format!("{label} was configured but no paired effect estimate was available."),
             )
         },
         |value| maximum_rule(name, Some(limit), value, label),

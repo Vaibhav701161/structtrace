@@ -23,6 +23,11 @@ const defaultDraft: ComparisonDraft = {
   gateMode: "regression",
   minCases: 100,
   financialInvariants: false,
+  financialMapping: {
+    lineItemsPointer: "/line_items", quantityPointer: "/quantity", unitPricePointer: "/unit_price",
+    amountPointer: "/amount", subtotalPointer: "/subtotal", taxPointer: "/tax",
+    totalPointer: "/total", absolute: "0.01",
+  },
 };
 function freshDraft(): ComparisonDraft { return { ...defaultDraft, projectId: crypto.randomUUID(), sources: {}, rules: [], activeJobId: undefined }; }
 

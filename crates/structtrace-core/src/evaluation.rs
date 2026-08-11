@@ -66,6 +66,10 @@ pub struct EvaluatorResult {
 pub struct FieldEvaluationFact {
     /// Output JSON Pointer.
     pub pointer: String,
+    /// Schema-aware aggregation pointer. Array indices are replaced only when the evaluator
+    /// knows that the segment is an array position; numeric object keys remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation_pointer: Option<String>,
     /// Expected-value JSON Pointer when the evaluator uses a reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_pointer: Option<String>,
@@ -79,6 +83,52 @@ pub struct FieldEvaluationFact {
     pub actual: Option<Value>,
     /// Auditable field-specific explanation.
     pub message: String,
+}
+
+/// Caller-facing truth state for the configured primary outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryOutcomeTruth {
+    /// Every required primary component passed.
+    True,
+    /// At least one required primary component explicitly failed.
+    False,
+    /// A required primary component could not produce a trustworthy result.
+    Error,
+    /// The configured primary outcome explicitly did not apply.
+    NotApplicable,
+    /// The configured primary outcome or one of its required components was absent.
+    Unscored,
+}
+
+/// Authoritative primary-outcome truth and evaluation-health projection for API consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrimaryOutcomeDisplay {
+    /// Five-state truth. This field, rather than diagnostic evaluator states, drives the main UI.
+    pub truth: PrimaryOutcomeTruth,
+    /// True only when every required component explicitly resolved to pass or fail.
+    pub fully_evaluated: bool,
+    /// Required primary components that errored.
+    pub component_errors: usize,
+    /// Required primary components that were not applicable.
+    pub component_not_applicable: usize,
+    /// Required primary components that were absent.
+    pub component_unscored: usize,
+    /// Evaluators that contribute to this primary outcome; diagnostic evaluators are excluded.
+    pub evaluator_ids: Vec<String>,
+}
+
+impl Default for PrimaryOutcomeDisplay {
+    fn default() -> Self {
+        Self {
+            truth: PrimaryOutcomeTruth::Unscored,
+            fully_evaluated: false,
+            component_errors: 0,
+            component_not_applicable: 0,
+            component_unscored: 1,
+            evaluator_ids: Vec::new(),
+        }
+    }
 }
 
 impl EvaluatorResult {
@@ -212,6 +262,9 @@ pub struct CaseEvaluation {
     pub evaluators: BTreeMap<String, EvaluatorResult>,
     /// Named composed outcomes.
     pub outcomes: BTreeMap<String, OutcomeResult>,
+    /// Authoritative display projection for the selected primary outcome.
+    #[serde(default)]
+    pub primary_outcome: PrimaryOutcomeDisplay,
     /// Whether the primary semantic outcome passed.
     pub primary_pass: bool,
     /// Whether adapter execution, strict parsing, and caller-facing schema validation succeeded.
@@ -336,6 +389,32 @@ pub fn evaluate_case_with_external(
     let primary_fully_evaluated = primary_result.is_some_and(|result| result.fully_evaluated);
     let structured_success = output.status == OutputStatus::Ok && schema_valid;
     let deployment_success = structured_success && primary_pass && primary_fully_evaluated;
+    let primary_outcome_display =
+        primary_result.map_or_else(PrimaryOutcomeDisplay::default, |result| {
+            PrimaryOutcomeDisplay {
+                truth: match result.truth {
+                    OutcomeStatus::True => PrimaryOutcomeTruth::True,
+                    OutcomeStatus::False => PrimaryOutcomeTruth::False,
+                    OutcomeStatus::Error => PrimaryOutcomeTruth::Error,
+                    OutcomeStatus::NotApplicable => PrimaryOutcomeTruth::NotApplicable,
+                },
+                fully_evaluated: result.fully_evaluated,
+                component_errors: result.error_components,
+                component_not_applicable: result.not_applicable_components,
+                component_unscored: result.unscored_components,
+                evaluator_ids: outcomes.get(primary_outcome).map_or_else(
+                    Vec::new,
+                    |configuration| {
+                        configuration
+                            .all_of
+                            .iter()
+                            .chain(&configuration.any_of)
+                            .cloned()
+                            .collect()
+                    },
+                ),
+            }
+        });
     CaseEvaluation {
         case_id: case.id.clone(),
         adapter_status: output.status,
@@ -346,6 +425,7 @@ pub fn evaluate_case_with_external(
         schema_errors,
         evaluators: evaluator_results,
         outcomes: outcome_results,
+        primary_outcome: primary_outcome_display,
         primary_pass,
         structured_success,
         semantic_success: primary_pass,
@@ -355,6 +435,176 @@ pub fn evaluate_case_with_external(
             && primary_status == Some(OutcomeStatus::False)
             && primary_fully_evaluated,
     }
+}
+
+/// One malformed or missing golden/reference value found before candidate scoring begins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReferenceValidationIssue {
+    /// Dataset case containing the bad reference.
+    pub case_id: String,
+    /// Evaluator whose declared reference contract cannot be satisfied.
+    pub evaluator_id: String,
+    /// Expected-value pointer, or `/` for the complete expected object.
+    pub expected_pointer: String,
+    /// Exact reason the value cannot be used as semantic truth.
+    pub message: String,
+}
+
+/// Validate every deterministic built-in reference before any baseline or candidate is scored.
+///
+/// Output-only invariants and external evaluators have no generic golden-value contract and are
+/// therefore excluded. Their runtime errors remain evaluator errors and never become failures.
+pub fn validate_references(
+    cases: &[Case],
+    evaluators: &[EvaluatorConfig],
+) -> Vec<ReferenceValidationIssue> {
+    let mut issues = Vec::new();
+    for case in cases {
+        for evaluator in evaluators {
+            let issue = |pointer: &str, message: &str| ReferenceValidationIssue {
+                case_id: case.id.clone(),
+                evaluator_id: evaluator.id.clone(),
+                expected_pointer: pointer.to_owned(),
+                message: message.to_owned(),
+            };
+            let expected = case.expected.as_ref();
+            match &evaluator.kind {
+                EvaluatorKind::ExactJson => {
+                    if expected.is_none() {
+                        issues.push(issue("/", "case has no expected JSON value"));
+                    }
+                }
+                EvaluatorKind::JsonPointerExact {
+                    expected_pointer, ..
+                }
+                | EvaluatorKind::EnumAccuracy {
+                    expected_pointer, ..
+                }
+                | EvaluatorKind::ToolSelection {
+                    expected_pointer, ..
+                } => {
+                    if expected
+                        .and_then(|value| value.pointer(expected_pointer))
+                        .is_none()
+                    {
+                        issues.push(issue(expected_pointer, "expected pointer did not resolve"));
+                    }
+                }
+                EvaluatorKind::JsonPointersExact { pointers }
+                | EvaluatorKind::ToolArguments { pointers } => {
+                    for pair in pointers {
+                        if expected
+                            .and_then(|value| value.pointer(&pair.expected_pointer))
+                            .is_none()
+                        {
+                            issues.push(issue(
+                                &pair.expected_pointer,
+                                "expected pointer did not resolve",
+                            ));
+                        }
+                    }
+                }
+                EvaluatorKind::NormalizedString {
+                    expected_pointer, ..
+                } => {
+                    if expected
+                        .and_then(|value| value.pointer(expected_pointer))
+                        .and_then(Value::as_str)
+                        .is_none()
+                    {
+                        issues.push(issue(
+                            expected_pointer,
+                            "expected normalized-string reference must be a string",
+                        ));
+                    }
+                }
+                EvaluatorKind::CanonicalDate {
+                    expected_pointer,
+                    formats,
+                    ..
+                } => {
+                    let valid = expected
+                        .and_then(|value| value.pointer(expected_pointer))
+                        .and_then(Value::as_str)
+                        .and_then(|value| canonical_date(value, formats))
+                        .is_some();
+                    if !valid {
+                        issues.push(issue(
+                            expected_pointer,
+                            "expected date is missing, malformed, or outside the accepted formats",
+                        ));
+                    }
+                }
+                EvaluatorKind::NumericTolerance {
+                    expected_pointer,
+                    exact_integer,
+                    ..
+                } => {
+                    let text = expected
+                        .and_then(|value| value.pointer(expected_pointer))
+                        .and_then(number_text);
+                    let valid = if *exact_integer {
+                        text.and_then(canonical_integer).is_some()
+                    } else {
+                        text.and_then(parse_decimal_text).is_some()
+                    };
+                    if !valid {
+                        issues.push(issue(
+                            expected_pointer,
+                            if *exact_integer {
+                                "expected exact-integer reference is missing or malformed"
+                            } else {
+                                "expected decimal reference is missing, malformed, or outside the exact range"
+                            },
+                        ));
+                    }
+                }
+                EvaluatorKind::KeyedArray {
+                    expected_pointer,
+                    keys,
+                    key_fields,
+                    fields,
+                    ..
+                } => {
+                    let Some(items) = expected
+                        .and_then(|value| value.pointer(expected_pointer))
+                        .and_then(Value::as_array)
+                    else {
+                        issues.push(issue(
+                            expected_pointer,
+                            "expected keyed-array reference must resolve to an array",
+                        ));
+                        continue;
+                    };
+                    if keyed_items(items, keys, key_fields).is_err() {
+                        issues.push(issue(
+                            expected_pointer,
+                            "expected keyed-array identities are missing, duplicated, or malformed",
+                        ));
+                        continue;
+                    }
+                    for (index, item) in items.iter().enumerate() {
+                        for field in fields {
+                            let expected_value = item.pointer(&field.pointer);
+                            let (status, message) =
+                                compare_keyed_field(field, expected_value, expected_value);
+                            if status == EvaluationStatus::Error {
+                                issues.push(issue(
+                                    &format!("{expected_pointer}/{index}{}", field.pointer),
+                                    message,
+                                ));
+                            }
+                        }
+                    }
+                }
+                EvaluatorKind::RequiredFields { .. }
+                | EvaluatorKind::FinancialInvariants { .. }
+                | EvaluatorKind::Command { .. }
+                | EvaluatorKind::Python { .. } => {}
+            }
+        }
+    }
+    issues
 }
 
 fn evaluate_builtin(
@@ -434,6 +684,7 @@ fn evaluate_builtin(
                     let passed = actual.as_ref().is_some_and(|value| !value.is_null());
                     FieldEvaluationFact {
                         pointer: pointer.clone(),
+                        aggregation_pointer: None,
                         expected_pointer: None,
                         status: if passed {
                             EvaluationStatus::Passed
@@ -479,18 +730,25 @@ fn evaluate_builtin(
             pointer,
             expected_pointer,
             keys,
+            key_fields,
             fields,
         } => evaluate_keyed_array(
             id,
             output,
             expected,
-            pointer,
-            expected_pointer,
-            keys,
-            fields,
+            KeyedArrayPolicy {
+                pointer,
+                expected_pointer,
+                keys,
+                key_fields,
+                fields,
+            },
         ),
         EvaluatorKind::FinancialInvariants {
             line_items_pointer,
+            quantity_pointer,
+            unit_price_pointer,
+            amount_pointer,
             subtotal_pointer,
             tax_pointer,
             total_pointer,
@@ -498,11 +756,16 @@ fn evaluate_builtin(
         } => evaluate_financial_invariants(
             id,
             output,
-            line_items_pointer,
-            subtotal_pointer,
-            tax_pointer,
-            total_pointer,
-            absolute,
+            FinancialInvariantPolicy {
+                line_items_pointer,
+                quantity_pointer,
+                unit_price_pointer,
+                amount_pointer,
+                subtotal_pointer,
+                tax_pointer,
+                total_pointer,
+                absolute,
+            },
         ),
         EvaluatorKind::Command { .. } | EvaluatorKind::Python { .. } => EvaluatorResult::error(
             id,
@@ -574,6 +837,7 @@ fn unparsed_field_facts(kind: &EvaluatorKind) -> Vec<FieldEvaluationFact> {
         .into_iter()
         .map(|(pointer, expected_pointer)| FieldEvaluationFact {
             pointer,
+            aggregation_pointer: None,
             expected_pointer,
             status: EvaluationStatus::Error,
             expected: None,
@@ -594,6 +858,7 @@ fn compare_pointer(
         return EvaluatorResult::error(id, "case has no expected value").with_fields(vec![
             FieldEvaluationFact {
                 pointer: pointer.to_owned(),
+                aggregation_pointer: None,
                 expected_pointer: Some(expected_pointer.to_owned()),
                 status: EvaluationStatus::Error,
                 expected: None,
@@ -607,6 +872,7 @@ fn compare_pointer(
     let field = |status, actual: Option<&Value>, reference: Option<&Value>, message: &str| {
         FieldEvaluationFact {
             pointer: pointer.to_owned(),
+            aggregation_pointer: None,
             expected_pointer: Some(expected_pointer.to_owned()),
             status,
             expected: reference.cloned(),
@@ -673,6 +939,7 @@ fn compare_pointer_list(
                 .iter()
                 .map(|pair| FieldEvaluationFact {
                     pointer: pair.pointer.clone(),
+                    aggregation_pointer: None,
                     expected_pointer: Some(pair.expected_pointer.clone()),
                     status: EvaluationStatus::Error,
                     expected: None,
@@ -700,6 +967,7 @@ fn compare_pointer_list(
         };
         fields.push(FieldEvaluationFact {
             pointer: pair.pointer.clone(),
+            aggregation_pointer: None,
             expected_pointer: Some(pair.expected_pointer.clone()),
             status,
             expected: reference,
@@ -746,10 +1014,7 @@ fn evaluate_normalized_string(
     };
     let actual = output.pointer(pointer);
     let reference = expected.pointer(expected_pointer);
-    let (Some(actual_text), Some(reference_text)) = (
-        actual.and_then(Value::as_str),
-        reference.and_then(Value::as_str),
-    ) else {
+    let Some(reference_text) = reference.and_then(Value::as_str) else {
         return field_result(
             id,
             EvaluationStatus::Error,
@@ -757,7 +1022,19 @@ fn evaluate_normalized_string(
             expected_pointer,
             actual,
             reference,
-            "Normalized-string inputs must both be strings.",
+            "Expected normalized-string reference must resolve to a string.",
+            Value::Null,
+        );
+    };
+    let Some(actual_text) = actual.and_then(Value::as_str) else {
+        return field_result(
+            id,
+            EvaluationStatus::Failed,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Output normalized-string value must resolve to a string.",
             Value::Null,
         );
     };
@@ -816,10 +1093,7 @@ fn evaluate_canonical_date(
     };
     let actual = output.pointer(pointer);
     let reference = expected.pointer(expected_pointer);
-    let (Some(actual_text), Some(reference_text)) = (
-        actual.and_then(Value::as_str),
-        reference.and_then(Value::as_str),
-    ) else {
+    let Some(reference_text) = reference.and_then(Value::as_str) else {
         return field_result(
             id,
             EvaluationStatus::Error,
@@ -827,13 +1101,12 @@ fn evaluate_canonical_date(
             expected_pointer,
             actual,
             reference,
-            "Canonical-date inputs must both be strings.",
+            "Expected canonical-date reference must resolve to a string.",
             Value::Null,
         );
     };
-    let actual_date = canonical_date(actual_text, formats);
     let expected_date = canonical_date(reference_text, formats);
-    let (Some(actual_date), Some(expected_date)) = (actual_date, expected_date) else {
+    let Some(expected_date) = expected_date else {
         return field_result(
             id,
             EvaluationStatus::Error,
@@ -841,7 +1114,31 @@ fn evaluate_canonical_date(
             expected_pointer,
             actual,
             reference,
-            "A date was invalid or did not match an accepted format.",
+            "Expected date was invalid or did not match an accepted format.",
+            serde_json::json!({"accepted_formats": formats}),
+        );
+    };
+    let Some(actual_text) = actual.and_then(Value::as_str) else {
+        return field_result(
+            id,
+            EvaluationStatus::Failed,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Output canonical-date value must resolve to a string.",
+            Value::Null,
+        );
+    };
+    let Some(actual_date) = canonical_date(actual_text, formats) else {
+        return field_result(
+            id,
+            EvaluationStatus::Failed,
+            pointer,
+            expected_pointer,
+            actual,
+            reference,
+            "Output date was invalid or did not match an accepted format.",
             serde_json::json!({"accepted_formats": formats}),
         );
     };
@@ -901,15 +1198,28 @@ fn valid_date((year, month, day): (u32, u32, u32)) -> bool {
     year > 0 && (1..=maximum).contains(&day)
 }
 
+#[derive(Clone, Copy)]
+struct KeyedArrayPolicy<'a> {
+    pointer: &'a str,
+    expected_pointer: &'a str,
+    keys: &'a [String],
+    key_fields: &'a [KeyedArrayField],
+    fields: &'a [KeyedArrayField],
+}
+
 fn evaluate_keyed_array(
     id: &str,
     output: &Value,
     expected: Option<&Value>,
-    pointer: &str,
-    expected_pointer: &str,
-    keys: &[String],
-    field_configs: &[KeyedArrayField],
+    policy: KeyedArrayPolicy<'_>,
 ) -> EvaluatorResult {
+    let KeyedArrayPolicy {
+        pointer,
+        expected_pointer,
+        keys,
+        key_fields,
+        fields: field_configs,
+    } = policy;
     let Some(expected) = expected else {
         return field_error(
             id,
@@ -921,10 +1231,7 @@ fn evaluate_keyed_array(
     };
     let actual = output.pointer(pointer);
     let reference = expected.pointer(expected_pointer);
-    let (Some(actual_items), Some(expected_items)) = (
-        actual.and_then(Value::as_array),
-        reference.and_then(Value::as_array),
-    ) else {
+    let Some(expected_items) = reference.and_then(Value::as_array) else {
         return field_result(
             id,
             EvaluationStatus::Error,
@@ -932,23 +1239,51 @@ fn evaluate_keyed_array(
             expected_pointer,
             actual,
             reference,
-            "Keyed-array inputs must both be arrays.",
+            "Expected keyed-array reference must resolve to an array.",
             Value::Null,
         );
     };
-    let actual_map = keyed_items(actual_items, keys, field_configs);
-    let expected_map = keyed_items(expected_items, keys, field_configs);
-    let (Ok(actual_map), Ok(expected_map)) = (actual_map, expected_map) else {
+    let Some(actual_items) = actual.and_then(Value::as_array) else {
         return field_result(
             id,
-            EvaluationStatus::Error,
+            EvaluationStatus::Failed,
             pointer,
             expected_pointer,
             actual,
             reference,
-            "Array items had missing or duplicate keys.",
-            serde_json::json!({"keys": keys}),
+            "Output keyed-array value must resolve to an array.",
+            Value::Null,
         );
+    };
+    let expected_map = match keyed_items(expected_items, keys, key_fields) {
+        Ok(items) => items,
+        Err(()) => {
+            return field_result(
+                id,
+                EvaluationStatus::Error,
+                pointer,
+                expected_pointer,
+                actual,
+                reference,
+                "Expected array items had missing, duplicate, or malformed keys.",
+                serde_json::json!({"keys": keys}),
+            );
+        }
+    };
+    let actual_map = match keyed_items(actual_items, keys, key_fields) {
+        Ok(items) => items,
+        Err(()) => {
+            return field_result(
+                id,
+                EvaluationStatus::Failed,
+                pointer,
+                expected_pointer,
+                actual,
+                reference,
+                "Output array items had missing, duplicate, or malformed keys.",
+                serde_json::json!({"keys": keys}),
+            );
+        }
     };
     let missing = expected_map
         .keys()
@@ -965,6 +1300,7 @@ fn evaluate_keyed_array(
     if !missing.is_empty() || !extra.is_empty() {
         field_facts.push(FieldEvaluationFact {
             pointer: pointer.to_owned(),
+            aggregation_pointer: None,
             expected_pointer: Some(expected_pointer.to_owned()),
             status: EvaluationStatus::Failed,
             expected: reference.cloned(),
@@ -996,6 +1332,7 @@ fn evaluate_keyed_array(
             had_error |= field_status == EvaluationStatus::Error;
             field_facts.push(FieldEvaluationFact {
                 pointer: format!("{pointer}/{actual_index}{}", field.pointer),
+                aggregation_pointer: Some(format!("{pointer}/*{}", field.pointer)),
                 expected_pointer: Some(format!(
                     "{expected_pointer}/{expected_index}{}",
                     field.pointer
@@ -1058,42 +1395,68 @@ fn compare_keyed_field(
     let passed = match field.evaluator.as_str() {
         "exact" => actual == expected,
         "normalized_string" => {
-            actual
-                .as_str()
-                .zip(expected.as_str())
-                .is_some_and(|(actual, expected)| {
-                    normalize_text(actual, field.case_insensitive)
-                        == normalize_text(expected, field.case_insensitive)
-                })
-        }
-        "exact_integer" => {
-            number_text(actual)
-                .zip(number_text(expected))
-                .is_some_and(|(actual, expected)| {
-                    canonical_integer(actual) == canonical_integer(expected)
-                        && canonical_integer(actual).is_some()
-                })
-        }
-        "decimal_exact" => {
-            let (Some(actual), Some(expected)) =
-                (decimal_value(Some(actual)), decimal_value(Some(expected)))
-            else {
+            let Some(expected) = expected.as_str() else {
                 return (
                     EvaluationStatus::Error,
-                    "Item values could not be represented as exact decimals.",
+                    "Expected item field must be a string.",
+                );
+            };
+            let Some(actual) = actual.as_str() else {
+                return (
+                    EvaluationStatus::Failed,
+                    "Output item field must be a string.",
+                );
+            };
+            normalize_text(actual, field.case_insensitive)
+                == normalize_text(expected, field.case_insensitive)
+        }
+        "exact_integer" => {
+            let Some(expected) = number_text(expected).and_then(canonical_integer) else {
+                return (
+                    EvaluationStatus::Error,
+                    "Expected item field must be an integer.",
+                );
+            };
+            let Some(actual) = number_text(actual).and_then(canonical_integer) else {
+                return (
+                    EvaluationStatus::Failed,
+                    "Output item field must be an integer.",
+                );
+            };
+            actual == expected
+        }
+        "decimal_exact" => {
+            let Some(expected) = decimal_value(Some(expected)) else {
+                return (
+                    EvaluationStatus::Error,
+                    "Expected item field must be an exact decimal.",
+                );
+            };
+            let Some(actual) = decimal_value(Some(actual)) else {
+                return (
+                    EvaluationStatus::Failed,
+                    "Output item field must be an exact decimal.",
                 );
             };
             actual == expected
         }
         "decimal_tolerance" => {
-            let (Some(actual), Some(expected), Some(tolerance)) = (
-                decimal_value(Some(actual)),
-                decimal_value(Some(expected)),
-                field.absolute.as_deref().and_then(parse_decimal_text),
-            ) else {
+            let Some(tolerance) = field.absolute.as_deref().and_then(parse_decimal_text) else {
                 return (
                     EvaluationStatus::Error,
-                    "Item values or tolerance could not be represented as exact decimals.",
+                    "Configured item tolerance is invalid.",
+                );
+            };
+            let Some(expected) = decimal_value(Some(expected)) else {
+                return (
+                    EvaluationStatus::Error,
+                    "Expected item field must be an exact decimal.",
+                );
+            };
+            let Some(actual) = decimal_value(Some(actual)) else {
+                return (
+                    EvaluationStatus::Failed,
+                    "Output item field must be an exact decimal.",
                 );
             };
             let Some(difference) = actual.checked_sub(expected).map(|value| value.abs()) else {
@@ -1105,14 +1468,25 @@ fn compare_keyed_field(
             difference <= tolerance
         }
         "canonical_date" => {
-            actual
+            let Some(expected) = expected
                 .as_str()
-                .zip(expected.as_str())
-                .is_some_and(|(actual, expected)| {
-                    canonical_date(actual, &field.formats)
-                        == canonical_date(expected, &field.formats)
-                        && canonical_date(actual, &field.formats).is_some()
-                })
+                .and_then(|value| canonical_date(value, &field.formats))
+            else {
+                return (
+                    EvaluationStatus::Error,
+                    "Expected item field must be a supported date.",
+                );
+            };
+            let Some(actual) = actual
+                .as_str()
+                .and_then(|value| canonical_date(value, &field.formats))
+            else {
+                return (
+                    EvaluationStatus::Failed,
+                    "Output item field must be a supported date.",
+                );
+            };
+            actual == expected
         }
         _ => {
             return (
@@ -1145,10 +1519,7 @@ fn keyed_items<'a>(
             .iter()
             .map(|key| {
                 let value = item.pointer(key).ok_or(())?;
-                Ok(normalized_key_value(
-                    value,
-                    fields.iter().find(|field| field.pointer == *key),
-                ))
+                normalized_key_value(value, fields.iter().find(|field| field.pointer == *key))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let identity = serde_json::to_string(&identity).map_err(|_| ())?;
@@ -1159,35 +1530,56 @@ fn keyed_items<'a>(
     Ok(indexed)
 }
 
-fn normalized_key_value(value: &Value, field: Option<&KeyedArrayField>) -> Value {
+fn normalized_key_value(value: &Value, field: Option<&KeyedArrayField>) -> Result<Value, ()> {
     let Some(field) = field else {
-        return value.clone();
+        return Ok(value.clone());
     };
-    match field.evaluator.as_str() {
-        "normalized_string" => value.as_str().map_or_else(
-            || value.clone(),
-            |text| Value::String(normalize_text(text, field.case_insensitive)),
-        ),
+    let normalized = match field.evaluator.as_str() {
+        "normalized_string" => Value::String(normalize_text(
+            value.as_str().ok_or(())?,
+            field.case_insensitive,
+        )),
         "exact_integer" => number_text(value)
             .and_then(canonical_integer)
-            .map_or_else(|| value.clone(), Value::String),
+            .map(Value::String)
+            .ok_or(())?,
         "canonical_date" => value
             .as_str()
             .and_then(|text| canonical_date(text, &field.formats))
-            .map_or_else(|| value.clone(), Value::String),
+            .map(Value::String)
+            .ok_or(())?,
         _ => value.clone(),
-    }
+    };
+    Ok(normalized)
+}
+
+#[derive(Clone, Copy)]
+struct FinancialInvariantPolicy<'a> {
+    line_items_pointer: &'a str,
+    quantity_pointer: &'a str,
+    unit_price_pointer: &'a str,
+    amount_pointer: &'a str,
+    subtotal_pointer: &'a str,
+    tax_pointer: &'a str,
+    total_pointer: &'a str,
+    absolute: &'a str,
 }
 
 fn evaluate_financial_invariants(
     id: &str,
     output: &Value,
-    line_items_pointer: &str,
-    subtotal_pointer: &str,
-    tax_pointer: &str,
-    total_pointer: &str,
-    absolute: &str,
+    policy: FinancialInvariantPolicy<'_>,
 ) -> EvaluatorResult {
+    let FinancialInvariantPolicy {
+        line_items_pointer,
+        quantity_pointer,
+        unit_price_pointer,
+        amount_pointer,
+        subtotal_pointer,
+        tax_pointer,
+        total_pointer,
+        absolute,
+    } = policy;
     let tolerance = match parse_decimal_text(absolute) {
         Some(value) => value,
         None => return EvaluatorResult::error(id, "financial tolerance is invalid"),
@@ -1197,12 +1589,14 @@ fn evaluate_financial_invariants(
     };
     let mut fields = Vec::new();
     let mut item_sum = Decimal::ZERO;
+    let mut item_sum_complete = true;
     let mut had_error = false;
     for (index, item) in items.iter().enumerate() {
-        let quantity = decimal_value(item.pointer("/quantity"));
-        let unit_price = decimal_value(item.pointer("/unit_price"));
-        let amount = decimal_value(item.pointer("/amount"));
-        let pointer = format!("{line_items_pointer}/{index}/amount");
+        let quantity = decimal_value(item.pointer(quantity_pointer));
+        let unit_price = decimal_value(item.pointer(unit_price_pointer));
+        let amount = decimal_value(item.pointer(amount_pointer));
+        let pointer = format!("{line_items_pointer}/{index}{amount_pointer}");
+        let aggregation_pointer = Some(format!("{line_items_pointer}/*{amount_pointer}"));
         match (quantity, unit_price, amount) {
             (Some(quantity), Some(unit_price), Some(amount)) => {
                 let expected_amount = quantity.checked_mul(unit_price);
@@ -1218,12 +1612,14 @@ fn evaluate_financial_invariants(
                     })
                 else {
                     had_error = true;
+                    item_sum_complete = false;
                     fields.push(FieldEvaluationFact {
                         pointer,
+                        aggregation_pointer,
                         expected_pointer: None,
                         status: EvaluationStatus::Error,
                         expected: None,
-                        actual: item.pointer("/amount").cloned(),
+                        actual: item.pointer(amount_pointer).cloned(),
                         message: "Line-item arithmetic exceeded the exact decimal range."
                             .to_owned(),
                     });
@@ -1233,6 +1629,7 @@ fn evaluate_financial_invariants(
                 let passed = difference <= tolerance;
                 fields.push(FieldEvaluationFact {
                     pointer,
+                    aggregation_pointer,
                     expected_pointer: None,
                     status: if passed {
                         EvaluationStatus::Passed
@@ -1240,18 +1637,20 @@ fn evaluate_financial_invariants(
                         EvaluationStatus::Failed
                     },
                     expected: Some(Value::String(expected_amount.normalize().to_string())),
-                    actual: item.pointer("/amount").cloned(),
+                    actual: item.pointer(amount_pointer).cloned(),
                     message: "Line amount must equal quantity multiplied by unit price.".to_owned(),
                 });
             }
             _ => {
                 had_error = true;
+                item_sum_complete = false;
                 fields.push(FieldEvaluationFact {
                     pointer,
+                    aggregation_pointer,
                     expected_pointer: None,
                     status: EvaluationStatus::Error,
                     expected: None,
-                    actual: item.pointer("/amount").cloned(),
+                    actual: item.pointer(amount_pointer).cloned(),
                     message: "Line item financial values must be decimal-compatible.".to_owned(),
                 });
             }
@@ -1264,6 +1663,7 @@ fn evaluate_financial_invariants(
         had_error = true;
         fields.push(FieldEvaluationFact {
             pointer: tax_pointer.to_owned(),
+            aggregation_pointer: None,
             expected_pointer: None,
             status: EvaluationStatus::Error,
             expected: None,
@@ -1271,12 +1671,15 @@ fn evaluate_financial_invariants(
             message: "Required financial value was missing or nonnumeric.".to_owned(),
         });
     }
-    for (pointer, actual, expected_value, message) in [
+    for (pointer, actual, expected_value, message, dependency_error) in [
         (
             subtotal_pointer,
             subtotal,
-            Some(item_sum),
+            item_sum_complete.then_some(item_sum),
             "Subtotal must equal the sum of line amounts.",
+            (!item_sum_complete).then_some(
+                "Subtotal invariant was not evaluated because the line-item sum is incomplete.",
+            ),
         ),
         (
             total_pointer,
@@ -1285,12 +1688,14 @@ fn evaluate_financial_invariants(
                 .zip(tax)
                 .and_then(|(subtotal, tax)| subtotal.checked_add(tax)),
             "Total must equal subtotal plus tax.",
+            None,
         ),
     ] {
         match (actual, expected_value) {
             (Some(actual), Some(expected)) => match actual.checked_sub(expected) {
                 Some(difference) => fields.push(FieldEvaluationFact {
                     pointer: pointer.to_owned(),
+                    aggregation_pointer: None,
                     expected_pointer: None,
                     status: if difference.abs() <= tolerance {
                         EvaluationStatus::Passed
@@ -1305,6 +1710,7 @@ fn evaluate_financial_invariants(
                     had_error = true;
                     fields.push(FieldEvaluationFact {
                         pointer: pointer.to_owned(),
+                        aggregation_pointer: None,
                         expected_pointer: None,
                         status: EvaluationStatus::Error,
                         expected: None,
@@ -1318,11 +1724,14 @@ fn evaluate_financial_invariants(
                 had_error = true;
                 fields.push(FieldEvaluationFact {
                     pointer: pointer.to_owned(),
+                    aggregation_pointer: None,
                     expected_pointer: None,
                     status: EvaluationStatus::Error,
                     expected: None,
                     actual: output.pointer(pointer).cloned(),
-                    message: "Required financial values were missing or nonnumeric.".to_owned(),
+                    message: dependency_error
+                        .unwrap_or("Required financial values were missing or nonnumeric.")
+                        .to_owned(),
                 });
             }
         }
@@ -1440,6 +1849,7 @@ fn field_result(
         details,
         fields: vec![FieldEvaluationFact {
             pointer: pointer.to_owned(),
+            aggregation_pointer: None,
             expected_pointer: Some(expected_pointer.to_owned()),
             status,
             expected: expected.cloned(),
@@ -1485,6 +1895,7 @@ fn evaluate_numeric(
                  message: &str| {
         vec![FieldEvaluationFact {
             pointer: pointer.to_owned(),
+            aggregation_pointer: None,
             expected_pointer: Some(expected_pointer.to_owned()),
             status,
             expected: reference.cloned(),
@@ -1525,26 +1936,53 @@ fn evaluate_numeric(
             "Expected pointer did not resolve.",
         ));
     };
-    let actual_text = number_text(actual_value);
-    let expected_text = number_text(expected_value);
-    let (Some(actual_text), Some(expected_text)) = (actual_text, expected_text) else {
+    let Some(expected_text) = number_text(expected_value) else {
+        return EvaluatorResult::error(id, "Expected numeric reference is not numeric.")
+            .with_fields(field(
+                EvaluationStatus::Error,
+                Some(actual_value),
+                Some(expected_value),
+                "Expected numeric reference is not numeric.",
+            ));
+    };
+    let Some(actual_text) = number_text(actual_value) else {
         return EvaluatorResult::failed(
             id,
-            "Numeric evaluator received a non-numeric value.",
+            "Output numeric value is not numeric.",
             serde_json::json!({"actual": actual_value, "expected": expected_value}),
         )
         .with_fields(field(
             EvaluationStatus::Failed,
             Some(actual_value),
             Some(expected_value),
-            "Numeric evaluator received a non-numeric value.",
+            "Output numeric value is not numeric.",
         ));
     };
     if exact_integer {
-        let actual = canonical_integer(actual_text);
-        let reference = canonical_integer(expected_text);
-        return match (actual, reference) {
-            (Some(actual), Some(reference)) if actual == reference => EvaluatorResult::passed(
+        let Some(reference) = canonical_integer(expected_text) else {
+            return EvaluatorResult::error(id, "Expected exact-integer reference is malformed.")
+                .with_fields(field(
+                    EvaluationStatus::Error,
+                    Some(actual_value),
+                    Some(expected_value),
+                    "Expected exact-integer reference is malformed.",
+                ));
+        };
+        let Some(actual) = canonical_integer(actual_text) else {
+            return EvaluatorResult::failed(
+                id,
+                "Output exact-integer value is malformed.",
+                Value::Null,
+            )
+            .with_fields(field(
+                EvaluationStatus::Failed,
+                Some(actual_value),
+                Some(expected_value),
+                "Output exact-integer value is malformed.",
+            ));
+        };
+        return match actual == reference {
+            true => EvaluatorResult::passed(
                 id,
                 "Integer values matched exactly.",
                 serde_json::json!({"value": actual}),
@@ -1555,7 +1993,7 @@ fn evaluate_numeric(
                 Some(expected_value),
                 "Integer values matched exactly.",
             )),
-            (Some(actual), Some(reference)) => EvaluatorResult::failed(
+            false => EvaluatorResult::failed(
                 id,
                 "Integer values did not match exactly.",
                 serde_json::json!({"actual": actual, "expected": reference}),
@@ -1566,31 +2004,31 @@ fn evaluate_numeric(
                 Some(expected_value),
                 "Integer values did not match exactly.",
             )),
-            _ => EvaluatorResult::failed(
-                id,
-                "Exact-integer comparison requires integer values.",
-                Value::Null,
-            )
-            .with_fields(field(
-                EvaluationStatus::Failed,
-                Some(actual_value),
-                Some(expected_value),
-                "Exact-integer comparison requires integer values.",
-            )),
         };
     }
-    let actual = parse_decimal_text(actual_text);
-    let reference = parse_decimal_text(expected_text);
-    let (Some(actual), Some(reference)) = (actual, reference) else {
+    let Some(reference) = parse_decimal_text(expected_text) else {
         return EvaluatorResult::error(
             id,
-            "Values could not be represented within the exact decimal range.",
+            "Expected reference could not be represented within the exact decimal range.",
         )
         .with_fields(field(
             EvaluationStatus::Error,
             Some(actual_value),
             Some(expected_value),
-            "Values could not be represented within the exact decimal range.",
+            "Expected reference could not be represented within the exact decimal range.",
+        ));
+    };
+    let Some(actual) = parse_decimal_text(actual_text) else {
+        return EvaluatorResult::failed(
+            id,
+            "Output value could not be represented within the exact decimal range.",
+            Value::Null,
+        )
+        .with_fields(field(
+            EvaluationStatus::Failed,
+            Some(actual_value),
+            Some(expected_value),
+            "Output value could not be represented within the exact decimal range.",
         ));
     };
     let absolute_tolerance = absolute.and_then(parse_decimal_text);
@@ -1616,15 +2054,28 @@ fn evaluate_numeric(
             ));
     };
     let absolute_pass = absolute_tolerance.is_some_and(|limit| difference <= limit);
-    let relative_pass = relative_tolerance.is_some_and(|limit| {
+    let relative_bound = relative_tolerance.map(|limit| {
         if reference.is_zero() {
-            difference.is_zero()
+            Some(Decimal::ZERO)
         } else {
-            difference
-                .checked_div(reference.abs())
-                .is_some_and(|ratio| ratio <= limit)
+            limit.checked_mul(reference.abs())
         }
     });
+    if relative_tolerance.is_some() && relative_bound == Some(None) {
+        return EvaluatorResult::error(
+            id,
+            "Relative tolerance bound exceeded the exact decimal range",
+        )
+        .with_fields(field(
+            EvaluationStatus::Error,
+            Some(actual_value),
+            Some(expected_value),
+            "Relative tolerance bound exceeded the exact decimal range.",
+        ));
+    }
+    let relative_pass = relative_bound
+        .flatten()
+        .is_some_and(|bound| difference <= bound);
     if difference.is_zero() || absolute_pass || relative_pass {
         EvaluatorResult::passed(
             id,
@@ -1873,6 +2324,33 @@ mod tests {
         .unwrap()
     }
 
+    fn keyed_policy<'a>(
+        keys: &'a [String],
+        key_fields: &'a [KeyedArrayField],
+        fields: &'a [KeyedArrayField],
+    ) -> KeyedArrayPolicy<'a> {
+        KeyedArrayPolicy {
+            pointer: "/items",
+            expected_pointer: "/items",
+            keys,
+            key_fields,
+            fields,
+        }
+    }
+
+    fn financial_policy() -> FinancialInvariantPolicy<'static> {
+        FinancialInvariantPolicy {
+            line_items_pointer: "/line_items",
+            quantity_pointer: "/quantity",
+            unit_price_pointer: "/unit_price",
+            amount_pointer: "/amount",
+            subtotal_pointer: "/subtotal",
+            tax_pointer: "/tax",
+            total_pointer: "/total",
+            absolute: "0.01",
+        }
+    }
+
     #[test]
     fn surrounding_prose_fails_scored_parse() {
         assert!(parse_strict("Here: {\"a\":1}").is_err());
@@ -1911,6 +2389,147 @@ mod tests {
     }
 
     #[test]
+    fn malformed_expected_integer_is_error_not_failure() {
+        let result = evaluate_numeric(
+            "quantity",
+            &json!({"quantity": 42}),
+            Some(&json!({"quantity": "not-an-integer"})),
+            "/quantity",
+            "/quantity",
+            None,
+            None,
+            true,
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn malformed_expected_decimal_is_error_not_failure() {
+        let result = evaluate_numeric(
+            "total",
+            &json!({"total": "42.00"}),
+            Some(&json!({"total": "not-a-decimal"})),
+            "/total",
+            "/total",
+            Some("0.01"),
+            None,
+            false,
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn malformed_expected_date_is_error_not_failure() {
+        let result = evaluate_canonical_date(
+            "date",
+            &json!({"date": "2026-08-11"}),
+            Some(&json!({"date": "2026-02-30"})),
+            "/date",
+            "/date",
+            &["iso".to_owned()],
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn malformed_expected_keyed_field_is_error_not_failure() {
+        let fields = vec![KeyedArrayField {
+            pointer: "/quantity".to_owned(),
+            evaluator: "exact_integer".to_owned(),
+            absolute: None,
+            case_insensitive: false,
+            formats: vec![],
+        }];
+        let result = evaluate_keyed_array(
+            "items",
+            &json!({"items": [{"sku": "A", "quantity": 1}]}),
+            Some(&json!({"items": [{"sku": "A", "quantity": "bad"}]})),
+            keyed_policy(&["/sku".to_owned()], &[], &fields),
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn reference_preflight_finds_malformed_values_before_scoring() {
+        let cases = vec![Case {
+            id: "bad-golden".to_owned(),
+            input: Value::Null,
+            expected: Some(json!({"quantity": "bad"})),
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        }];
+        let evaluators = vec![EvaluatorConfig {
+            id: "quantity".to_owned(),
+            implementation_version: None,
+            implementation: Default::default(),
+            kind: EvaluatorKind::NumericTolerance {
+                pointer: "/quantity".to_owned(),
+                expected_pointer: "/quantity".to_owned(),
+                absolute: None,
+                relative: None,
+                exact_integer: true,
+            },
+        }];
+        let issues = validate_references(&cases, &evaluators);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].case_id, "bad-golden");
+        assert_eq!(issues[0].expected_pointer, "/quantity");
+    }
+
+    #[test]
+    fn bad_reference_cannot_create_valid_but_wrong() {
+        let schema = compile_schema(&json!({
+            "type": "object",
+            "required": ["quantity"],
+            "properties": {"quantity": {"type": "integer"}}
+        }))
+        .unwrap();
+        let case = Case {
+            id: "bad-golden".to_owned(),
+            input: Value::Null,
+            expected: Some(json!({"quantity": "bad"})),
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let evaluators = vec![EvaluatorConfig {
+            id: "quantity".to_owned(),
+            implementation_version: None,
+            implementation: Default::default(),
+            kind: EvaluatorKind::NumericTolerance {
+                pointer: "/quantity".to_owned(),
+                expected_pointer: "/quantity".to_owned(),
+                absolute: None,
+                relative: None,
+                exact_integer: true,
+            },
+        }];
+        let outcomes = BTreeMap::from([(
+            "correct".to_owned(),
+            OutcomeConfig {
+                all_of: vec!["quantity".to_owned()],
+                any_of: vec![],
+            },
+        )]);
+        let result = evaluate_case(
+            &case,
+            &output("{\"quantity\":42}"),
+            &schema,
+            &evaluators,
+            &outcomes,
+            "correct",
+        );
+        assert_eq!(result.primary_outcome.truth, PrimaryOutcomeTruth::Error);
+        assert!(!result.valid_but_wrong);
+        assert!(!result.fully_evaluated_valid_but_wrong);
+    }
+
+    #[test]
     fn normalized_strings_handle_unicode_case_and_whitespace() {
         let result = evaluate_normalized_string(
             "vendor",
@@ -1940,20 +2559,14 @@ mod tests {
             "items",
             &json!({"items": [{"sku": "B", "qty": 2}, {"sku": "A", "qty": 1}]}),
             Some(&json!({"items": [{"sku": "A", "qty": 1}, {"sku": "B", "qty": 2}]})),
-            "/items",
-            "/items",
-            &keys,
-            &[],
+            keyed_policy(&keys, &[], &[]),
         );
         assert_eq!(reordered.status, EvaluationStatus::Passed);
         let missing = evaluate_keyed_array(
             "items",
             &json!({"items": [{"sku": "A", "qty": 1}]}),
             Some(&json!({"items": [{"sku": "A", "qty": 1}, {"sku": "B", "qty": 2}]})),
-            "/items",
-            "/items",
-            &keys,
-            &[],
+            keyed_policy(&keys, &[], &[]),
         );
         assert_eq!(missing.status, EvaluationStatus::Failed);
         assert_eq!(missing.details["missing"].as_array().unwrap().len(), 1);
@@ -1989,10 +2602,7 @@ mod tests {
             "items",
             &json!({"items": [{"description": " Widget ", "quantity": "01", "amount": "10.0"}]}),
             Some(&json!({"items": [{"description": "widget", "quantity": 1, "amount": "10.00"}]})),
-            "/items",
-            "/items",
-            &keys,
-            &fields,
+            keyed_policy(&keys, &fields, &fields),
         );
         assert_eq!(result.status, EvaluationStatus::Passed);
         assert_eq!(result.fields.len(), 3);
@@ -2010,17 +2620,8 @@ mod tests {
             "line_items": [{"quantity": "2", "unit_price": "5.00", "amount": "10.00"}],
             "subtotal": "10.00", "tax": "1.00", "total": "11.00"
         });
-        let evaluate = |value: &Value| {
-            evaluate_financial_invariants(
-                "financial",
-                value,
-                "/line_items",
-                "/subtotal",
-                "/tax",
-                "/total",
-                "0.01",
-            )
-        };
+        let evaluate =
+            |value: &Value| evaluate_financial_invariants("financial", value, financial_policy());
 
         let mut wrong_amount = base.clone();
         wrong_amount["line_items"][0]["amount"] = json!("9.00");
@@ -2084,6 +2685,57 @@ mod tests {
             .unwrap();
         assert_eq!(fact.status, EvaluationStatus::Error);
         assert_eq!(fact.actual, Some(json!("not-a-number")));
+    }
+
+    #[test]
+    fn invalid_line_item_does_not_false_fail_subtotal() {
+        let result = evaluate_financial_invariants(
+            "financial",
+            &json!({
+                "line_items": [
+                    {"quantity": "1", "unit_price": "100", "amount": "100"},
+                    {"quantity": "1", "unit_price": "100", "amount": "invalid"}
+                ],
+                "subtotal": "200", "tax": "0", "total": "200"
+            }),
+            financial_policy(),
+        );
+        let subtotal = result
+            .fields
+            .iter()
+            .find(|field| field.pointer == "/subtotal")
+            .unwrap();
+        assert_eq!(subtotal.status, EvaluationStatus::Error);
+        assert_eq!(subtotal.expected, None);
+        assert!(subtotal.message.contains("incomplete"));
+        assert!(!result.fields.iter().any(|field| {
+            field.pointer == "/subtotal" && field.status == EvaluationStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn overflowing_line_item_does_not_false_fail_subtotal() {
+        let result = evaluate_financial_invariants(
+            "financial",
+            &json!({
+                "line_items": [{
+                    "quantity": "2",
+                    "unit_price": "79228162514264337593543950335",
+                    "amount": "79228162514264337593543950335"
+                }],
+                "subtotal": "79228162514264337593543950335",
+                "tax": "0",
+                "total": "79228162514264337593543950335"
+            }),
+            financial_policy(),
+        );
+        let subtotal = result
+            .fields
+            .iter()
+            .find(|field| field.pointer == "/subtotal")
+            .unwrap();
+        assert_eq!(subtotal.status, EvaluationStatus::Error);
+        assert_eq!(subtotal.expected, None);
     }
 
     #[test]
@@ -2176,11 +2828,7 @@ mod tests {
                 "tax": "1",
                 "total": "79228162514264337593543950335"
             }),
-            "/line_items",
-            "/subtotal",
-            "/tax",
-            "/total",
-            "0.01",
+            financial_policy(),
         );
         assert_eq!(result.status, EvaluationStatus::Error);
         assert!(
@@ -2430,6 +3078,84 @@ mod tests {
             "semantic",
             &external,
         )
+    }
+
+    #[test]
+    fn diagnostic_evaluator_error_does_not_override_primary_pass() {
+        let schema = compile_schema(&json!({"type": "object"})).unwrap();
+        let case = Case {
+            id: "diagnostic".to_owned(),
+            input: Value::Null,
+            expected: None,
+            model_visible_metadata: None,
+            metadata: None,
+            source_line: 1,
+        };
+        let external_kind = || EvaluatorKind::Command {
+            command: crate::config::CommandSpec {
+                program: "unused".to_owned(),
+                args: vec![],
+            },
+            process_mode: crate::config::ProcessMode::Persistent,
+            timeout_ms: 1_000,
+        };
+        let evaluators = vec![
+            EvaluatorConfig {
+                id: "primary".to_owned(),
+                implementation_version: Some("test-v1".to_owned()),
+                implementation: Default::default(),
+                kind: external_kind(),
+            },
+            EvaluatorConfig {
+                id: "diagnostic".to_owned(),
+                implementation_version: Some("test-v1".to_owned()),
+                implementation: Default::default(),
+                kind: external_kind(),
+            },
+        ];
+        let outcomes = BTreeMap::from([(
+            "semantic".to_owned(),
+            OutcomeConfig {
+                all_of: vec!["primary".to_owned()],
+                any_of: vec![],
+            },
+        )]);
+        let external = BTreeMap::from([
+            (
+                "primary".to_owned(),
+                EvaluatorResult::passed("primary", "correct", Value::Null),
+            ),
+            (
+                "diagnostic".to_owned(),
+                EvaluatorResult::error("diagnostic", "diagnostic unavailable"),
+            ),
+        ]);
+        let result = evaluate_case_with_external(
+            &case,
+            &output("{}"),
+            &schema,
+            &evaluators,
+            &outcomes,
+            "semantic",
+            &external,
+        );
+        assert!(result.primary_pass);
+        assert_eq!(result.primary_outcome.truth, PrimaryOutcomeTruth::True);
+        assert!(result.primary_outcome.fully_evaluated);
+        assert_eq!(result.primary_outcome.evaluator_ids, vec!["primary"]);
+        assert_eq!(
+            result.evaluators["diagnostic"].status,
+            EvaluationStatus::Error
+        );
+    }
+
+    #[test]
+    fn primary_outcome_health_matches_engine_artifact() {
+        let result = valid_output_with_primary_status(EvaluationStatus::Error);
+        assert_eq!(result.primary_outcome.truth, PrimaryOutcomeTruth::Error);
+        assert!(!result.primary_outcome.fully_evaluated);
+        assert_eq!(result.primary_outcome.component_errors, 1);
+        assert_eq!(result.primary_outcome.evaluator_ids, vec!["external"]);
     }
 
     #[test]

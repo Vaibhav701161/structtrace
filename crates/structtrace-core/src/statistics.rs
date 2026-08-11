@@ -27,7 +27,7 @@ pub struct PairedMetrics {
     /// Both variants fail.
     pub both_fail: usize,
     /// Candidate minus baseline percentage points.
-    pub difference_pp: f64,
+    pub difference_pp: Option<f64>,
     /// Exact two-sided McNemar p-value.
     pub mcnemar_exact_p: f64,
 }
@@ -64,11 +64,8 @@ pub fn paired_metrics(pairs: &[(bool, bool)]) -> PairedMetrics {
     let total = pairs.len();
     let baseline_pass = both_pass + baseline_only_pass;
     let candidate_pass = both_pass + candidate_only_pass;
-    let difference_pp = if total == 0 {
-        0.0
-    } else {
-        100.0 * (candidate_pass as f64 - baseline_pass as f64) / total as f64
-    };
+    let difference_pp =
+        (total > 0).then(|| 100.0 * (candidate_pass as f64 - baseline_pass as f64) / total as f64);
     PairedMetrics {
         total,
         baseline_pass,
@@ -185,8 +182,16 @@ mod tests {
         assert_eq!(metrics.baseline_pass, 18);
         assert_eq!(metrics.candidate_pass, 24);
         assert_eq!(metrics.total, 49);
-        assert!((metrics.difference_pp - 12.244_897_959).abs() < 1e-9);
+        assert!((metrics.difference_pp.unwrap() - 12.244_897_959).abs() < 1e-9);
         assert!((metrics.mcnemar_exact_p - 0.145_996_093_75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_independent_units_has_no_effect_estimate() {
+        let metrics = paired_metrics(&[]);
+        assert_eq!(metrics.total, 0);
+        assert_eq!(metrics.difference_pp, None);
+        assert_eq!(metrics.mcnemar_exact_p, 1.0);
     }
 
     #[test]

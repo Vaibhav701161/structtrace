@@ -33,8 +33,9 @@ const ciRoute = createRoute({
 });
 const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: "/settings/$section", component: () => <SimplePage kind="settings" /> });
 const resultRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId", component: Results });
-const casesRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId/cases", validateSearch: (search: Record<string, unknown>) => ({ search: typeof search.search === "string" ? search.search : "" }), component: Cases });
-const caseRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId/cases/$caseId", component: Cases });
+const caseSearch = (search: Record<string, unknown>) => ({ search: typeof search.search === "string" ? search.search : "", focus: typeof search.focus === "string" ? search.focus : "" });
+const casesRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId/cases", validateSearch: caseSearch, component: Cases });
+const caseRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId/cases/$caseId", validateSearch: caseSearch, component: Cases });
 const wizardRoutes = [
   ["/new/source", 0], ["/new/map", 1], ["/new/correctness", 2], ["/new/evidence", 3], ["/new/review", 4], ["/new/run", 5],
 ] as const;
