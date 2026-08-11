@@ -195,6 +195,35 @@ impl RecordedOutputs {
                     line: line_number,
                     message: error.to_string(),
                 })?;
+            if let Some(raw_output) = &row.raw_output {
+                if raw_output.len() > limits.max_output_bytes_per_case {
+                    return Err(CoreError::RecordedOutput {
+                        line: line_number,
+                        message: format!(
+                            "raw_output is {} bytes; per-case output limit is {}",
+                            raw_output.len(),
+                            limits.max_output_bytes_per_case
+                        ),
+                    });
+                }
+            }
+            if let Some(parsed_output) = &row.parsed_output {
+                let serialized_bytes = serde_json::to_vec(parsed_output)
+                    .map_err(|error| CoreError::RecordedOutput {
+                        line: line_number,
+                        message: format!("parsed_output could not be measured: {error}"),
+                    })?
+                    .len();
+                if serialized_bytes > limits.max_output_bytes_per_case {
+                    return Err(CoreError::RecordedOutput {
+                        line: line_number,
+                        message: format!(
+                            "serialized parsed_output is {serialized_bytes} bytes; per-case output limit is {}",
+                            limits.max_output_bytes_per_case
+                        ),
+                    });
+                }
+            }
             if row.case_id.trim().is_empty() {
                 return Err(CoreError::RecordedOutput {
                     line: line_number,
@@ -348,6 +377,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("duplicate object key `case_id`"));
+    }
+
+    fn one_case_dataset() -> Dataset {
+        let mut dataset_file = NamedTempFile::new().unwrap();
+        writeln!(dataset_file, r#"{{"id":"a","input":1}}"#).unwrap();
+        Dataset::read(dataset_file.path(), &DatasetFields::default()).unwrap()
+    }
+
+    #[test]
+    fn recorded_raw_output_above_case_limit_is_rejected() {
+        let dataset = one_case_dataset();
+        let bytes = b"{\"case_id\":\"a\",\"status\":\"ok\",\"raw_output\":\"12345\"}\n";
+        let limits = LimitsConfig {
+            max_output_bytes_per_case: 4,
+            ..LimitsConfig::default()
+        };
+        let error = RecordedOutputs::from_bytes_bounded(bytes, &dataset, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("raw_output is 5 bytes"));
+    }
+
+    #[test]
+    fn recorded_parsed_output_above_case_limit_is_rejected() {
+        let dataset = one_case_dataset();
+        let bytes = b"{\"case_id\":\"a\",\"status\":\"ok\",\"parsed_output\":{\"answer\":12345}}\n";
+        let limits = LimitsConfig {
+            max_output_bytes_per_case: 8,
+            ..LimitsConfig::default()
+        };
+        let error = RecordedOutputs::from_bytes_bounded(bytes, &dataset, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("serialized parsed_output"));
     }
 
     proptest! {

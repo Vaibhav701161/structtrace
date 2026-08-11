@@ -3,6 +3,10 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
+  // The local product intentionally has one persisted workspace. Parallel
+  // browsers would race on that same user-owned draft instead of testing
+  // independent product sessions.
+  workers: 1,
   use: {
     baseURL: process.env.STRUCTTRACE_UI_URL ?? "http://127.0.0.1:4173",
     trace: "retain-on-failure",

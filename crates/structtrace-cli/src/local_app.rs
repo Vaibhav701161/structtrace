@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +32,7 @@ use crate::initialize::{FromOutputsOptions, SimpleOutputFields, initialize_from_
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SCHEMA_BYTES: usize = 16 * 1024 * 1024;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 const INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
@@ -51,6 +52,7 @@ struct AppState {
     runs: Mutex<HashMap<String, PathBuf>>,
     pin_lock: Mutex<()>,
     comparison_lock: Mutex<()>,
+    jobs: Mutex<HashMap<String, JobEntry>>,
     last_activity: AtomicU64,
     active_runs: AtomicUsize,
 }
@@ -82,7 +84,7 @@ enum InputFormat {
     Csv,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ComparisonFiles {
     dataset: SourceReference,
@@ -91,13 +93,13 @@ struct ComparisonFiles {
     schema: Option<SourceReference>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SourceReference {
     source_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StageSourceRequest {
     kind: String,
@@ -113,6 +115,10 @@ struct StagedSource {
     format: InputFormat,
     hash: String,
     bytes: usize,
+    #[serde(default)]
+    rows: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preview: Vec<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,7 +158,7 @@ struct ProjectSummary {
     updated_at: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MappingRequest {
     dataset_id: String,
@@ -176,7 +182,7 @@ struct MappingRequest {
     candidate_metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuleKind {
     Exact,
@@ -189,7 +195,7 @@ enum RuleKind {
     RequiredFields,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuleRequest {
     pointer: String,
@@ -201,7 +207,7 @@ struct RuleRequest {
     case_insensitive: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ComparisonRequest {
     project_id: String,
@@ -214,6 +220,54 @@ struct ComparisonRequest {
     gate_mode: GateMode,
     min_cases: usize,
     financial_invariants: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum JobStatus {
+    Queued,
+    Running,
+    Complete,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobResponse {
+    job_id: String,
+    project_id: String,
+    status: JobStatus,
+    stage: String,
+    completed: usize,
+    total: usize,
+    message: Option<String>,
+    run_id: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    events: Vec<JobEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobEvent {
+    stage: String,
+    at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedJob {
+    state: JobResponse,
+    request: ComparisonRequest,
+}
+
+#[derive(Debug, Clone)]
+struct JobEntry {
+    state: JobResponse,
+    request: ComparisonRequest,
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,12 +310,13 @@ struct CasePageResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CiRequest {
     mode: CiMode,
+    project_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CiMode {
     Regression,
@@ -273,6 +328,8 @@ struct CiResponse {
     config: String,
     workflow: String,
     command: String,
+    export_path: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,6 +451,7 @@ pub async fn serve(project_root: &Path, open_browser: bool) -> anyhow::Result<()
     }
 
     let known_runs = discover_ui_runs(&project_root)?;
+    let jobs = discover_jobs(&project_root)?;
     let state = Arc::new(AppState {
         token,
         expected_host,
@@ -401,6 +459,7 @@ pub async fn serve(project_root: &Path, open_browser: bool) -> anyhow::Result<()
         runs: Mutex::new(known_runs),
         pin_lock: Mutex::new(()),
         comparison_lock: Mutex::new(()),
+        jobs: Mutex::new(jobs),
         last_activity: AtomicU64::new(now_seconds()),
         active_runs: AtomicUsize::new(0),
     });
@@ -408,6 +467,10 @@ pub async fn serve(project_root: &Path, open_browser: bool) -> anyhow::Result<()
         .route("/{token}/api/v1/system", get(system))
         .route("/{token}/api/v1/demo", post(run_demo))
         .route("/{token}/api/v1/comparisons/run", post(run_comparison))
+        .route("/{token}/api/v1/jobs", post(create_job))
+        .route("/{token}/api/v1/jobs/{job_id}", get(get_job))
+        .route("/{token}/api/v1/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/{token}/api/v1/jobs/{job_id}/resume", post(resume_job))
         .route("/{token}/api/v1/sources", post(stage_source))
         .route(
             "/{token}/api/v1/comparisons/draft",
@@ -530,7 +593,7 @@ async fn system() -> Json<SystemResponse> {
         version: env!("CARGO_PKG_VERSION"),
         local_only: true,
         telemetry: false,
-        max_upload_bytes: MAX_REQUEST_BYTES,
+        max_upload_bytes: MAX_FILE_BYTES,
         api_version: "v1",
     })
 }
@@ -619,13 +682,26 @@ async fn stage_source(
         ));
     }
     let bytes = request.file.content.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
+    let source_limit = if request.kind == "schema" {
+        MAX_SCHEMA_BYTES
+    } else {
+        MAX_FILE_BYTES
+    };
+    if bytes.is_empty() || bytes.len() > source_limit {
         return Err(AppError::bad_request(
             "invalid_source_size",
-            "Source must contain 1 byte to 32 MiB.",
+            if request.kind == "schema" {
+                "Schema must contain 1 byte to 16 MiB."
+            } else {
+                "Source must contain 1 byte to 32 MiB."
+            },
         ));
     }
-    let staged = stage_browser_file(&state.project_root, request.kind, request.file)?;
+    validate_source_file(&request.file)?;
+    let rows = authoritative_rows(&request.kind, &request.file)?;
+    let mut staged = stage_browser_file(&state.project_root, request.kind, request.file)?;
+    staged.rows = rows.len();
+    staged.preview = rows.into_iter().take(25).collect();
     Ok(Json(staged))
 }
 
@@ -654,6 +730,233 @@ async fn run_comparison(
     let response = response_from_run(&run.run_dir)?;
     drop(guard);
     Ok(Json(response))
+}
+
+async fn create_job(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ComparisonRequest>,
+) -> Result<(StatusCode, Json<JobResponse>), AppError> {
+    validate_comparison_request(&request)
+        .map_err(|error| AppError::bad_request("invalid_comparison", error.to_string()))?;
+    let response = enqueue_job(Arc::clone(&state), request)?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn get_job(
+    State(state): State<Arc<AppState>>,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<Json<JobResponse>, AppError> {
+    let job_id = params.get("job_id").context("job ID is missing")?;
+    let jobs = state
+        .jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?;
+    let job = jobs
+        .get(job_id)
+        .ok_or_else(|| AppError::not_found("job_not_found", "Comparison job was not found."))?;
+    Ok(Json(job.state.clone()))
+}
+
+async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<Json<JobResponse>, AppError> {
+    let job_id = params.get("job_id").context("job ID is missing")?;
+    let mut jobs = state
+        .jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?;
+    let job = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| AppError::not_found("job_not_found", "Comparison job was not found."))?;
+    if matches!(job.state.status, JobStatus::Queued | JobStatus::Running) {
+        job.cancel.store(true, Ordering::Relaxed);
+        job.state.stage = "cancelling".to_owned();
+        job.state.message = Some(
+            "Cancellation requested. The engine will stop at the next safe case boundary."
+                .to_owned(),
+        );
+        job.state.updated_at = now_seconds();
+        persist_job(&state.project_root, job)?;
+    }
+    Ok(Json(job.state.clone()))
+}
+
+async fn resume_job(
+    State(state): State<Arc<AppState>>,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<(StatusCode, Json<JobResponse>), AppError> {
+    let job_id = params.get("job_id").context("job ID is missing")?;
+    let request = {
+        let jobs = state
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?;
+        let job = jobs
+            .get(job_id)
+            .ok_or_else(|| AppError::not_found("job_not_found", "Comparison job was not found."))?;
+        if !matches!(
+            job.state.status,
+            JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted
+        ) {
+            return Err(AppError::bad_request(
+                "job_not_resumable",
+                "Only failed, cancelled, or interrupted jobs can be resumed.",
+            ));
+        }
+        job.request.clone()
+    };
+    let response = enqueue_job(Arc::clone(&state), request)?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+fn enqueue_job(state: Arc<AppState>, request: ComparisonRequest) -> anyhow::Result<JobResponse> {
+    let now = now_seconds();
+    let response = JobResponse {
+        job_id: Ulid::new().to_string(),
+        project_id: request.project_id.clone(),
+        status: JobStatus::Queued,
+        stage: "queued".to_owned(),
+        completed: 0,
+        total: 1,
+        message: None,
+        run_id: None,
+        created_at: now,
+        updated_at: now,
+        events: vec![JobEvent {
+            stage: "queued".to_owned(),
+            at: now,
+        }],
+    };
+    let entry = JobEntry {
+        state: response.clone(),
+        request,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    persist_job(&state.project_root, &entry)?;
+    state
+        .jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?
+        .insert(response.job_id.clone(), entry);
+    let job_id = response.job_id.clone();
+    tokio::spawn(async move {
+        execute_job(state, job_id).await;
+    });
+    Ok(response)
+}
+
+async fn execute_job(state: Arc<AppState>, job_id: String) {
+    let (request, cancel) = match state.jobs.lock() {
+        Ok(mut jobs) => match jobs.get_mut(&job_id) {
+            Some(job) => {
+                job.state.status = JobStatus::Running;
+                job.state.stage = "preparing_project".to_owned();
+                job.state.updated_at = now_seconds();
+                let _ = persist_job(&state.project_root, job);
+                (job.request.clone(), Arc::clone(&job.cancel))
+            }
+            None => return,
+        },
+        Err(_) => return,
+    };
+    let guard = ActiveRunGuard::new(Arc::clone(&state));
+    let root = state.project_root.clone();
+    let run_state = Arc::clone(&state);
+    let progress_state = Arc::clone(&state);
+    let progress_job_id = job_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _lock = run_state
+            .comparison_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("comparison coordinator is unavailable"))?;
+        let observer = |progress: structtrace_engine::RunProgress| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "comparison cancelled by user"
+            );
+            let mut jobs = progress_state
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?;
+            let job = jobs
+                .get_mut(&progress_job_id)
+                .context("comparison job disappeared")?;
+            let stage_changed = job.state.stage != progress.stage;
+            job.state.stage = progress.stage.to_owned();
+            job.state.completed = progress.completed;
+            job.state.total = progress.total.max(1);
+            job.state.updated_at = now_seconds();
+            if stage_changed {
+                job.state.events.push(JobEvent {
+                    stage: progress.stage.to_owned(),
+                    at: job.state.updated_at,
+                });
+            }
+            if stage_changed
+                || progress.completed == progress.total
+                || progress.completed % 100 == 0
+            {
+                persist_job(&progress_state.project_root, job)?;
+            }
+            Ok(())
+        };
+        materialize_and_run_comparison_observed(&root, request, &observer)
+    })
+    .await;
+    let mut completed_run = None;
+    let (status, message, run_id) = match outcome {
+        Ok(Ok((run, _))) => {
+            let id = run.run_id.clone();
+            completed_run = Some(run);
+            (JobStatus::Complete, None, Some(id))
+        }
+        Ok(Err(error)) if error.to_string().contains("cancelled by user") => (
+            JobStatus::Cancelled,
+            Some(
+                "Comparison cancelled at a safe engine boundary. No decision was produced."
+                    .to_owned(),
+            ),
+            None,
+        ),
+        Ok(Err(error)) => {
+            tracing::error!(error = ?error, "comparison job failed");
+            (JobStatus::Failed, Some("StructTrace could not complete the comparison. Check the local terminal for the private diagnostic.".to_owned()), None)
+        }
+        Err(error) => {
+            tracing::error!(error = ?error, "comparison worker failed");
+            (
+                JobStatus::Failed,
+                Some("The local comparison worker stopped unexpectedly.".to_owned()),
+                None,
+            )
+        }
+    };
+    if let Some(run) = completed_run {
+        if let Ok(mut runs) = state.runs.lock() {
+            runs.insert(run.run_id.clone(), run.run_dir.clone());
+        }
+    }
+    if let Ok(mut jobs) = state.jobs.lock() {
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.state.status = status;
+            job.state.stage = match status {
+                JobStatus::Complete => "complete",
+                JobStatus::Cancelled => "cancelled",
+                _ => "failed",
+            }
+            .to_owned();
+            job.state.events.push(JobEvent {
+                stage: job.state.stage.clone(),
+                at: now_seconds(),
+            });
+            job.state.message = message;
+            job.state.run_id = run_id;
+            job.state.updated_at = now_seconds();
+            let _ = persist_job(&state.project_root, job);
+        }
+    }
+    drop(guard);
 }
 
 async fn get_run(
@@ -829,9 +1132,17 @@ fn case_matches_filter(
 ) -> bool {
     match filter {
         "all" => true,
-        "regressions" => record.transition == "baseline_only_pass",
-        "improvements" => record.transition == "candidate_only_pass",
-        "both_wrong" => record.transition == "both_fail",
+        "regressions" => {
+            record.deployment_transition
+                == structtrace_core::artifact::PairedTransition::BaselineOnlyPass
+        }
+        "improvements" => {
+            record.deployment_transition
+                == structtrace_core::artifact::PairedTransition::CandidateOnlyPass
+        }
+        "both_wrong" => {
+            record.deployment_transition == structtrace_core::artifact::PairedTransition::BothFail
+        }
         "valid_but_wrong" => {
             record.baseline_evaluation.valid_but_wrong
                 || record.candidate_evaluation.valid_but_wrong
@@ -1238,28 +1549,135 @@ async fn update_regression(
     Ok(Json(response))
 }
 
-async fn generate_ci(Json(request): Json<CiRequest>) -> Json<CiResponse> {
+async fn generate_ci(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CiRequest>,
+) -> Result<Json<CiResponse>, AppError> {
+    validate_project_id(&request.project_id)
+        .map_err(|error| AppError::bad_request("invalid_project_id", error.to_string()))?;
     let (mode, command) = match request.mode {
         CiMode::Regression => ("regression", "structtrace gate latest"),
         CiMode::Release => ("release", "structtrace release-check latest"),
     };
-    let config = format!(
-        "# Generated by StructTrace Local. Review before committing.\nversion: 3\nproject:\n  name: structured-output-comparison\ngate:\n  mode: {mode}\n  min_cases: 100\n  min_unique_cases: 100\n  min_primary_fully_evaluated_rate: 0.99\n  max_deployment_regression_pp: 0.0\n"
-    );
+    let project = state
+        .project_root
+        .join(".structtrace/ui/projects")
+        .join(&request.project_id);
+    if !project.is_dir() {
+        return Err(AppError::not_found(
+            "project_not_found",
+            "Run this project once before exporting CI.",
+        ));
+    }
+    let mut parsed = Config::load(&project.join("structtrace.yaml"))?;
+    parsed.gate.mode = match request.mode {
+        CiMode::Regression => GateMode::Regression,
+        CiMode::Release => GateMode::Release,
+    };
+    let parsed = Config::validate(parsed).map_err(|error| {
+        AppError::bad_request(
+            "invalid_ci_authority",
+            format!("The saved project cannot use {mode} authority: {error}"),
+        )
+    })?;
+    let config = serde_yaml_ng::to_string(&parsed)?;
+    let revision =
+        option_env!("STRUCTTRACE_GIT_SHA").unwrap_or("7e5546ff35b5f0ce3209741a19f1e332950a309b");
     let workflow = format!(
-        "# Starter template: pin the StructTrace installation before use.\nname: StructTrace\n\non:\n  pull_request:\n\npermissions:\n  contents: read\n\njobs:\n  structured-output-regression:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n      - name: Run comparison\n        run: structtrace run\n      - name: Verify decision\n        run: {command}\n"
+        "# Generated from a complete saved StructTrace project.\nname: StructTrace\n\non:\n  pull_request:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  structured-output-regression:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n      - name: Check out project\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n      - name: Check out pinned StructTrace source\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n        with:\n          repository: Vaibhav701161/structtrace\n          ref: {revision}\n          path: .structtrace-tool\n      - name: Install pinned StructTrace binary\n        run: cargo install --locked --path .structtrace-tool/crates/structtrace-cli\n      - name: Verify required comparison inputs\n        run: test -s data/golden.jsonl && test -s outputs/baseline.jsonl && test -s outputs/candidate.jsonl && test -s schemas/output.schema.json\n      - name: Validate project\n        run: structtrace doctor --strict\n      - name: Run comparison\n        run: structtrace run\n      - name: Verify decision authority\n        run: {command}\n      - name: Upload immutable evidence\n        if: always()\n        uses: actions/upload-artifact@v4\n        with:\n          name: structtrace-evidence\n          path: .structtrace/runs/\n          if-no-files-found: error\n          retention-days: 14\n"
     );
-    Json(CiResponse {
+    let export = state
+        .project_root
+        .join(".structtrace/exports")
+        .join(format!("{}-{mode}", request.project_id));
+    if export.exists() {
+        std::fs::remove_dir_all(&export)?;
+    }
+    for relative in [
+        "data/golden.jsonl",
+        "outputs/baseline.jsonl",
+        "outputs/candidate.jsonl",
+        "schemas/output.schema.json",
+    ] {
+        let source = project.join(relative);
+        let target = export.join(relative);
+        std::fs::create_dir_all(target.parent().context("CI export path has no parent")?)?;
+        let bytes = structtrace_core::hashing::read_bounded(
+            &source,
+            MAX_FILE_BYTES,
+            "CI project artifact",
+        )?;
+        atomic_write(&target, &bytes)?;
+    }
+    std::fs::create_dir_all(export.join(".github/workflows"))?;
+    atomic_write(&export.join("structtrace.yaml"), config.as_bytes())?;
+    atomic_write(
+        &export.join(".github/workflows/structtrace.yml"),
+        workflow.as_bytes(),
+    )?;
+    let integration = format!(
+        "# StructTrace CI integration\n\nThis directory is a complete, runnable snapshot of project `{}`.\n\nBefore each comparison, your existing generation step must replace `outputs/candidate.jsonl` with one row per golden case. Keep `outputs/baseline.jsonl` unchanged until an authorized baseline is deliberately promoted. The workflow validates all required files, runs the exact saved evaluators, executes `{command}`, and uploads immutable evidence even when the gate fails.\n\nStructTrace source is pinned to commit `{revision}`. Update that pin only through a reviewed dependency change.\n",
+        parsed.project.name
+    );
+    atomic_write(&export.join("CI_INTEGRATION.md"), integration.as_bytes())?;
+    let mut files = vec![
+        "structtrace.yaml",
+        ".github/workflows/structtrace.yml",
+        "CI_INTEGRATION.md",
+        "data/golden.jsonl",
+        "outputs/baseline.jsonl",
+        "outputs/candidate.jsonl",
+        "schemas/output.schema.json",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let accepted = project.join("accepted-baseline.json");
+    if accepted.is_file() {
+        let bytes = structtrace_core::hashing::read_bounded(
+            &accepted,
+            1024 * 1024,
+            "accepted baseline reference",
+        )?;
+        atomic_write(&export.join("accepted-baseline.json"), &bytes)?;
+        files.push("accepted-baseline.json".to_owned());
+    }
+    Ok(Json(CiResponse {
         config,
         workflow,
         command: command.to_owned(),
-    })
+        export_path: export.display().to_string(),
+        files,
+    }))
 }
 
 fn materialize_and_run_comparison(
     root: &Path,
     request: ComparisonRequest,
 ) -> anyhow::Result<(structtrace_engine::CompletedRun, &'static str)> {
+    materialize_and_run_comparison_inner(root, request, None)
+}
+
+fn materialize_and_run_comparison_observed(
+    root: &Path,
+    request: ComparisonRequest,
+    observer: &dyn Fn(structtrace_engine::RunProgress) -> anyhow::Result<()>,
+) -> anyhow::Result<(structtrace_engine::CompletedRun, &'static str)> {
+    materialize_and_run_comparison_inner(root, request, Some(observer))
+}
+
+fn materialize_and_run_comparison_inner(
+    root: &Path,
+    request: ComparisonRequest,
+    observer: Option<&dyn Fn(structtrace_engine::RunProgress) -> anyhow::Result<()>>,
+) -> anyhow::Result<(structtrace_engine::CompletedRun, &'static str)> {
+    if let Some(observer) = observer {
+        observer(structtrace_engine::RunProgress {
+            stage: "normalizing_sources",
+            completed: 0,
+            total: 4,
+        })?;
+    }
     let dataset_file = load_staged_source(root, &request.files.dataset)?;
     let baseline_file = load_staged_source(root, &request.files.baseline)?;
     let candidate_file = load_staged_source(root, &request.files.candidate)?;
@@ -1269,6 +1687,13 @@ fn materialize_and_run_comparison(
         .as_ref()
         .map(|source| load_staged_source(root, source))
         .transpose()?;
+    if let Some(observer) = observer {
+        observer(structtrace_engine::RunProgress {
+            stage: "normalizing_sources",
+            completed: 1,
+            total: 4,
+        })?;
+    }
     for file in [&dataset_file, &baseline_file, &candidate_file] {
         validate_source_file(file)?;
     }
@@ -1308,6 +1733,13 @@ fn materialize_and_run_comparison(
         &request.mapping.candidate_output,
         envelope_mappings(&request.mapping, true),
     )?;
+    if let Some(observer) = observer {
+        observer(structtrace_engine::RunProgress {
+            stage: "normalizing_sources",
+            completed: 3,
+            total: 4,
+        })?;
+    }
     let dataset_path = staging.join("dataset.jsonl");
     let baseline_path = staging.join("baseline.jsonl");
     let candidate_path = staging.join("candidate.jsonl");
@@ -1315,14 +1747,24 @@ fn materialize_and_run_comparison(
     std::fs::write(&baseline_path, &baseline_bytes)?;
     std::fs::write(&candidate_path, &candidate_bytes)?;
     let (schema_bytes, schema_provenance) = match schema_file.as_ref() {
-        Some(schema) => (normalized_schema(schema)?, "caller_supplied"),
+        Some(schema) => (
+            normalized_schema(schema)?,
+            structtrace_core::config::SchemaProvenance::CallerSupplied,
+        ),
         None => (
             inferred_schema(&dataset_bytes, &request.mapping.dataset_expected)?,
-            "inferred_from_expected_values",
+            structtrace_core::config::SchemaProvenance::InferredExpectedShape,
         ),
     };
     let schema_path = staging.join("schema.json");
     std::fs::write(&schema_path, schema_bytes)?;
+    if let Some(observer) = observer {
+        observer(structtrace_engine::RunProgress {
+            stage: "normalizing_sources",
+            completed: 4,
+            total: 4,
+        })?;
+    }
 
     let field_evaluators = request
         .rules
@@ -1394,6 +1836,7 @@ fn materialize_and_run_comparison(
     })?;
     let config_path = build.join("structtrace.yaml");
     let mut config = Config::load(&config_path)?;
+    config.schema.provenance = schema_provenance;
     let ordinary_rules = request
         .rules
         .iter()
@@ -1417,6 +1860,7 @@ fn materialize_and_run_comparison(
         "{} compared with {} through StructTrace Local",
         request.baseline_name, request.candidate_name
     ));
+    let config = Config::validate(config)?;
     std::fs::write(&config_path, serde_yaml_ng::to_string(&config)?)?;
     if destination.exists() {
         for relative in [
@@ -1442,9 +1886,75 @@ fn materialize_and_run_comparison(
     } else {
         std::fs::rename(&build, &destination)?;
     }
-    let run =
-        structtrace_engine::run_recorded(&destination, &destination.join("structtrace.yaml"))?;
-    Ok((run, schema_provenance))
+    let run = match observer {
+        Some(observer) => structtrace_engine::run_recorded_observed(
+            &destination,
+            &destination.join("structtrace.yaml"),
+            observer,
+        )?,
+        None => {
+            structtrace_engine::run_recorded(&destination, &destination.join("structtrace.yaml"))?
+        }
+    };
+    Ok((
+        run,
+        match schema_provenance {
+            structtrace_core::config::SchemaProvenance::CallerSupplied => "caller_supplied",
+            structtrace_core::config::SchemaProvenance::InferredExpectedShape => {
+                "inferred_from_expected_values"
+            }
+        },
+    ))
+}
+
+fn jobs_root(root: &Path) -> PathBuf {
+    root.join(".structtrace/ui/jobs")
+}
+
+fn persist_job(root: &Path, job: &JobEntry) -> anyhow::Result<()> {
+    let directory = jobs_root(root);
+    std::fs::create_dir_all(&directory)?;
+    atomic_write(
+        &directory.join(format!("{}.json", job.state.job_id)),
+        &serde_json::to_vec_pretty(&PersistedJob {
+            state: job.state.clone(),
+            request: job.request.clone(),
+        })?,
+    )
+}
+
+fn discover_jobs(root: &Path) -> anyhow::Result<HashMap<String, JobEntry>> {
+    let directory = jobs_root(root);
+    if !directory.is_dir() {
+        return Ok(HashMap::new());
+    }
+    let mut jobs = HashMap::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            structtrace_core::hashing::read_bounded(&path, 2 * 1024 * 1024, "persisted UI job")?;
+        let mut persisted: PersistedJob = structtrace_core::strict_json::from_slice(&bytes)?;
+        if matches!(
+            persisted.state.status,
+            JobStatus::Queued | JobStatus::Running
+        ) {
+            persisted.state.status = JobStatus::Interrupted;
+            persisted.state.stage = "interrupted".to_owned();
+            persisted.state.message = Some("The local server stopped before this comparison completed. Resume it to run again from retained source references.".to_owned());
+            persisted.state.updated_at = now_seconds();
+        }
+        let job = JobEntry {
+            state: persisted.state,
+            request: persisted.request,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        persist_job(root, &job)?;
+        jobs.insert(job.state.job_id.clone(), job);
+    }
+    Ok(jobs)
 }
 
 fn validate_comparison_request(request: &ComparisonRequest) -> anyhow::Result<()> {
@@ -1519,6 +2029,21 @@ fn normalized_jsonl(file: &BrowserFile) -> anyhow::Result<Vec<u8>> {
     Ok(output)
 }
 
+fn authoritative_rows(kind: &str, file: &BrowserFile) -> anyhow::Result<Vec<Value>> {
+    if kind == "schema" {
+        return Ok(vec![
+            structtrace_core::strict_json::value_from_str(&file.content)
+                .with_context(|| format!("{} is not strict JSON", file.name))?,
+        ]);
+    }
+    normalized_jsonl(file)?
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(structtrace_core::strict_json::value_from_slice)
+        .collect::<Result<Vec<_>, _>>()
+        .context("server-normalized source could not be previewed")
+}
+
 fn csv_rows(file: &BrowserFile) -> anyhow::Result<Vec<Value>> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(false)
@@ -1571,23 +2096,60 @@ fn normalize_simple_outputs(
                     index + 1
                 )
             })?;
-        let selected = value.pointer(output_pointer).cloned();
-        let status = value
-            .pointer("/status")
-            .and_then(Value::as_str)
-            .unwrap_or("ok");
+        let status_pointer = envelope_mappings
+            .iter()
+            .find_map(|(key, pointer)| (*key == "status").then_some(*pointer))
+            .flatten()
+            .filter(|pointer| !pointer.is_empty())
+            .unwrap_or("/status");
+        let status = match value.pointer(status_pointer) {
+            Some(Value::String(status)) => status.as_str(),
+            Some(_) => anyhow::bail!(
+                "output row {}: {status_pointer} must resolve to ok, error, or missing",
+                index + 1
+            ),
+            None => "ok",
+        };
         anyhow::ensure!(
-            status == "error" || selected.is_some(),
-            "output row {}: {output_pointer} did not resolve",
+            matches!(status, "ok" | "error" | "missing"),
+            "output row {}: {status_pointer} must resolve to ok, error, or missing",
             index + 1
         );
+        let selected = value.pointer(output_pointer).cloned();
+        if status == "ok" {
+            anyhow::ensure!(
+                selected.is_some(),
+                "output row {}: {output_pointer} did not resolve for an ok output",
+                index + 1
+            );
+        }
         let mut normalized = serde_json::Map::new();
         normalized.insert("id".to_owned(), Value::String(id.to_owned()));
         normalized.insert("status".to_owned(), Value::String(status.to_owned()));
-        if let Some(selected) = selected {
+        if status == "ok" {
+            let selected = selected.context("ok output lost its selected value")?;
             normalized.insert("output".to_owned(), selected);
+        } else {
+            let mapped_error = envelope_mappings
+                .iter()
+                .find_map(|(key, pointer)| (*key == "error").then_some(*pointer))
+                .flatten()
+                .filter(|pointer| !pointer.is_empty())
+                .and_then(|pointer| value.pointer(pointer));
+            let error = if status == "missing" {
+                serde_json::json!({
+                    "kind": "missing_output",
+                    "message": "Recorded output was marked missing."
+                })
+            } else {
+                normalize_mapped_error(mapped_error)
+            };
+            normalized.insert("error".to_owned(), error);
         }
         for (key, pointer) in envelope_mappings {
+            if matches!(key, "status" | "error") {
+                continue;
+            }
             if let Some(item) = pointer
                 .filter(|pointer| !pointer.is_empty())
                 .and_then(|pointer| value.pointer(pointer))
@@ -1599,6 +2161,29 @@ fn normalize_simple_outputs(
         output.push(b'\n');
     }
     Ok(output)
+}
+
+fn normalize_mapped_error(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Object(error))
+            if error.get("kind").and_then(Value::as_str).is_some()
+                && error.get("message").and_then(Value::as_str).is_some() =>
+        {
+            Value::Object(error.clone())
+        }
+        Some(Value::String(message)) => serde_json::json!({
+            "kind": "recorded_error",
+            "message": message
+        }),
+        Some(value) => serde_json::json!({
+            "kind": "recorded_error",
+            "message": format!("Recorded error: {value}")
+        }),
+        None => serde_json::json!({
+            "kind": "recorded_error",
+            "message": "Recorded output reported an error."
+        }),
+    }
 }
 
 fn envelope_mappings(mapping: &MappingRequest, candidate: bool) -> [(&str, Option<&str>); 6] {
@@ -1684,25 +2269,13 @@ fn response_from_run(run_dir: &Path) -> anyhow::Result<RunResponse> {
         project_name: manifest.project_name,
         created_at: u64::try_from(manifest.started_at_unix_ms).unwrap_or(u64::MAX),
         summary,
-        schema_provenance: schema_provenance(run_dir),
+        schema_provenance: match manifest.schema_provenance {
+            structtrace_core::config::SchemaProvenance::CallerSupplied => "caller_supplied",
+            structtrace_core::config::SchemaProvenance::InferredExpectedShape => {
+                "inferred_from_expected_values"
+            }
+        },
     })
-}
-
-fn schema_provenance(run_dir: &Path) -> &'static str {
-    let inferred = read_json::<Value>(&run_dir.join("inputs/schema.json"))
-        .ok()
-        .and_then(|schema| {
-            schema
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .is_some_and(|title| title == "StructTrace inferred expected-output shape");
-    if inferred {
-        "inferred_from_expected_values"
-    } else {
-        "caller_supplied"
-    }
 }
 
 fn discover_ui_runs(project_root: &Path) -> anyhow::Result<HashMap<String, PathBuf>> {
@@ -1776,6 +2349,8 @@ fn stage_browser_file(
         format: file.format,
         hash: structtrace_core::hashing::hash_bytes(bytes),
         bytes: bytes.len(),
+        rows: 0,
+        preview: Vec::new(),
     };
     let directory = staged_sources_dir(root);
     std::fs::create_dir_all(&directory)?;
@@ -2068,6 +2643,8 @@ mod tests {
             format: InputFormat::Jsonl,
             hash: structtrace_core::hashing::hash_bytes(b"original"),
             bytes: 8,
+            rows: 1,
+            preview: Vec::new(),
         };
         std::fs::write(
             directory.join(format!("{source_id}.json")),
@@ -2077,6 +2654,63 @@ mod tests {
         std::fs::write(directory.join(format!("{source_id}.data")), b"tampered").unwrap();
         let error = load_staged_source(root.path(), &SourceReference { source_id }).unwrap_err();
         assert!(error.to_string().contains("hash"));
+    }
+
+    #[test]
+    fn mapped_error_status_is_resolved_before_output_is_required() {
+        let source =
+            b"{\"id\":\"invoice-7\",\"state\":\"error\",\"message\":\"provider timeout\"}\n";
+        let normalized = normalize_simple_outputs(
+            source,
+            "/id",
+            "/output",
+            [
+                ("status", Some("/state")),
+                ("error", Some("/message")),
+                ("latency_ms", None),
+                ("usage", None),
+                ("cost", None),
+                ("metadata", None),
+            ],
+        )
+        .unwrap();
+        let value =
+            structtrace_core::strict_json::value_from_slice(&normalized[..normalized.len() - 1])
+                .unwrap();
+        assert_eq!(
+            value.pointer("/status"),
+            Some(&Value::String("error".to_owned()))
+        );
+        assert_eq!(
+            value.pointer("/error/kind"),
+            Some(&Value::String("recorded_error".to_owned()))
+        );
+        assert_eq!(
+            value.pointer("/error/message"),
+            Some(&Value::String("provider timeout".to_owned()))
+        );
+        assert_eq!(value.pointer("/output"), None);
+    }
+
+    #[test]
+    fn mapped_ok_status_still_requires_output() {
+        let source = b"{\"id\":\"invoice-7\",\"state\":\"ok\"}\n";
+        let error = normalize_simple_outputs(
+            source,
+            "/id",
+            "/output",
+            [
+                ("status", Some("/state")),
+                ("error", None),
+                ("latency_ms", None),
+                ("usage", None),
+                ("cost", None),
+                ("metadata", None),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not resolve for an ok output"));
     }
 
     #[test]
@@ -2104,6 +2738,24 @@ mod tests {
         assert_eq!(
             schema.pointer("/required/0"),
             Some(&Value::String("answer".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ci_request_uses_the_public_camel_case_api_contract() {
+        let request: CiRequest = serde_json::from_value(serde_json::json!({
+            "mode": "release",
+            "projectId": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4"
+        }))
+        .unwrap();
+        assert!(matches!(request.mode, CiMode::Release));
+        assert_eq!(request.project_id, "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4");
+        assert!(
+            serde_json::from_value::<CiRequest>(serde_json::json!({
+                "mode": "release",
+                "project_id": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4"
+            }))
+            .is_err()
         );
     }
 }

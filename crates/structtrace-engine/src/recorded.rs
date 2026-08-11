@@ -22,8 +22,8 @@ use structtrace_core::{
     artifact::{
         EvaluatorComparison, EvaluatorStateCounts, EvidenceGroupDiagnostic, EvidenceGroupKind,
         EvidenceSummary, ExternalEvaluatorReceipt, FieldHotspot, MatchedOperationalSummary,
-        PairedCaseRecord, RunKind, RunManifest, RunStatus, RunSummary, SemanticEffectSummary,
-        VariantSummary,
+        PairedCaseRecord, PairedTransition, RunKind, RunManifest, RunStatus, RunSummary,
+        SemanticEffectSummary, VariantSummary,
     },
     config::{Config, EvaluatorKind, EvidenceUnitConfig, VariantConfig},
     dataset::Dataset,
@@ -52,6 +52,35 @@ pub struct CompletedRun {
     pub summary: RunSummary,
     /// Final manifest.
     pub manifest: RunManifest,
+}
+
+/// Honest progress emitted by the recorded-output engine at cancellable boundaries.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunProgress {
+    /// Stable machine-readable phase.
+    pub stage: &'static str,
+    /// Completed work units within this phase.
+    pub completed: usize,
+    /// Total work units within this phase.
+    pub total: usize,
+}
+
+type RunObserver<'a> = Option<&'a dyn Fn(RunProgress) -> anyhow::Result<()>>;
+
+fn observe(
+    observer: RunObserver<'_>,
+    stage: &'static str,
+    completed: usize,
+    total: usize,
+) -> anyhow::Result<()> {
+    if let Some(observer) = observer {
+        observer(RunProgress {
+            stage,
+            completed,
+            total,
+        })?;
+    }
+    Ok(())
 }
 
 /// A complete-denominator variant result prepared by any execution adapter.
@@ -90,6 +119,32 @@ pub fn run_recorded(project_root: &Path, config_path: &Path) -> anyhow::Result<C
         config,
         config_source_bytes,
         RunKind::Production,
+        None,
+    )
+}
+
+/// Run a recorded comparison with progress callbacks that may cancel by returning an error.
+pub fn run_recorded_observed(
+    project_root: &Path,
+    config_path: &Path,
+    observer: &dyn Fn(RunProgress) -> anyhow::Result<()>,
+) -> anyhow::Result<CompletedRun> {
+    let project_root = project_root
+        .canonicalize()
+        .with_context(|| format!("project root {} does not exist", project_root.display()))?;
+    let config_path = resolve(&project_root, config_path);
+    let config_source_bytes = structtrace_core::hashing::read_bounded(
+        &config_path,
+        structtrace_core::config::HARD_MAX_CONFIG_BYTES,
+        "configuration",
+    )?;
+    let config = Config::from_bytes(&config_path, &config_source_bytes)?;
+    run_recorded_with_snapshot(
+        &project_root,
+        config,
+        config_source_bytes,
+        RunKind::Production,
+        Some(observer),
     )
 }
 
@@ -113,6 +168,7 @@ pub fn run_recorded_with_config(
         config,
         config_source_bytes,
         RunKind::Production,
+        None,
     )
 }
 
@@ -132,7 +188,7 @@ pub fn run_recorded_with_config_kind(
         structtrace_core::config::HARD_MAX_CONFIG_BYTES,
         "configuration",
     )?;
-    run_recorded_with_snapshot(&project_root, config, config_source_bytes, run_kind)
+    run_recorded_with_snapshot(&project_root, config, config_source_bytes, run_kind, None)
 }
 
 fn run_recorded_with_snapshot(
@@ -140,7 +196,9 @@ fn run_recorded_with_snapshot(
     config: Config,
     config_source_bytes: Vec<u8>,
     run_kind: RunKind,
+    observer: RunObserver<'_>,
 ) -> anyhow::Result<CompletedRun> {
+    observe(observer, "validating_configuration", 0, 1)?;
     let config = Config::validate(config)?;
     anyhow::ensure!(
         config_source_bytes.len() <= config.limits.max_config_bytes,
@@ -148,6 +206,7 @@ fn run_recorded_with_snapshot(
     );
     let dataset_path = resolve(project_root, &config.dataset.path);
     let dataset = Dataset::read_bounded(&dataset_path, &config.dataset.fields, &config.limits)?;
+    observe(observer, "loading_inputs", 1, 4)?;
     let schema_path = resolve(project_root, &config.schema.path);
     let schema_bytes = structtrace_core::hashing::read_bounded(
         &schema_path,
@@ -157,6 +216,7 @@ fn run_recorded_with_snapshot(
     let schema_value = structtrace_core::strict_json::value_from_slice(&schema_bytes)
         .with_context(|| format!("schema {} is not valid strict JSON", schema_path.display()))?;
     compile_schema(&schema_value)?;
+    observe(observer, "loading_inputs", 2, 4)?;
 
     let baseline = read_recorded_variant(
         project_root,
@@ -165,6 +225,7 @@ fn run_recorded_with_snapshot(
         &dataset,
         &config.limits,
     )?;
+    observe(observer, "loading_inputs", 3, 4)?;
     let candidate = read_recorded_variant(
         project_root,
         "candidate",
@@ -172,6 +233,7 @@ fn run_recorded_with_snapshot(
         &dataset,
         &config.limits,
     )?;
+    observe(observer, "loading_inputs", 4, 4)?;
 
     finalize_prepared_kind(
         project_root,
@@ -182,6 +244,7 @@ fn run_recorded_with_snapshot(
         baseline,
         candidate,
         run_kind,
+        observer,
     )
 }
 
@@ -205,6 +268,7 @@ pub fn finalize_prepared(
         baseline,
         candidate,
         RunKind::Production,
+        None,
     )
 }
 
@@ -218,8 +282,9 @@ fn finalize_prepared_kind(
     baseline: PreparedVariant,
     candidate: PreparedVariant,
     run_kind: RunKind,
+    observer: RunObserver<'_>,
 ) -> anyhow::Result<CompletedRun> {
-    finalize_prepared_for_run(
+    finalize_prepared_for_run_observed(
         project_root,
         config_source_bytes,
         config,
@@ -230,6 +295,7 @@ fn finalize_prepared_kind(
         None,
         None,
         run_kind,
+        observer,
     )
 }
 
@@ -241,11 +307,40 @@ pub fn finalize_prepared_for_run(
     config: Config,
     dataset: Dataset,
     schema_bytes: Vec<u8>,
+    baseline: PreparedVariant,
+    candidate: PreparedVariant,
+    existing_run_id: Option<String>,
+    implementation_fingerprint: Option<String>,
+    run_kind: RunKind,
+) -> anyhow::Result<CompletedRun> {
+    finalize_prepared_for_run_observed(
+        project_root,
+        config_source_bytes,
+        config,
+        dataset,
+        schema_bytes,
+        baseline,
+        candidate,
+        existing_run_id,
+        implementation_fingerprint,
+        run_kind,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_prepared_for_run_observed(
+    project_root: &Path,
+    config_source_bytes: Vec<u8>,
+    config: Config,
+    dataset: Dataset,
+    schema_bytes: Vec<u8>,
     mut baseline: PreparedVariant,
     mut candidate: PreparedVariant,
     existing_run_id: Option<String>,
     implementation_fingerprint: Option<String>,
     run_kind: RunKind,
+    observer: RunObserver<'_>,
 ) -> anyhow::Result<CompletedRun> {
     if baseline.rows.len() != dataset.cases.len() || candidate.rows.len() != dataset.cases.len() {
         anyhow::bail!("prepared variants must contain exactly one row per dataset case");
@@ -294,6 +389,7 @@ pub fn finalize_prepared_for_run(
     )?;
 
     store.set_status(&run_id, RunStatus::Running)?;
+    observe(observer, "evaluating_cases", 0, dataset.cases.len())?;
     let mut records = Vec::with_capacity(dataset.cases.len());
     let evaluator_bridge = materialize_evaluator_bridge(&storage_root)?;
     let mut evaluator_stderr = Vec::new();
@@ -327,6 +423,7 @@ pub fn finalize_prepared_for_run(
         config.report.include_prompts,
     )?;
     for index in 0..dataset.cases.len() {
+        observe(observer, "evaluating_cases", index, dataset.cases.len())?;
         let case = &dataset.cases[index];
         let baseline_analysis_output = &analysis_baseline.rows[index];
         let candidate_analysis_output = &analysis_candidate.rows[index];
@@ -360,21 +457,29 @@ pub fn finalize_prepared_for_run(
             case: case.clone(),
             baseline_output: baseline_output.clone(),
             candidate_output: candidate_output.clone(),
-            transition: transition_name(
+            deployment_transition: PairedTransition::from_bools(
                 baseline_evaluation.deployment_success,
                 candidate_evaluation.deployment_success,
-            )
-            .to_owned(),
+            ),
+            semantic_transition: semantic_transition(
+                &baseline_evaluation,
+                &candidate_evaluation,
+                &config.analysis.primary_outcome,
+            ),
             baseline_evaluation,
             candidate_evaluation,
         });
+        observe(observer, "evaluating_cases", index + 1, dataset.cases.len())?;
     }
 
     store.set_status(&run_id, RunStatus::Analyzing)?;
+    observe(observer, "analyzing_evidence", 0, 1)?;
     let summary = build_summary(&run_id, &config, &records)?;
+    observe(observer, "analyzing_evidence", 1, 1)?;
     store.insert_paired_result(&config.analysis.primary_outcome, &summary.paired)?;
 
     let run_dir = store.run_dir().to_owned();
+    observe(observer, "writing_artifacts", 0, 1)?;
     let original_config =
         Config::from_bytes(&PathBuf::from("configuration.source"), &config_source_bytes)?;
     let variants_changed =
@@ -468,6 +573,7 @@ pub fn finalize_prepared_for_run(
     manifest.dataset_hash = dataset.source_hash.clone();
     manifest.schema_path = config.schema.path.display().to_string();
     manifest.schema_hash = hash_bytes(&schema_bytes);
+    manifest.schema_provenance = config.schema.provenance;
     manifest.variants = serde_json::to_value(&config.variants)?;
     manifest.evaluation_definition = serde_json::json!({
         "evaluators": config.evaluators,
@@ -591,6 +697,7 @@ pub fn finalize_prepared_for_run(
     );
     manifest.status = RunStatus::Complete;
     atomic_write_json(&run_dir.join("manifest.json"), &manifest)?;
+    observe(observer, "writing_artifacts", 1, 1)?;
     failure_guard.disarm();
     drop(failure_guard);
 
@@ -1820,13 +1927,15 @@ fn rate(count: usize, total: usize) -> f64 {
     }
 }
 
-fn transition_name(baseline: bool, candidate: bool) -> &'static str {
-    match (baseline, candidate) {
-        (true, true) => "both_pass",
-        (true, false) => "baseline_only_pass",
-        (false, true) => "candidate_only_pass",
-        (false, false) => "both_fail",
-    }
+fn semantic_transition(
+    baseline: &structtrace_core::evaluation::CaseEvaluation,
+    candidate: &structtrace_core::evaluation::CaseEvaluation,
+    primary_outcome: &str,
+) -> Option<PairedTransition> {
+    let baseline_outcome = baseline.outcomes.get(primary_outcome)?;
+    let candidate_outcome = candidate.outcomes.get(primary_outcome)?;
+    (baseline_outcome.fully_evaluated && candidate_outcome.fully_evaluated)
+        .then(|| PairedTransition::from_bools(baseline.primary_pass, candidate.primary_pass))
 }
 
 fn summary_markdown(project_name: &str, summary: &RunSummary) -> String {

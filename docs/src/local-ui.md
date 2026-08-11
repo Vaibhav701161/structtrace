@@ -25,17 +25,23 @@ The browser guides a comparison through six explicit stages:
 6. Run the existing Rust initializer, evaluator, paired analysis, gate, report, and artifact
    verification path.
 
-JSON, JSONL, and ordinary CSV sources are accepted. Browser uploads are content-only: the API does
+JSON, JSONL, and ordinary CSV sources are accepted. The Rust server is the authoritative parser
+for readiness, row counts, strict duplicate-key rejection, CSV semantics, and preview values; the
+browser never declares a source ready from a more permissive client parser. Browser uploads are content-only: the API does
 not accept arbitrary local paths. Each source is staged exactly once under an opaque ULID and
 BLAKE3 digest. Draft autosaves contain only that reference plus mappings and policy; source bytes
 are reloaded from the staged store only after their digest is verified. The source screen exposes
-save failures and a destructive, explicit clear action. Each file is capped at 32 MiB and the complete request at 64 MiB.
+save failures and a destructive, explicit clear action. Dataset and recorded-output sources are
+capped at the same 32 MiB default used by the CLI; schemas are capped at the same 16 MiB default.
+Each source is staged in its own request under a 64 MiB transport ceiling. Larger custom CLI limits
+are an advanced opt-in and are not claimed as browser-product capacity.
 Duplicate IDs, label leakage, malformed lines, missing outputs, insufficient evidence, and evaluator
 failures remain visible and fail closed.
 
 If no schema is supplied, StructTrace derives a closed structural shape from the first expected
-value and labels the resulting metric **Schema valid (inferred shape)**. This is not presented as
-validation against a caller-owned contract.
+value and labels the resulting metric **Schema valid (inferred shape)**. This is diagnostic only:
+Release mode is unavailable and runtime validation rejects any release configuration whose schema
+provenance is not explicitly `caller_supplied`.
 
 ## Decision language
 
@@ -57,14 +63,17 @@ table. A request can return no more than 500 cases, filters and search execute o
 the complete case artifact remains subject to the existing 64 MiB evidence bound. This avoids
 placing an entire large run in either an API response or the browser DOM.
 
-The case drawer uses JSON Pointer-addressed structural rows, marks failing fields across expected,
-baseline, and candidate values, can collapse to the failed paths, and copies exact pointers. Error,
+The case drawer uses JSON Pointer-addressed structural rows, distinguishes added, removed, changed,
+and type-changed values, aligns common ID/SKU/product-code arrays before comparison, offers unified
+and side-by-side modes, collapses unchanged paths, and copies exact pointers. Error,
 not-applicable, and unscored evaluator states remain distinct from a semantic “wrong” result.
 
-The current recorded evaluation executes as one bounded synchronous Rust operation. The browser
-uses an indeterminate working state and explicitly says that cancellation is unavailable; it does
-not animate invented parser/scorer stages. Real background jobs, cancellation, and resume are not
-claimed by this release candidate.
+Recorded evaluation executes through a durable local job. The browser polls real engine
+checkpoints, shows the current phase and completed work units, preserves an event history, recovers
+the active job after reload, and requests cancellation through a shared atomic control checked at
+safe source and case boundaries. Cancelled, failed, or server-interrupted jobs can be resumed from
+their retained source references as a new auditable job; no decision is produced for an incomplete
+job.
 
 ## Security boundary
 
@@ -83,8 +92,11 @@ under a new identity, and moves archived projects to `.structtrace/ui/archived-p
 than deleting them. A new comparison always receives a new project identity.
 
 Saved cases are local bookmarks and are deliberately not described as a regression suite. The CI
-screen generates a starter template whose missing installation and project binding must be reviewed;
-it does not claim that the fragment is immediately runnable. Candidate-baseline promotion appears
+screen exports a complete runnable snapshot of the saved project: full configuration and evaluator
+definitions, golden/baseline/candidate sources, caller schema, commit-pinned StructTrace install,
+authority-safe command, required-input checks, evidence upload, and integration instructions. The
+application-specific candidate generation step remains caller-owned and is named explicitly rather
+than guessed. Candidate-baseline promotion appears
 only for an authorizing Release decision. It copies the immutable candidate input into a separately
 hash-bound staged source, records the accepted run ID and candidate artifact hash, and prepares the
 same persistent project for its next candidate. Advisory, regression, insufficient-evidence, and

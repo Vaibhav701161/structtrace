@@ -17,6 +17,7 @@ export interface SourceArtifact {
   rows: number;
   status: "ready" | "staging" | "error";
   message?: string;
+  preview?: unknown[];
 }
 
 export interface FieldRule {
@@ -34,6 +35,12 @@ export interface FieldRule {
   tolerance?: string;
   keys?: string;
   fields?: string;
+  keyFields?: string[];
+  arrayFields?: Array<{
+    pointer: string;
+    kind: "exact" | "normalized_string" | "canonical_date" | "exact_integer" | "decimal_tolerance";
+    tolerance?: string;
+  }>;
   formats?: string;
   caseInsensitive?: boolean;
   expectedCoverage: number;
@@ -65,7 +72,23 @@ export interface ComparisonDraft {
   gateMode: GateMode;
   minCases: number;
   financialInvariants: boolean;
+  activeJobId?: string;
 }
+
+export const jobResponseSchema = z.object({
+  jobId: z.string(),
+  projectId: z.string(),
+  status: z.enum(["queued", "running", "complete", "failed", "cancelled", "interrupted"]),
+  stage: z.string(),
+  completed: z.number(),
+  total: z.number(),
+  message: z.string().nullable(),
+  runId: z.string().nullable(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  events: z.array(z.object({ stage: z.string(), at: z.number() })),
+});
+export type JobResponse = z.infer<typeof jobResponseSchema>;
 
 export const systemResponseSchema = z.object({
   product: z.literal("StructTrace"),
@@ -105,7 +128,15 @@ export const runResultSchema = z.object({
   summary: z.object({
     baseline: variantSummarySchema,
     candidate: variantSummarySchema,
+    descriptive_baseline: variantSummarySchema,
+    descriptive_candidate: variantSummarySchema,
+    primary_jointly_scored: z.number(),
     paired: pairedSchema,
+    jointly_scored_semantic: z.object({
+      jointly_scored_cases: z.number(),
+      excluded_pairs: z.number(),
+      paired: pairedSchema,
+    }),
     bootstrap: z.object({ lower_pp: z.number(), upper_pp: z.number() }),
     evidence: z.object({
       total_rows: z.number(),
@@ -191,6 +222,7 @@ const sourceArtifactSchema = z.object({
   rows: z.number(),
   status: z.enum(["ready", "staging", "error"]),
   message: z.string().optional(),
+  preview: z.array(z.unknown()).optional(),
 });
 
 const fieldRuleSchema = z.object({
@@ -200,6 +232,12 @@ const fieldRuleSchema = z.object({
   tolerance: z.string().optional(),
   keys: z.string().optional(),
   fields: z.string().optional(),
+  keyFields: z.array(z.string()).optional(),
+  arrayFields: z.array(z.object({
+    pointer: z.string(),
+    kind: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_tolerance"]),
+    tolerance: z.string().optional(),
+  })).optional(),
   formats: z.string().optional(),
   caseInsensitive: z.boolean().optional(),
   expectedCoverage: z.number(),
@@ -229,4 +267,5 @@ export const comparisonDraftSchema: z.ZodType<ComparisonDraft> = z.object({
   gateMode: gateModeSchema,
   minCases: z.number(),
   financialInvariants: z.boolean(),
+  activeJobId: z.string().optional(),
 });

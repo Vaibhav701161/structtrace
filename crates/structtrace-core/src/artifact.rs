@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     ARTIFACT_FORMAT_VERSION,
-    config::{BootstrapConfig, GateConfig},
+    config::{BootstrapConfig, GateConfig, SchemaProvenance},
     dataset::Case,
     evaluation::CaseEvaluation,
     evaluation::EvaluatorResult,
@@ -29,8 +29,50 @@ pub struct PairedCaseRecord {
     pub baseline_evaluation: CaseEvaluation,
     /// Recomputed candidate scores.
     pub candidate_evaluation: CaseEvaluation,
-    /// Primary paired category.
-    pub transition: String,
+    /// Paired category based on complete deployment success.
+    #[serde(alias = "transition")]
+    pub deployment_transition: PairedTransition,
+    /// Paired category based on semantic truth when both outcomes fully resolved.
+    #[serde(default)]
+    pub semantic_transition: Option<PairedTransition>,
+}
+
+/// Typed paired transition retained in case evidence and verified by replay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairedTransition {
+    /// Both variants passed the selected criterion.
+    BothPass,
+    /// Baseline passed and candidate failed.
+    BaselineOnlyPass,
+    /// Candidate passed and baseline failed.
+    CandidateOnlyPass,
+    /// Neither variant passed.
+    BothFail,
+}
+
+impl PairedTransition {
+    /// Build a transition from paired binary facts.
+    #[must_use]
+    pub const fn from_bools(baseline: bool, candidate: bool) -> Self {
+        match (baseline, candidate) {
+            (true, true) => Self::BothPass,
+            (true, false) => Self::BaselineOnlyPass,
+            (false, true) => Self::CandidateOnlyPass,
+            (false, false) => Self::BothFail,
+        }
+    }
+
+    /// Stable snake-case label used by reports and filters.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BothPass => "both_pass",
+            Self::BaselineOnlyPass => "baseline_only_pass",
+            Self::CandidateOnlyPass => "candidate_only_pass",
+            Self::BothFail => "both_fail",
+        }
+    }
 }
 
 /// Hash-bound receipt for one deliberately non-reexecuted external evaluator.
@@ -115,6 +157,9 @@ pub struct RunManifest {
     pub schema_path: String,
     /// Exact schema bytes hash.
     pub schema_hash: String,
+    /// Explicit authority of the schema used for structural validity.
+    #[serde(default)]
+    pub schema_provenance: SchemaProvenance,
     /// Redacted variant definitions.
     pub variants: Value,
     /// Evaluators and outcomes.
@@ -160,6 +205,7 @@ impl RunManifest {
             dataset_hash: String::new(),
             schema_path: String::new(),
             schema_hash: String::new(),
+            schema_provenance: SchemaProvenance::CallerSupplied,
             variants: Value::Null,
             evaluation_definition: Value::Null,
             gate: GateConfig::default(),

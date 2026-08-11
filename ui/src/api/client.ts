@@ -1,4 +1,4 @@
-import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
+import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, jobResponseSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
 
 function capabilityBase(): string {
   const first = window.location.pathname.split("/").filter(Boolean)[0];
@@ -50,11 +50,27 @@ export async function runComparison(comparison: ComparisonRequest) {
   }));
 }
 
-export async function stageSource(kind: SourceKind, source: SourceArtifact): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes">> {
+export async function createComparisonJob(comparison: ComparisonRequest) {
+  return jobResponseSchema.parse(await request("/jobs", { method: "POST", body: JSON.stringify(comparison) }));
+}
+
+export async function getComparisonJob(jobId: string) {
+  return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}`));
+}
+
+export async function cancelComparisonJob(jobId: string) {
+  return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: "{}" }));
+}
+
+export async function resumeComparisonJob(jobId: string) {
+  return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }));
+}
+
+export async function stageSource(kind: SourceKind, source: SourceArtifact): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">> {
   return await request("/sources", {
     method: "POST",
     body: JSON.stringify({ kind, file: { name: source.name, format: source.format, content: source.content } }),
-  }) as Pick<SourceArtifact, "sourceId" | "hash" | "bytes">;
+  }) as Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">;
 }
 
 export async function getRun(runId: string) {
@@ -143,10 +159,12 @@ export async function deleteDraft() {
   await request("/comparisons/draft", { method: "DELETE" });
 }
 
-export async function generateCi(mode: "regression" | "release") {
-  return request("/ci/generate", { method: "POST", body: JSON.stringify({ mode }) }) as Promise<{
+export async function generateCi(mode: "regression" | "release", projectId: string) {
+  return request("/ci/generate", { method: "POST", body: JSON.stringify({ mode, projectId }) }) as Promise<{
     config: string;
     workflow: string;
     command: string;
+    export_path: string;
+    files: string[];
   }>;
 }

@@ -8,6 +8,23 @@ describe("local import inspection", () => {
     expect(artifact.message).toContain("Line 2");
   });
 
+  it("suggests a compound invoice item key and numeric field semantics", () => {
+    const row = '{"id":"a","expected":{"line_items":[{"description":"Paper","quantity":2,"unit_price":"40.00","amount":"80.00"}]}}\n';
+    const output = '{"id":"a","output":{"line_items":[{"description":"Paper","quantity":2,"unit_price":"40.00","amount":"80.00"}]}}\n';
+    const rules = discoverRules(parseArtifact("dataset", "data.jsonl", row), parseArtifact("baseline", "base.jsonl", output), parseArtifact("candidate", "next.jsonl", output), "/expected", "/output", "/output");
+    const items = rules.find((rule) => rule.pointer === "/line_items");
+    expect(items?.keyFields).toEqual(["/description", "/unit_price"]);
+    expect(items?.arrayFields).toContainEqual({ pointer: "/quantity", kind: "exact_integer" });
+    expect(items?.arrayFields).toContainEqual({ pointer: "/amount", kind: "decimal_tolerance" });
+  });
+
+  it("rejects duplicate JSON keys instead of silently keeping the last value", () => {
+    const artifact = parseArtifact("candidate", "candidate.jsonl", '{"id":"a","output":{"answer":4,"answer":5}}\n');
+    expect(artifact.status).toBe("error");
+    expect(artifact.message).toContain("Line 1");
+    expect(artifact.message).toContain('Duplicate object key "answer"');
+  });
+
   it("parses quoted CSV with nested JSON deterministically", () => {
     const rows = parseRows('id,output\na,"{""answer"":4}"\n', "csv");
     expect(valueAt(rows[0], "/output/answer")).toBe(4);
@@ -25,5 +42,6 @@ describe("local import inspection", () => {
     const rules = discoverRules(dataset, baseline, candidate, "/expected", "/output", "/output");
     expect(rules.find((rule) => rule.pointer === "/amount")).toMatchObject({ kind: "decimal_exact", enabled: false });
     expect(rules.find((rule) => rule.pointer === "/items")).toMatchObject({ kind: "keyed_array", enabled: false });
+    expect(rules.find((rule) => rule.pointer === "/items")).toMatchObject({ keyFields: ["/sku"] });
   });
 });

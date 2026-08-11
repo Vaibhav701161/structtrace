@@ -57,7 +57,11 @@ test("recorded files complete the visual workflow through the Rust engine", asyn
   await expect(page.locator(".coverage-card strong").first()).toHaveText("12");
   await page.getByRole("button", { name: "Looks right" }).click();
   await expect(page.getByRole("heading", { name: "What does correct mean for your application?" })).toBeVisible();
-  await page.locator('.rules-table input[type="checkbox"]').first().check();
+  await page.getByRole("checkbox", { name: "Use /line_items" }).check();
+  await expect(page.getByRole("heading", { name: "Match items in /line_items" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Role for /description" })).toHaveValue("key");
+  await expect(page.getByRole("combobox", { name: "Role for /unit_price" })).toHaveValue("key");
+  await expect(page.getByText("Pairs the same item across variants").first()).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByRole("heading", { name: "Ready to compare" })).toBeVisible();
@@ -91,7 +95,7 @@ test("mobile navigation keeps every primary route reachable", async ({ page }) =
   await page.getByRole("button", { name: "Open navigation" }).click();
   await expect(page.getByRole("dialog", { name: "Mobile navigation" })).toBeVisible();
   await page.getByRole("link", { name: "Saved cases" }).click();
-  await expect(page.getByRole("heading", { name: "Saved cases" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Saved cases", exact: true })).toBeVisible();
 });
 
 test("dark theme and command search remain accessible", async ({ page }) => {
@@ -103,14 +107,14 @@ test("dark theme and command search remain accessible", async ({ page }) => {
   await page.getByRole("button", { name: /Search or run a command/ }).click();
   const palette = page.getByRole("dialog", { name: "Command palette" });
   await palette.getByRole("textbox", { name: "Search commands" }).fill("CI");
-  await expect(palette.getByRole("button", { name: /Generate CI starter/ })).toBeVisible();
+  await expect(palette.getByRole("button", { name: /Export CI project/ })).toBeVisible();
   await expect(palette.getByRole("button", { name: /New comparison/ })).toBeHidden();
   const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze();
   expect(results.violations).toEqual([]);
 });
 
 test("authorized candidate becomes the next baseline in the same project", async ({ page }, testInfo) => {
-  const projectName = `E2E authorized lifecycle ${testInfo.project.name}`;
+  const projectName = `E2E authorized lifecycle ${testInfo.project.name} ${Date.now()}`;
   const dataset = Array.from({ length: 100 }, (_, index) => JSON.stringify({ id: `case-${index}`, input: { value: index }, expected: { answer: index } })).join("\n") + "\n";
   const outputs = Array.from({ length: 100 }, (_, index) => JSON.stringify({ id: `case-${index}`, status: "ok", output: { answer: index } })).join("\n") + "\n";
   const schema = JSON.stringify({ "$schema": "https://json-schema.org/draft/2020-12/schema", type: "object", properties: { answer: { type: "integer" } }, required: ["answer"], additionalProperties: false });
@@ -130,6 +134,17 @@ test("authorized candidate becomes the next baseline in the same project", async
   await page.getByLabel("Comparison name").fill(projectName);
   await page.getByRole("button", { name: "Run comparison" }).click();
   await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible({ timeout: 20_000 });
+  const resultUrl = page.url();
+  await page.getByRole("button", { name: "Export CI project" }).click();
+  await expect(page.getByRole("heading", { name: "Export a reproducible CI project" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Release authorization/ })).toHaveClass(/selected/);
+  await page.getByRole("button", { name: "Export complete CI project" }).click();
+  await expect(page.getByText("Complete CI project exported")).toBeVisible();
+  const generatedWorkflow = page.locator(".generated-file").filter({ hasText: ".github/workflows/structtrace.yml" });
+  await expect(generatedWorkflow).toContainText("structtrace release-check latest");
+  await expect(generatedWorkflow).toContainText(/ref: [0-9a-f]{40}/);
+  await page.goto(resultUrl);
+  await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible();
   await page.getByRole("button", { name: "Accept as next baseline" }).click();
   await expect(page.getByText("Authorized baseline recorded")).toBeVisible();
   const persistedIteration = page.waitForRequest((request) => request.method() === "PUT" && request.url().includes("/comparisons/draft") && request.postData()?.includes("accepted-") === true);
@@ -153,4 +168,35 @@ test("authorized candidate becomes the next baseline in the same project", async
   page.once("dialog", (dialog) => dialog.accept());
   await copy.getByRole("button", { name: `Archive ${copyName}` }).click();
   await expect(copy).toBeHidden();
+});
+
+test("long comparison exposes real reload-safe cancellation and resume", async ({ page }) => {
+  test.setTimeout(60_000);
+  const count = 10_000;
+  const dataset = Array.from({ length: count }, (_, index) => JSON.stringify({ id: `job-${index}`, input: { value: index }, expected: { answer: index } })).join("\n") + "\n";
+  const outputs = Array.from({ length: count }, (_, index) => JSON.stringify({ id: `job-${index}`, status: "ok", output: { answer: index } })).join("\n") + "\n";
+  const schema = JSON.stringify({ type: "object", properties: { answer: { type: "integer" } }, required: ["answer"], additionalProperties: false });
+  await page.goto(process.env.STRUCTTRACE_UI_URL ?? "/");
+  await page.getByRole("button", { name: "Compare a change" }).click();
+  const files = page.locator('input[type="file"]');
+  await files.nth(0).setInputFiles({ name: "job-dataset.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(dataset) });
+  await files.nth(1).setInputFiles({ name: "job-baseline.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(outputs) });
+  await files.nth(2).setInputFiles({ name: "job-candidate.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(outputs) });
+  await files.nth(3).setInputFiles({ name: "job.schema.json", mimeType: "application/json", buffer: Buffer.from(schema) });
+  await page.getByRole("button", { name: "Continue to field mapping" }).click();
+  await page.getByRole("button", { name: "Looks right" }).click();
+  await page.getByRole("checkbox", { name: "Use /answer" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page.getByRole("button", { name: "Run comparison" }).click();
+  await expect(page.getByRole("button", { name: "Cancel safely" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".stage-list li").first()).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Cancel safely" })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole("button", { name: "Cancel safely" }).click();
+  await expect(page.getByRole("button", { name: "Resume from retained sources" })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole("button", { name: "Resume from retained sources" }).click();
+  await expect(page.getByRole("button", { name: "Cancel safely" })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole("button", { name: "Cancel safely" }).click();
+  await expect(page.getByText("No decision was produced", { exact: true })).toBeVisible({ timeout: 15_000 });
 });

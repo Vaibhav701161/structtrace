@@ -13,7 +13,7 @@ export function Home() {
   const demo = useMutation({ mutationFn: runDemo, onSuccess: (result) => { setResult(result); void navigate({ to: "/runs/$runId", params: { runId: result.runId } }); } });
   return (
     <div className="page page-wide">
-      <PageHeader title="What do you want to test?" description="Start with recorded outputs. StructTrace will retain a reproducible project and can prepare a CI starter for review." />
+      <PageHeader title="What do you want to test?" description="Start with matched recorded outputs. StructTrace preserves a reproducible project and can export it as a pinned CI check." />
       <div className="action-grid">
         <button className="action-card primary-action" onClick={() => { reset(); void navigate({ to: "/new/source" }); }}><span className="action-icon"><Plus /></span><strong>Compare a change</strong><p>Test a new model, prompt, provider, decoder, or implementation.</p><span className="card-link">Start comparison <ArrowRight size={15} /></span></button>
         <button className="action-card" onClick={() => demo.mutate()} disabled={demo.isPending}><span className="action-icon"><Play /></span><strong>{demo.isPending ? "Running local demo…" : "Try invoice extraction demo"}</strong><p>See why schema validity and semantic correctness are separate.</p><span className="card-link">Open workflow <ArrowRight size={15} /></span></button>
@@ -26,7 +26,7 @@ export function Home() {
         </Card>
         <div className="side-stack">
           <Card><div className="compact-heading"><ShieldCheck size={18} /><h2>Saved cases</h2></div><p className="muted">Bookmark important evidence for later inspection. Saved cases are not an enforced regression suite.</p><Status tone={pins.data?.length ? "info" : "neutral"} label={pins.isLoading ? "Loading…" : `${pins.data?.length ?? 0} saved ${pins.data?.length === 1 ? "case" : "cases"}`} /></Card>
-          <Card><div className="compact-heading"><GitPullRequest size={18} /><h2>CI starter</h2></div><p className="muted">Generate a reviewable template after your first real comparison. It is not installed automatically.</p><Status tone="neutral" label="Manual setup" /></Card>
+          <Card><div className="compact-heading"><GitPullRequest size={18} /><h2>CI project export</h2></div><p className="muted">Export the complete saved configuration, sources, pinned installation, safe gate, and evidence upload workflow.</p><Status tone="pass" label="Runnable snapshot" /></Card>
         </div>
       </div>
     </div>

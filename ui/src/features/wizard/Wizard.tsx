@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertTriangle,
@@ -16,13 +16,14 @@ import {
   LockKeyhole,
   ShieldCheck,
   Upload,
+  XCircle,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { runComparison, stageSource } from "../../api/client";
+import { cancelComparisonJob, createComparisonJob, getComparisonJob, getRun, resumeComparisonJob, stageSource } from "../../api/client";
 import type { ComparisonRequest, FieldRule, GateMode, Mapping, SourceArtifact, SourceKind } from "../../api/types";
-import { Button, Card, InlineNotice, PageHeader, Status, Stepper, WizardActions } from "../../design-system/components";
+import { Button, Card, InlineNotice, PageHeader, Skeleton, Status, Stepper, WizardActions } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
-import { discoverRules, inferPointer, parseArtifact, parseRows, pointerCandidates, valueAt } from "../import/inspect";
+import { detectFormat, discoverRules, inferPointer, parseRows, pointerCandidates, valueAt } from "../import/inspect";
 
 const paths = ["/new/source", "/new/map", "/new/correctness", "/new/evidence", "/new/review", "/new/run"] as const;
 
@@ -83,12 +84,12 @@ function SourceDrop({ kind, title, description, required, source, onSource }: {
   const read = (file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const parsed = parseArtifact(kind, file.name, String(reader.result ?? ""));
-      if (parsed.status === "error") { onSource({ ...parsed, sourceId: "", hash: "" }); return; }
-      onSource({ ...parsed, status: "staging", message: "Staging and hashing on the local server…" });
-      void stageSource(kind, parsed)
-        .then((staged) => onSource({ ...parsed, sourceId: staged.sourceId, hash: staged.hash }))
-        .catch((error: Error) => onSource({ ...parsed, sourceId: "", hash: "", status: "error", message: error.message }));
+      const content = String(reader.result ?? "");
+      const pending: SourceArtifact = { kind, name: file.name, format: kind === "schema" ? "json" : detectFormat(file.name, content), content, bytes: new Blob([content]).size, rows: 0, status: "staging", message: "Strict validation and hashing on the local server…", sourceId: "", hash: "" };
+      onSource(pending);
+      void stageSource(kind, pending)
+        .then((staged) => onSource({ ...pending, ...staged, status: "ready", message: undefined }))
+        .catch((error: Error) => onSource({ ...pending, sourceId: "", hash: "", status: "error", message: error.message }));
     };
     reader.onerror = () => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The browser could not read this file.", sourceId: "", hash: "" });
     reader.readAsText(file);
@@ -120,9 +121,9 @@ function MappingStep() {
   const dataset = draft.sources.dataset!;
   const baseline = draft.sources.baseline!;
   const candidate = draft.sources.candidate!;
-  const dataRows = useMemo(() => parseRows(dataset.content, dataset.format), [dataset]);
-  const baselineRows = useMemo(() => parseRows(baseline.content, baseline.format), [baseline]);
-  const candidateRows = useMemo(() => parseRows(candidate.content, candidate.format), [candidate]);
+  const dataRows = useMemo(() => dataset.preview ?? parseRows(dataset.content, dataset.format), [dataset]);
+  const baselineRows = useMemo(() => baseline.preview ?? parseRows(baseline.content, baseline.format), [baseline]);
+  const candidateRows = useMemo(() => candidate.preview ?? parseRows(candidate.content, candidate.format), [candidate]);
   const dataPointers = useMemo(() => pointerCandidates(dataRows), [dataRows]);
   const baselinePointers = useMemo(() => pointerCandidates(baselineRows), [baselineRows]);
   const candidatePointers = useMemo(() => pointerCandidates(candidateRows), [candidateRows]);
@@ -208,6 +209,7 @@ function CorrectnessStep() {
   useEffect(() => { if (!initialized) { setRules(draft.rules.length ? draft.rules : discovered); setInitialized(true); } }, [discovered, draft.rules, initialized, setRules]);
   const update = (pointer: string, next: Partial<FieldRule>) => setRules(draft.rules.map((rule) => rule.pointer === pointer ? { ...rule, ...next } : rule));
   const enabled = draft.rules.filter((rule) => rule.enabled);
+  const keyedRules = enabled.filter((rule) => rule.kind === "keyed_array");
   return (
     <>
       <PageHeader eyebrow="Step 3 of 6" title="What does correct mean for your application?" description="Schema validity is never treated as task correctness. Select the fields and deterministic rules that define success." />
@@ -218,15 +220,47 @@ function CorrectnessStep() {
           <thead><tr><th scope="col">Use</th><th scope="col">Field</th><th scope="col">Type</th><th scope="col">Expected</th><th scope="col">Baseline</th><th scope="col">Candidate</th><th scope="col">Comparison</th></tr></thead>
           <tbody>{draft.rules.map((rule) => {
             const missing = rule.candidateCoverage < rule.expectedCoverage;
-            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="required_fields">Required presence</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="keyed_array">Keyed array</option></select>{rule.kind === "normalized_string" && <label className="inline-option"><input type="checkbox" checked={rule.caseInsensitive ?? true} onChange={(event) => update(rule.pointer, { caseInsensitive: event.target.checked })} /> Ignore case</label>}{rule.kind === "canonical_date" && <select value={rule.formats ?? "iso"} onChange={(event) => update(rule.pointer, { formats: event.target.value })} aria-label={`Accepted date formats for ${rule.pointer}`}><option value="iso">ISO only</option><option value="iso,dmy_slash">ISO + DMY slash</option><option value="iso,mdy_slash">ISO + MDY slash</option></select>}{rule.kind === "decimal_tolerance" && <input value={rule.tolerance ?? "0.01"} onChange={(event) => update(rule.pointer, { tolerance: event.target.value })} aria-label={`Absolute tolerance for ${rule.pointer}`} />}{rule.kind === "keyed_array" && <div className="keyed-array-options"><input value={rule.keys ?? ""} onChange={(event) => update(rule.pointer, { keys: event.target.value })} placeholder="Item key, e.g. /sku" aria-label={`Item keys for ${rule.pointer}`} /><input value={rule.fields ?? ""} onChange={(event) => update(rule.pointer, { fields: event.target.value })} placeholder="/quantity:exact_integer" aria-label={`Compared fields for ${rule.pointer}`} /></div>}</td></tr>;
+            return <tr key={rule.pointer} className={!rule.enabled ? "disabled-row" : missing ? "missing-row" : ""}><td><input type="checkbox" checked={rule.enabled} onChange={(event) => update(rule.pointer, { enabled: event.target.checked })} aria-label={`Use ${rule.pointer}`} /></td><td><code>{rule.pointer}</code>{missing && <small className="coverage-warning"><AlertTriangle size={13} /> Candidate omission</small>}</td><td>{rule.observedType}</td><td>{formatCoverage(rule.expectedCoverage)}</td><td>{formatCoverage(rule.baselineCoverage)}</td><td>{formatCoverage(rule.candidateCoverage)}</td><td><select value={rule.kind} onChange={(event) => update(rule.pointer, { kind: event.target.value as FieldRule["kind"] })} aria-label={`Comparison for ${rule.pointer}`}><option value="exact">Exact value</option><option value="required_fields">Required presence</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="keyed_array">Keyed array</option></select>{rule.kind === "normalized_string" && <label className="inline-option"><input type="checkbox" checked={rule.caseInsensitive ?? true} onChange={(event) => update(rule.pointer, { caseInsensitive: event.target.checked })} /> Ignore case</label>}{rule.kind === "canonical_date" && <select value={rule.formats ?? "iso"} onChange={(event) => update(rule.pointer, { formats: event.target.value })} aria-label={`Accepted date formats for ${rule.pointer}`}><option value="iso">ISO only</option><option value="iso,dmy_slash">ISO + DMY slash</option><option value="iso,mdy_slash">ISO + MDY slash</option></select>}{rule.kind === "decimal_tolerance" && <input value={rule.tolerance ?? "0.01"} onChange={(event) => update(rule.pointer, { tolerance: event.target.value })} aria-label={`Absolute tolerance for ${rule.pointer}`} />}{rule.kind === "keyed_array" && <small className="configured-label">Configure item matching below</small>}</td></tr>;
           })}</tbody>
         </table>
         {!draft.rules.length && <div className="table-empty"><AlertTriangle size={20} /><strong>No semantic fields were discovered</strong><p>Check the expected and output mappings on the previous step.</p></div>}
       </Card>
+      {keyedRules.map((rule) => <KeyedArrayBuilder key={rule.pointer} rule={rule} update={(next) => update(rule.pointer, next)} />)}
+      {enabled.length > 0 && <Card className="rule-preview"><div className="panel-heading"><div><h2>Rule behavior preview</h2><p>These examples describe the deterministic result states before the configuration is saved.</p></div><Status tone="info" label={`${enabled.length} active`} /></div><div className="rule-preview-grid">{enabled.slice(0, 6).map((rule) => <div key={rule.pointer}><code>{rule.pointer}</code><span><b className="preview-pass">Pass</b>{passExample(rule)}</span><span><b className="preview-fail">Regression</b>{failureExample(rule)}</span><span><b className="preview-error">Unscored/error</b>Missing expected reference or evaluator failure never counts as a pass.</span></div>)}</div></Card>}
       <InlineNotice title="Why suggestions appear">Suggestions come only from observed JSON types and field names. They are never silently activated or changed after you review them.</InlineNotice>
       <WizardActions back={navigation.back} next={navigation.next} disabled={!enabled.length} />
     </>
   );
+}
+function passExample(rule: FieldRule) { return rule.kind === "normalized_string" ? "Whitespace and configured case normalization agree." : rule.kind === "canonical_date" ? "Both values resolve to the same declared calendar date." : rule.kind === "decimal_tolerance" ? `Absolute difference is at most ${rule.tolerance ?? "0.01"}.` : rule.kind === "keyed_array" ? "Every keyed item pairs and all selected item fields pass." : "Expected and output values satisfy the selected exact policy."; }
+function failureExample(rule: FieldRule) { return rule.kind === "keyed_array" ? "An item is missing, duplicated, or a compared field differs." : rule.kind === "required_fields" ? "The output omits the required field." : "The candidate value violates the selected field policy."; }
+
+function KeyedArrayBuilder({ rule, update }: { rule: FieldRule; update: (next: Partial<FieldRule>) => void }) {
+  const fields = rule.arrayFields ?? [];
+  const keys = new Set(rule.keyFields ?? (rule.keys ? rule.keys.split(",").filter(Boolean) : []));
+  const allPointers = [...new Set([...keys, ...fields.map((field) => field.pointer)])].sort();
+  const comparison = (pointer: string) => fields.find((field) => field.pointer === pointer);
+  const setRole = (pointer: string, role: string) => {
+    const nextKeys = new Set(keys);
+    let nextFields = fields.filter((field) => field.pointer !== pointer);
+    if (role === "key") nextKeys.add(pointer); else nextKeys.delete(pointer);
+    if (role !== "key" && role !== "ignore") {
+      nextFields = [...nextFields, { pointer, kind: role as NonNullable<FieldRule["arrayFields"]>[number]["kind"], tolerance: role === "decimal_tolerance" ? "0.01" : undefined }].sort((left, right) => left.pointer.localeCompare(right.pointer));
+    }
+    update({ keyFields: [...nextKeys].sort(), arrayFields: nextFields });
+  };
+  return <Card className="array-builder">
+    <div className="panel-heading"><div><h2>Match items in <code>{rule.pointer}</code></h2><p>Choose stable identity fields, then define how each remaining item field is compared. Array order is ignored.</p></div><Status tone={keys.size ? "pass" : "warning"} label={keys.size ? `${keys.size} match ${keys.size === 1 ? "key" : "keys"}` : "Match key required"} /></div>
+    <div className="array-field-grid" role="group" aria-label={`Item rules for ${rule.pointer}`}>
+      <div className="array-field-head"><span>Item field</span><span>Role and comparison</span><span>Policy</span></div>
+      {allPointers.map((pointer) => {
+        const field = comparison(pointer);
+        const role = keys.has(pointer) ? "key" : field?.kind ?? "ignore";
+        return <div className="array-field-row" key={pointer}><code>{pointer}</code><select value={role} onChange={(event) => setRole(pointer, event.target.value)} aria-label={`Role for ${pointer}`}><option value="key">Match key</option><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_tolerance">Decimal tolerance</option><option value="ignore">Do not compare</option></select><span>{role === "key" ? "Pairs the same item across variants" : role === "ignore" ? "Excluded from correctness" : role === "decimal_tolerance" ? <label>± <input value={field?.tolerance ?? "0.01"} onChange={(event) => update({ arrayFields: fields.map((item) => item.pointer === pointer ? { ...item, tolerance: event.target.value } : item) })} aria-label={`Tolerance for ${pointer}`} /></label> : "Deterministic evaluator"}</span></div>;
+      })}
+    </div>
+    {!keys.size && <InlineNotice tone="danger" title="Choose at least one stable item key">A keyed array cannot pair items safely without an identity such as SKU, product code, or ID.</InlineNotice>}
+  </Card>;
 }
 function formatCoverage(value: number) { return `${Math.round(value * 100)}%`; }
 
@@ -240,18 +274,21 @@ function EvidenceStep() {
   const navigation = useStepNavigation(3);
   const rows = draft.sources.dataset?.rows ?? 0;
   const sufficient = rows >= draft.minCases;
+  const releaseAvailable = Boolean(draft.sources.schema);
+  const financialReady = ["/line_items", "/subtotal", "/tax", "/total"].every((pointer) => draft.rules.some((rule) => rule.pointer === pointer));
   return (
     <>
       <PageHeader eyebrow="Step 4 of 6" title="How should StructTrace judge this comparison?" description="Choose the authority of this result. Evidence checks cannot be bypassed by a quality metric." />
-      <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode, minCases: mode === "release" ? Math.max(100, draft.minCases) : draft.minCases })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{text}</p></div></button>)}</div>
+      <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} disabled={mode === "release" && !releaseAvailable} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode, minCases: mode === "release" ? Math.max(100, draft.minCases) : draft.minCases })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{mode === "release" && !releaseAvailable ? "Unavailable until you provide the caller-facing JSON Schema." : text}</p></div></button>)}</div>
       <Card className="evidence-profile">
         <div className="panel-heading"><div><h2>{draft.gateMode === "release" ? "Conservative release profile" : "Balanced evidence profile"}</h2><p>Plain-language thresholds generated into the reproducible configuration.</p></div><ShieldCheck size={22} /></div>
         <label className="range-field"><span><strong>Required independent cases</strong><small>Current dataset contains {rows.toLocaleString()} rows.{draft.gateMode === "release" ? " Release authority requires at least 100." : ""}</small></span><input type="number" min={draft.gateMode === "release" ? "100" : "1"} max="100000" value={draft.minCases} onChange={(event) => updateDraft({ minCases: Math.max(draft.gateMode === "release" ? 100 : 1, Number(event.target.value)) })} /></label>
-        <label className="setting-row"><span><strong>Invoice financial invariants</strong><small>Enable only when outputs use /line_items, /subtotal, /tax, and /total. Uses absolute tolerance 0.01.</small></span><input type="checkbox" checked={draft.financialInvariants} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
+        <label className={`setting-row ${!financialReady ? "disabled-row" : ""}`}><span><strong>Invoice financial invariants</strong><small>{financialReady ? "Cross-checks line amounts, subtotal, tax, and total with absolute tolerance 0.01." : "Unavailable because /line_items, /subtotal, /tax, and /total were not all discovered."}</small></span><input type="checkbox" disabled={!financialReady} checked={draft.financialInvariants && financialReady} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
         <div className="evidence-rules"><span><Check size={15} /> At least 99% fully evaluated</span><span><Check size={15} /> No repeated-trial conflicts</span><span><Check size={15} /> Candidate may regress by at most 0 pp</span>{draft.gateMode === "release" && <><span><Check size={15} /> Candidate deployment success at least 95%</span><span><Check size={15} /> Candidate strict JSON and schema validity 100%</span></>}</div>
       </Card>
       {!sufficient && draft.gateMode !== "advisory" && <InlineNotice tone="warning" title="Analysis available; authority disabled">This dataset has {rows} rows, below the configured minimum of {draft.minCases}. StructTrace will preserve the result as insufficient evidence instead of overstating it.</InlineNotice>}
-      <WizardActions back={navigation.back} next={navigation.next} />
+      {!releaseAvailable && <InlineNotice tone="warning" title="Release mode requires the real contract">Without a caller-supplied JSON Schema, inferred shape checks remain diagnostic and can be used only in Advisory or Regression mode.</InlineNotice>}
+      <WizardActions back={navigation.back} next={navigation.next} disabled={draft.gateMode === "release" && !releaseAvailable} />
     </>
   );
 }
@@ -278,9 +315,11 @@ function ReviewStep() {
 }
 
 function RunStep() {
-  const { draft, setResult } = useWorkspace();
+  const { draft, setResult, updateDraft, updateDraftAndPersist, draftStatus } = useWorkspace();
   const navigate = useNavigate();
-  const request = useMemo<ComparisonRequest>(() => ({
+  const request = useMemo<ComparisonRequest | null>(() => {
+    if (!draft.sources.dataset || !draft.sources.baseline || !draft.sources.candidate) return null;
+    return ({
     projectId: draft.projectId,
     name: draft.name,
     baselineName: draft.baselineName,
@@ -292,27 +331,52 @@ function RunStep() {
       schema: draft.sources.schema ? sourcePayload(draft.sources.schema) : undefined,
     },
     mapping: draft.mapping,
-    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance, keys, fields, formats, caseInsensitive }) => ({ pointer, kind, tolerance, keys, fields, formats, caseInsensitive })),
+    rules: draft.rules.filter((rule) => rule.enabled).map(({ pointer, kind, tolerance, keys, fields, keyFields, arrayFields, formats, caseInsensitive }) => ({
+      pointer, kind, tolerance,
+      keys: keyFields?.join(",") || keys,
+      fields: arrayFields?.map((field) => `${field.pointer}:${field.kind === "decimal_tolerance" ? `decimal_tolerance:${field.tolerance ?? "0.01"}` : field.kind}`).join(",") || fields,
+      formats, caseInsensitive,
+    })),
     gateMode: draft.gateMode,
     minCases: draft.minCases,
     financialInvariants: draft.financialInvariants,
-  }), [draft]);
-  const run = useMutation({ mutationFn: () => runComparison(request), onSuccess: (result) => {
-    setResult(result);
-    window.setTimeout(() => void navigate({ to: "/runs/$runId", params: { runId: result.runId } }), 450);
-  }});
-  useEffect(() => { if (run.isIdle) run.mutate(); }, [run]);
+    });
+  }, [draft]);
+  const create = useMutation({
+    mutationFn: () => request ? createComparisonJob(request) : Promise.reject(new Error("The saved comparison sources are not available.")),
+    onSuccess: async (createdJob) => { await updateDraftAndPersist({ activeJobId: createdJob.jobId }); },
+  });
+  const job = useQuery({ queryKey: ["comparison-job", draft.activeJobId], queryFn: () => getComparisonJob(draft.activeJobId!), enabled: Boolean(draft.activeJobId), refetchInterval: (query) => ["queued", "running"].includes(query.state.data?.status ?? "") ? 300 : false });
+  const cancel = useMutation({ mutationFn: () => cancelComparisonJob(draft.activeJobId!), onSuccess: () => void job.refetch() });
+  const resume = useMutation({ mutationFn: () => resumeComparisonJob(draft.activeJobId!), onSuccess: async (next) => { await updateDraftAndPersist({ activeJobId: next.jobId }); } });
+  useEffect(() => { if (request && !draft.activeJobId && create.isIdle) create.mutate(); }, [create, draft.activeJobId, request]);
+  useEffect(() => {
+    const runId = job.data?.status === "complete" ? job.data.runId : null;
+    if (!runId) return;
+    void getRun(runId).then((result) => { setResult(result); updateDraft({ activeJobId: undefined }); void navigate({ to: "/runs/$runId", params: { runId } }); });
+  }, [job.data?.runId, job.data?.status, navigate, setResult, updateDraft]);
+  const progress = job.data ? Math.round(job.data.completed / Math.max(1, job.data.total) * 100) : 0;
+  const terminalError = create.error ?? job.error;
+  const active = !job.data || ["queued", "running"].includes(job.data.status);
+  if (!request && draftStatus === "loading") return <div className="run-screen"><Card className="run-progress"><Skeleton /><Skeleton width="70%" /></Card></div>;
+  if (!request) return <div className="run-screen"><InlineNotice tone="danger" title="Comparison sources are unavailable">Return to the first step and attach the dataset, baseline, and candidate sources before running.</InlineNotice></div>;
   return (
     <div className="run-screen">
       <PageHeader eyebrow="Step 6 of 6" title={`Comparing ${draft.sources.dataset?.rows ?? 0} cases`} description="Baseline and candidate outputs are loaded. The Rust engine is building verified paired evidence." />
       <Card className="run-progress">
-        <div className="progress-head"><div><LoaderCircle className={run.isPending ? "spin" : ""} /><span><strong>{run.isError ? "Comparison stopped" : run.isSuccess ? "Artifacts verified" : "Comparison running"}</strong><small>{run.isError ? "No decision was produced." : "No network calls or telemetry."}</small></span></div><Status tone={run.isError ? "fail" : run.isSuccess ? "pass" : "working"} label={run.isError ? "Run error" : run.isSuccess ? "Complete" : "In progress"} /></div>
-        {run.isPending && <InlineNotice title="Synchronous local evaluation"><span>The Rust engine is working as one bounded operation. This workflow does not claim fabricated stage progress and cannot be cancelled safely after execution begins.</span></InlineNotice>}
+        <div className="progress-head"><div><LoaderCircle className={active ? "spin" : ""} /><span><strong>{job.data?.status === "failed" ? "Comparison stopped" : job.data?.status === "cancelled" ? "Comparison cancelled" : job.data?.status === "interrupted" ? "Comparison interrupted" : job.data?.status === "complete" ? "Artifacts verified" : "Comparison running"}</strong><small>{job.data ? stageLabel(job.data.stage) : "Starting an isolated local job…"}</small></span></div><Status tone={job.data?.status === "complete" ? "pass" : ["failed", "cancelled", "interrupted"].includes(job.data?.status ?? "") ? "fail" : "working"} label={job.data?.status ?? "Starting"} /></div>
+        <div className="progress-line" aria-label={`${progress}% complete`}><span style={{ width: `${progress}%` }} /></div>
+        {job.data && <div className="job-progress-meta"><span><strong>{job.data.completed.toLocaleString()}</strong> / {job.data.total.toLocaleString()} work units</span><code>{job.data.jobId}</code></div>}
+        {job.data?.events.length ? <ol className="stage-list">{job.data.events.map((event, index) => <li className={index === job.data!.events.length - 1 && active ? "active" : "complete"} key={`${event.stage}:${event.at}:${index}`}><span>{index + 1}</span><strong>{stageLabel(event.stage)}</strong><small>{new Date(event.at * 1000).toLocaleTimeString()}</small></li>)}</ol> : null}
+        {active && draft.activeJobId && <div className="job-actions"><Button variant="secondary" icon={XCircle} onClick={() => cancel.mutate()} disabled={cancel.isPending}>{cancel.isPending ? "Requesting cancellation…" : "Cancel safely"}</Button><small>Reload-safe. Cancellation occurs at the next engine checkpoint.</small></div>}
       </Card>
-      {run.isError && <InlineNotice tone="danger" title="StructTrace could not complete this comparison"><p>{run.error.message}</p><Button variant="secondary" onClick={() => run.mutate()}>Try again</Button></InlineNotice>}
+      {terminalError && <InlineNotice tone="danger" title="StructTrace could not start this comparison"><p>{terminalError.message}</p><Button variant="secondary" onClick={() => create.mutate()}>Try again</Button></InlineNotice>}
+      {job.data && ["failed", "cancelled", "interrupted"].includes(job.data.status) && <InlineNotice tone="danger" title="No decision was produced"><p>{job.data.message}</p><Button variant="secondary" onClick={() => resume.mutate()} disabled={resume.isPending}>{resume.isPending ? "Resuming…" : "Resume from retained sources"}</Button></InlineNotice>}
     </div>
   );
 }
+
+function stageLabel(stage: string) { return ({ queued: "Waiting for the local engine", preparing_project: "Preparing the reproducible project", normalizing_sources: "Strictly validating and normalizing sources", validating_configuration: "Validating configuration and release policy", loading_inputs: "Loading hash-bound inputs", evaluating_cases: "Evaluating matched cases", analyzing_evidence: "Computing paired evidence", writing_artifacts: "Writing and verifying immutable artifacts", complete: "Comparison complete", cancelling: "Stopping at a safe boundary", cancelled: "Cancelled safely", interrupted: "Interrupted", failed: "Comparison failed" } as Record<string, string>)[stage] ?? stage.replaceAll("_", " "); }
 
 function sourcePayload(source: SourceArtifact) {
   return { sourceId: source.sourceId };

@@ -1,6 +1,6 @@
 # Configuration and artifact migration
 
-StructTrace configuration version 3 and artifact version 9 introduce explicit structural,
+StructTrace configuration version 3 and artifact versions 9 and 10 introduce explicit structural,
 semantic, and deployment-success results. They also change the complete-denominator paired metric
 and release-gate inputs. Old completed runs are therefore never silently reinterpreted.
 
@@ -31,10 +31,15 @@ protection are rejected.
 
 ## Existing runs
 
+Artifact version 10 replaces the ambiguous case-level `transition` string with typed
+`deployment_transition` and optional `semantic_transition` fields. Replay recomputes and verifies
+both. Version 9 runs remain readable only as historical evidence and must be regenerated before
+they can be replay-verified or promoted under version 10 semantics.
+
 Artifact versions before 9 cannot be promoted in place because retained data may not prove the new
 deployment-success and retention-invariance semantics. Keep them as historical evidence and rerun
 the comparison from the original dataset, schema, configuration, baseline, and candidate inputs.
 Replay refuses unsupported artifact versions rather than guessing.
 
 SQLite metadata upgrades to version 5 when a compatible run store is opened. This metadata update
-does not convert an older portable artifact into artifact version 9.
+does not convert an older portable artifact into artifact version 10.

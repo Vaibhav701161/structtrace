@@ -14,6 +14,7 @@ pub mod storage;
 
 pub use configured::{resume_configured, run_configured};
 pub use recorded::{
-    CompletedRun, run_recorded, run_recorded_with_config, run_recorded_with_config_kind,
+    CompletedRun, RunProgress, run_recorded, run_recorded_observed, run_recorded_with_config,
+    run_recorded_with_config_kind,
 };
 pub use replay::{ReplayReport, replay_run};

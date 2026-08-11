@@ -5,6 +5,18 @@ here.
 
 ## Unreleased
 
+- Advance portable artifacts to version 10. Store typed deployment and semantic transitions,
+  verify both during replay, and reject silent reinterpretation of version 9 case evidence.
+- Enforce identical per-case output ceilings for recorded and live adapters, require explicit
+  caller-schema provenance for release authority, and honor mapped error/missing status before
+  requiring an output.
+- Add persistent local comparison jobs with real engine progress, safe-boundary cancellation,
+  reload recovery, resume, and event history; align the visual product and engine at a documented
+  32 MiB source envelope.
+- Replace keyed-array mini-language inputs with a visual item-role builder and add keyed-array-aware
+  structured case diffs, unified/side-by-side investigation, denominator-explicit evidence charts,
+  and a complete saved-project CI export.
+
 - Add `structtrace open`, a capability-protected local browser product with visual recorded-output
   import, field mapping, deterministic correctness setup, evidence authority, real Rust-engine
   execution, paired results, virtualized case inspection, local drafts, and safe CI generation.

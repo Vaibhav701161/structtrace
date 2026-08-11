@@ -117,8 +117,8 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_config_bytes: 1024 * 1024,
-            max_dataset_bytes: 256 * 1024 * 1024,
-            max_recorded_output_bytes: 512 * 1024 * 1024,
+            max_dataset_bytes: 32 * 1024 * 1024,
+            max_recorded_output_bytes: 32 * 1024 * 1024,
             max_schema_bytes: 16 * 1024 * 1024,
             max_cases: 10_000,
             max_jsonl_line_bytes: 16 * 1024 * 1024,
@@ -301,6 +301,20 @@ impl Default for DatasetFields {
 pub struct SchemaConfig {
     /// Schema path.
     pub path: PathBuf,
+    /// Authority of the schema used for structural validity and release decisions.
+    #[serde(default)]
+    pub provenance: SchemaProvenance,
+}
+
+/// Provenance of the output-validation schema.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaProvenance {
+    /// An application owner supplied the caller-facing contract.
+    #[default]
+    CallerSupplied,
+    /// StructTrace inferred a diagnostic shape from expected values.
+    InferredExpectedShape,
 }
 
 /// Baseline or candidate execution source.
@@ -1129,6 +1143,14 @@ impl Config {
             }
         }
         validate_gate(&config.gate)?;
+        if config.gate.mode == GateMode::Release
+            && config.schema.provenance != SchemaProvenance::CallerSupplied
+        {
+            return Err(CoreError::Configuration(
+                "gate release mode requires a caller-supplied output schema; inferred expected-output shapes are diagnostic only"
+                    .to_owned(),
+            ));
+        }
         const REPORT_FILTERS: &[&str] = &[
             "all",
             "discordant",
@@ -1869,6 +1891,7 @@ mod tests {
             },
             schema: SchemaConfig {
                 path: "schema.json".into(),
+                provenance: SchemaProvenance::CallerSupplied,
             },
             variants: BTreeMap::from([
                 (
@@ -2320,6 +2343,19 @@ mod tests {
         config.gate.min_candidate_schema_validity = Some(1.0);
         config.gate.max_candidate_valid_but_wrong_rate = Some(0.02);
         Config::validate(config).unwrap();
+    }
+
+    #[test]
+    fn release_mode_refuses_inferred_schema_provenance() {
+        let mut config = minimal();
+        config.gate = regression_gate(GateMode::Release);
+        config.gate.min_candidate_deployment_success_rate = Some(0.95);
+        config.gate.min_candidate_parse_validity = Some(1.0);
+        config.gate.min_candidate_schema_validity = Some(1.0);
+        config.gate.max_candidate_valid_but_wrong_rate = Some(0.02);
+        config.schema.provenance = SchemaProvenance::InferredExpectedShape;
+        let error = Config::validate(config).unwrap_err().to_string();
+        assert!(error.contains("requires a caller-supplied output schema"));
     }
 
     #[test]

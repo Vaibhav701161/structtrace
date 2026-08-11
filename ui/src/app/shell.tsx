@@ -25,12 +25,12 @@ const navigation = [
   { to: "/runs", label: "Comparisons", icon: History },
   { to: "/projects", label: "Projects", icon: FolderOpen },
   { to: "/regressions", label: "Saved cases", icon: Activity },
-  { to: "/ci", label: "CI starter", icon: GitPullRequest },
+  { to: "/ci", label: "CI export", icon: GitPullRequest },
 ] as const;
 const commands = [
   { label: "New comparison", detail: "Compare baseline and candidate outputs", to: "/new/source", icon: Plus },
   { label: "Open comparisons", detail: "Review immutable evidence", to: "/runs", icon: History },
-  { label: "Generate CI starter", detail: "Create a reviewed integration template", to: "/ci", icon: Braces },
+  { label: "Export CI project", detail: "Create a complete pinned integration snapshot", to: "/ci", icon: Braces },
 ] as const;
 
 export function Shell() {

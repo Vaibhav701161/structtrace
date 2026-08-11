@@ -48,8 +48,8 @@
       "additionalProperties": false,
       "properties": {
         "max_config_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 1048576},
-        "max_dataset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824, "default": 268435456},
-        "max_recorded_output_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 536870912},
+        "max_dataset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824, "default": 33554432},
+        "max_recorded_output_bytes": {"type": "integer", "minimum": 1, "maximum": 2147483648, "default": 33554432},
         "max_schema_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
         "max_cases": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 10000},
         "max_jsonl_line_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 16777216},
@@ -76,7 +76,10 @@
       "type": "object",
       "required": ["path"],
       "additionalProperties": false,
-      "properties": {"path": {"type": "string", "minLength": 1}}
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "provenance": {"enum": ["caller_supplied", "inferred_expected_shape"], "default": "caller_supplied"}
+      }
     },
     "variants": {
       "type": "object",

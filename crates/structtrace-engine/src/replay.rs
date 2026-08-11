@@ -13,7 +13,9 @@ use structtrace_adapters::evaluator::{
 };
 use structtrace_core::{
     ARTIFACT_FORMAT_VERSION,
-    artifact::{ExternalEvaluatorReceipt, PairedCaseRecord, RunManifest, RunSummary},
+    artifact::{
+        ExternalEvaluatorReceipt, PairedCaseRecord, PairedTransition, RunManifest, RunSummary,
+    },
     config::Config,
     dataset::Dataset,
     evaluation::{CaseEvaluation, EvaluatorResult, compile_schema, evaluate_case_with_external},
@@ -297,11 +299,28 @@ pub fn replay_run(run_dir: &Path) -> anyhow::Result<ReplayReport> {
                 replayed: candidate.clone(),
             });
         }
+        let deployment_transition =
+            PairedTransition::from_bools(baseline.deployment_success, candidate.deployment_success);
+        let semantic_transition =
+            semantic_transition(&baseline, &candidate, &config.analysis.primary_outcome);
+        if record.deployment_transition != deployment_transition {
+            cross_artifact_mismatches.push(format!(
+                "case {} retained deployment transition {:?} does not match replayed {:?}",
+                case.id, record.deployment_transition, deployment_transition
+            ));
+        }
+        if record.semantic_transition != semantic_transition {
+            cross_artifact_mismatches.push(format!(
+                "case {} retained semantic transition {:?} does not match replayed {:?}",
+                case.id, record.semantic_transition, semantic_transition
+            ));
+        }
         replayed_records.push(PairedCaseRecord {
             case: case.clone(),
             baseline_output: baseline_output.clone(),
             candidate_output: candidate_output.clone(),
-            transition: transition_name(baseline.primary_pass, candidate.primary_pass).to_owned(),
+            deployment_transition,
+            semantic_transition,
             baseline_evaluation: baseline,
             candidate_evaluation: candidate,
         });
@@ -510,13 +529,15 @@ fn safe_artifact_path(run_dir: &Path, relative: &str) -> anyhow::Result<std::pat
     Ok(canonical)
 }
 
-fn transition_name(baseline: bool, candidate: bool) -> &'static str {
-    match (baseline, candidate) {
-        (true, true) => "both_pass",
-        (true, false) => "baseline_only_pass",
-        (false, true) => "candidate_only_pass",
-        (false, false) => "both_fail",
-    }
+fn semantic_transition(
+    baseline: &CaseEvaluation,
+    candidate: &CaseEvaluation,
+    primary_outcome: &str,
+) -> Option<PairedTransition> {
+    let baseline_outcome = baseline.outcomes.get(primary_outcome)?;
+    let candidate_outcome = candidate.outcomes.get(primary_outcome)?;
+    (baseline_outcome.fully_evaluated && candidate_outcome.fully_evaluated)
+        .then(|| PairedTransition::from_bools(baseline.primary_pass, candidate.primary_pass))
 }
 
 #[cfg(test)]
@@ -671,6 +692,45 @@ analysis:
         assert!(replay.cross_artifact_mismatches.iter().any(|item| {
             item.contains("candidate differs between inputs/candidate.jsonl and cases.jsonl")
         }));
+    }
+
+    #[test]
+    fn replay_detects_retained_transition_tampering_after_rehash() {
+        let (_root, run_dir) = completed_run();
+        let cases_path = run_dir.join("cases.jsonl");
+        let mut records: Vec<PairedCaseRecord> =
+            read_jsonl_bounded(&cases_path, 64 * 1024 * 1024, 16 * 1024 * 1024, 10).unwrap();
+        records[0].deployment_transition = PairedTransition::BothFail;
+        records[0].semantic_transition = Some(PairedTransition::BothFail);
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&cases_path, bytes).unwrap();
+        let digest = hash_file(&cases_path).unwrap();
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: RunManifest = read_json(&manifest_path).unwrap();
+        manifest.artifacts.insert("cases.jsonl".to_owned(), digest);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let replay = replay_run(&run_dir).unwrap();
+        assert!(!replay.verified);
+        assert!(
+            replay
+                .cross_artifact_mismatches
+                .iter()
+                .any(|message| { message.contains("retained deployment transition") })
+        );
+        assert!(
+            replay
+                .cross_artifact_mismatches
+                .iter()
+                .any(|message| { message.contains("retained semantic transition") })
+        );
     }
 
     #[test]

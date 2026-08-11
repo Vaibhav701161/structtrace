@@ -972,8 +972,8 @@ storage:
 
 limits:
   max_config_bytes: 1048576
-  max_dataset_bytes: 268435456
-  max_recorded_output_bytes: 536870912
+  max_dataset_bytes: 33554432
+  max_recorded_output_bytes: 33554432
   max_schema_bytes: 16777216
   max_cases: 10000
   max_jsonl_line_bytes: 16777216

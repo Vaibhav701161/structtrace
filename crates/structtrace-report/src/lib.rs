@@ -1631,9 +1631,10 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
             "rendered_prompt",
         );
     }
-    let mut filters = vec![record.transition.clone()];
+    let deployment_transition = record.deployment_transition.as_str();
+    let mut filters = vec![deployment_transition.to_owned()];
     if matches!(
-        record.transition.as_str(),
+        deployment_transition,
         "baseline_only_pass" | "candidate_only_pass"
     ) {
         filters.push("discordant".to_owned());
@@ -1710,7 +1711,7 @@ fn case_view(record: &PairedCaseRecord, config: &Config) -> anyhow::Result<CaseV
             .unwrap_or(REDACTION_MARKER)
             .to_owned(),
         transition: redacted_value
-            .pointer("/transition")
+            .pointer("/deployment_transition")
             .and_then(Value::as_str)
             .unwrap_or(REDACTION_MARKER)
             .replace('_', " "),
@@ -2103,7 +2104,8 @@ mod tests {
             candidate_output: output,
             baseline_evaluation: evaluation.clone(),
             candidate_evaluation: evaluation,
-            transition: "both_pass".to_owned(),
+            deployment_transition: structtrace_core::artifact::PairedTransition::BothPass,
+            semantic_transition: Some(structtrace_core::artifact::PairedTransition::BothPass),
         }
     }
 
@@ -2520,7 +2522,8 @@ mod tests {
             candidate_output: output,
             baseline_evaluation: evaluation.clone(),
             candidate_evaluation: evaluation,
-            transition: "both_pass".to_owned(),
+            deployment_transition: structtrace_core::artifact::PairedTransition::BothPass,
+            semantic_transition: Some(structtrace_core::artifact::PairedTransition::BothPass),
         };
         let view = case_view(&record, &config).unwrap();
         let serialized = serde_json::to_string(&view).unwrap();

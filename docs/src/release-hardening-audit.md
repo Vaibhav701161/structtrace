@@ -25,12 +25,12 @@ policies, and uploads commit-bound acceptance evidence from CI.
 | Format | Current version | Reason |
 |---|---:|---|
 | Configuration | 3 | Safe release profile and deployment rules |
-| Portable artifact | 9 | Explicit success types, parse receipts, and provenance |
+| Portable artifact | 10 | Explicit success types, schema provenance, and typed deployment/semantic transitions |
 | Report data | 4 | Deployment and semantic denominators are separate |
-| SQLite metadata | 5 | Binds stored evaluation JSON to artifact v9 semantics |
+| SQLite metadata | 5 | Binds stored evaluation JSON to versioned artifact semantics |
 | Command/evaluator protocol | 3 | Unchanged in this hardening pass |
 
-Artifact versions before 9 are historical evidence. They must be rerun from original inputs and
+Artifact versions before 10 are historical evidence. They must be rerun from original inputs and
 are never silently upgraded to the new decision semantics.
 
 ## Still requires non-local evidence
