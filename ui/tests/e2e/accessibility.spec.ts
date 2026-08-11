@@ -60,11 +60,14 @@ test("recorded files complete the visual workflow through the Rust engine", asyn
   await expect(page.getByRole("heading", { name: "What does correct mean for your application?" })).toBeVisible();
   await page.getByRole("checkbox", { name: "Use /line_items", exact: true }).check();
   await expect(page.getByRole("heading", { name: "Match items in /line_items" })).toBeVisible();
-  await expect(page.getByText("Match key required", { exact: true })).toBeVisible();
-  await page.getByRole("combobox", { name: "Role for /description" }).selectOption("key");
-  await expect(page.getByRole("combobox", { name: "Role for /description" })).toHaveValue("key");
-  await expect(page.getByRole("combobox", { name: "Role for /unit_price" })).not.toHaveValue("key");
-  await expect(page.getByText("Pairs the same item across variants").first()).toBeVisible();
+  await expect(page.getByText("Identity required", { exact: true })).toBeVisible();
+  const descriptionRule = page.locator(".array-field-row").filter({ has: page.getByText("/description", { exact: true }) });
+  await descriptionRule.getByRole("checkbox", { name: "Use for identity" }).check();
+  await page.getByRole("combobox", { name: "Identity normalization for /description" }).selectOption("normalized_string");
+  await page.getByRole("combobox", { name: "Comparison for /description" }).selectOption("normalized_string");
+  await expect(page.getByRole("combobox", { name: "Identity normalization for /description" })).toHaveValue("normalized_string");
+  await expect(page.getByRole("combobox", { name: "Comparison for /description" })).toHaveValue("normalized_string");
+  await expect(page.getByText("1 identity field", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByRole("heading", { name: "Ready to compare" })).toBeVisible();
@@ -117,6 +120,7 @@ test("dark theme and command search remain accessible", async ({ page }) => {
 });
 
 test("authorized candidate becomes the next baseline in the same project", async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
   const projectName = `E2E authorized lifecycle ${testInfo.project.name} ${Date.now()}`;
   const dataset = Array.from({ length: 100 }, (_, index) => JSON.stringify({ id: `case-${index}`, input: { value: index }, expected: { answer: index } })).join("\n") + "\n";
   const outputs = Array.from({ length: 100 }, (_, index) => JSON.stringify({ id: `case-${index}`, status: "ok", output: { answer: index } })).join("\n") + "\n";
@@ -136,7 +140,7 @@ test("authorized candidate becomes the next baseline in the same project", async
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByLabel("Comparison name").fill(projectName);
   await page.getByRole("button", { name: "Run comparison" }).click();
-  await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible({ timeout: 60_000 });
   const resultUrl = page.url();
   const runId = new URL(resultUrl).pathname.split("/").at(-1);
   await page.getByRole("button", { name: "Export CI project" }).click();

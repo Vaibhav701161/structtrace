@@ -2757,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_decimal_is_not_a_semantic_failure() {
+    fn out_of_range_output_decimal_is_a_candidate_failure() {
         let result = evaluate_numeric(
             "decimal",
             &json!({"value": "9999999999999999999999999999999999999999"}),
@@ -2768,7 +2768,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(result.status, EvaluationStatus::Error);
+        assert_eq!(result.status, EvaluationStatus::Failed);
     }
 
     #[test]

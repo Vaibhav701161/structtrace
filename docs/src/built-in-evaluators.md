@@ -17,10 +17,10 @@
 
 Numeric evaluation does not round through binary floating point. Arbitrary-length integer text is
 normalized exactly. Decimal comparison uses a bounded 96-bit coefficient with up to 28 fractional
-digits. Plain decimal and scientific notation are accepted only when conversion is exact. A valid
-numeric lexeme outside that range produces evaluator `error` and remains not fully evaluated; it
-is never labelled as a wrong model answer. Missing expected values or malformed references also
-produce explicit evaluator errors.
+digits. Plain decimal and scientific notation are accepted only when conversion is exact. An
+expected numeric reference outside that range produces evaluator `error` and remains not fully
+evaluated. An output value outside the declared numeric contract is a candidate failure. Missing
+expected values or malformed references also produce explicit evaluator errors.
 
 For invoice line items, `fields` makes item diagnosis practical instead of comparing the whole
 object byte-for-byte. Every failed field is attributed to its concrete array index and pointer;
