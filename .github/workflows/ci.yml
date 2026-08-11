@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  research-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - id: provenance
+        name: Read pinned research revision
+        shell: bash
+        run: |
+          commit="$(python3 -c 'import json; print(json.load(open("provenance/research-foundation.json"))["source_commit"])')"
+          echo "source_commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: Vaibhav701161/constrained-senstivity-lab
+          ref: ${{ steps.provenance.outputs.source_commit }}
+          path: research-source
+      - name: Verify accepted research artifacts
+        run: python3 scripts/verify-research-provenance.py provenance/research-foundation.json research-source
+
   local-ui:
     runs-on: ubuntu-latest
     steps:

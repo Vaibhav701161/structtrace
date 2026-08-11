@@ -99,8 +99,11 @@ The Projects screen reopens the saved wizard policy, persists name changes, dupl
 under a new identity, and moves archived projects to `.structtrace/ui/archived-projects/` rather
 than deleting them. A new comparison always receives a new project identity.
 
-Saved cases are local bookmarks and are deliberately not described as a regression suite. The CI
-screen exports a complete runnable snapshot of the saved project: full configuration and evaluator
+Saved cases form a recurring local regression suite. Every completed candidate for the same project
+reevaluates each pinned case and records whether it is passing, fixed, still broken, reintroduced,
+or missing. Still-broken, reintroduced, and missing cases block baseline promotion and release-mode
+CI export; the generated workflow checks the same required case IDs against its newly produced run.
+The CI screen exports a complete runnable snapshot of the saved project: full configuration and evaluator
 definitions, golden/baseline/candidate sources, caller schema, commit-pinned StructTrace install,
 authority-safe command, required-input checks, evidence upload, and integration instructions. The
 application-specific candidate generation step remains caller-owned and is named explicitly rather

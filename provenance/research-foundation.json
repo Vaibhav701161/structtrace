@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "source_repository": "https://github.com/Vaibhav701161/constrained-senstivity-lab",
+  "source_commit": "ac461b9fcf6a31df614fd3c540cc3458bc49d10e",
+  "relationship": "StructTrace product requirements derived from accepted contract-sensitivity evidence",
+  "artifacts": [
+    {
+      "study": "corrected_qwen_replication",
+      "path": "experiments/corrected-replication/results/qwen2.5-7b-corrected/paired-summary-exact.json",
+      "sha256": "a70eef40ffb89c2b522b0cf5f37526e0c059b171114b960b4ff3d6edc68ead6f"
+    },
+    {
+      "study": "canonical_llama_replication",
+      "path": "experiments/canonical-schema-equivalence-correction/paired-summary.json",
+      "sha256": "5eff7851f04989bcb22e239c49258fce72fd4053132505230d8bb56a43d05828"
+    },
+    {
+      "study": "executable_tool_call_gate",
+      "path": "experiments/tool-call-gate/paired-summary.json",
+      "sha256": "adbb8e0032cd137e208132e96d504b7b1085f89bb3daf928f6bbcb80a70acba5"
+    }
+  ],
+  "claim_boundary": "The studies motivate paired measurement and fail-closed evaluation. They do not establish a universally beneficial schema transformation."
+}

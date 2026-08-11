@@ -18,6 +18,13 @@ The primary human workflow is now a local browser product backed by that same Ru
 structtrace open
 ```
 
+## Product walkthrough
+
+**[Watch the 71-second StructTrace product demo](media/structtrace-product-demo.mp4)**
+
+The recording shows the real local application and evidence workflow. It is an H.264/AAC MP4,
+2560 by 1440, committed with the repository so the demo does not depend on an external video host.
+
 Drop golden, baseline, and candidate JSONL, JSON, or CSV files; confirm mappings visually; select
 deterministic correctness rules; choose the authority of the evidence; and inspect the exact paired
 regressions. StructTrace generates a reproducible local project; its CI screen emits a reviewable
@@ -30,7 +37,9 @@ opaque IDs, and verified against BLAKE3 digests before use. Autosaved drafts con
 mapping policy, not repeated copies of full source contents. A stable project identity retains
 immutable earlier runs when the same setup is evaluated again. Runs created directly in a project
 with `structtrace --project-root <folder> open` appear in the same comparison history. “Saved cases”
-are review bookmarks only; the UI does not market them as an enforced regression suite.
+form a recurring regression suite. Future candidates automatically label each pin as passing,
+fixed, still broken, reintroduced, or missing; unresolved pins block baseline promotion and
+release-mode CI export.
 An authorizing Release result can promote its exact candidate bytes into the next comparison;
 the project records the source run, manifest hash, staged-source hash, and visible baseline provenance.
 Non-authorizing runs have no promotion action or hidden override.
@@ -54,6 +63,31 @@ The execution boundary is deliberate: adapters receive an opaque transport token
 explicitly model-visible metadata, but never the dataset ID, golden `expected` value, or
 evaluation-only metadata. OpenAI prompt templates receive no identifier. Only the evaluation
 engine retains the token-to-dataset-ID mapping and can access labels.
+
+## From Constrained Sensitivity Lab to StructTrace
+
+StructTrace is the product consequence of the
+[Constrained Sensitivity Lab](https://github.com/Vaibhav701161/constrained-senstivity-lab), not an
+unrelated dashboard added after the research. The lab tested how model-facing structured-output
+contracts change semantic behavior while the external caller contract stays fixed.
+
+The evidence chain produced three requirements that define this product:
+
+| Research finding | Product decision |
+|---|---|
+| Schema validity can reach 100% while task correctness falls | Report strict JSON, schema validity, semantic correctness, and valid-but-wrong separately |
+| Field order and representation can change paired answers | Compare baseline and candidate on identical case IDs and show every repair and regression |
+| A positive Qwen estimate reversed on canonical Llama and did not help the executable pilot | Never ship a universal schema optimizer; make teams measure their own workload and preserve uncertainty |
+| Errors, cap hits, and invalid outputs changed conclusions when omitted | Keep every known case in the deployment denominator and fail closed on evaluator uncertainty |
+
+The accepted source studies are the
+[corrected Qwen result](https://github.com/Vaibhav701161/constrained-senstivity-lab/blob/master/experiments/corrected-replication/results/qwen2.5-7b-corrected/paired-summary-exact.json),
+[canonical Llama correction](https://github.com/Vaibhav701161/constrained-senstivity-lab/blob/master/experiments/canonical-schema-equivalence-correction/paired-summary.json),
+and [executable tool-call gate](https://github.com/Vaibhav701161/constrained-senstivity-lab/blob/master/experiments/tool-call-gate/paired-summary.json).
+Their source commit and SHA-256 digests are pinned in
+[`provenance/research-foundation.json`](provenance/research-foundation.json). Read the
+[full research-to-product lineage](docs/src/research-foundation.md) for claim boundaries and the
+difference between normalized demonstration fixtures and raw research artifacts.
 
 ## Hero workflow: invoice extraction migration
 
