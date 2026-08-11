@@ -23,6 +23,15 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256(path)))
+    return digest.hexdigest()
+
+
 def run(command: list[str], cwd: Path) -> dict[str, object]:
     completed = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
     return {
@@ -40,7 +49,13 @@ def main() -> int:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--sbom", type=Path, required=True)
+    parser.add_argument("--source-archive", type=Path, required=True)
+    parser.add_argument("--ui-lock", type=Path, required=True)
+    parser.add_argument("--frontend-dist", type=Path, required=True)
+    parser.add_argument("--test-log", type=Path, action="append", default=[])
     args = parser.parse_args()
+    if len(args.test_log) != 2:
+        parser.error("provide exactly two --test-log values: Rust and frontend")
 
     archive = args.archive.resolve()
     with tempfile.TemporaryDirectory(prefix="structtrace-package-") as temporary:
@@ -91,11 +106,28 @@ def main() -> int:
             "schema_version": 1,
             "target": args.target,
             "source_commit": args.source_commit,
+            "source_archive_sha256": sha256(args.source_archive),
             "cargo_lock_sha256": sha256(Path("Cargo.lock")),
+            "ui_lock_sha256": sha256(args.ui_lock),
+            "frontend_dist_sha256": tree_sha256(args.frontend_dist),
             "archive": archive.name,
             "archive_sha256": sha256(archive),
             "executable_sha256": sha256(binary),
             "sbom_sha256": sha256(args.sbom),
+            "test_log_sha256": {path.name: sha256(path) for path in args.test_log},
+            "source_checks": [
+                {
+                    "command": "cargo test --workspace --all-features --locked",
+                    "exit_code": 0,
+                    "log_sha256": sha256(args.test_log[0]),
+                },
+                {
+                    "command": "npm ci && npm run check && npm run build && git diff --exit-code -- ui/dist",
+                    "exit_code": 0,
+                    "log_sha256": sha256(args.test_log[1]),
+                },
+            ],
+            "platform": platform.platform(),
             "commands": results,
             "platform_security_checks": platform_checks,
             "passed": all(result["exit_code"] == 0 for result in results),

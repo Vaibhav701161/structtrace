@@ -7,6 +7,7 @@ pub mod config;
 pub mod dataset;
 pub mod error;
 pub mod evaluation;
+pub mod filesystem;
 pub mod gate;
 pub mod hashing;
 pub mod inspection;

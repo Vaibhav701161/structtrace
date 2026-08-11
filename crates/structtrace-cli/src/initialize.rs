@@ -464,7 +464,8 @@ pub fn initialize_from_outputs(options: FromOutputsOptions<'_>) -> anyhow::Resul
                         format!("keyed-array field `{field}` must use POINTER:EVALUATOR")
                     })?;
                     let value = match evaluator {
-                        "exact" | "normalized_string" | "exact_integer" | "canonical_date" => {
+                        "exact" | "normalized_string" | "exact_integer" | "decimal_exact"
+                        | "canonical_date" => {
                             json!({"pointer": field_pointer, "evaluator": evaluator})
                         }
                         value if value.starts_with("decimal_tolerance:") => json!({
@@ -792,14 +793,7 @@ pub fn initialize(destination: &Path, template: InitTemplate) -> anyhow::Result<
     ] {
         std::fs::create_dir_all(destination.join(directory))?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            destination.join(".structtrace"),
-            std::fs::Permissions::from_mode(0o700),
-        )?;
-    }
+    structtrace_core::filesystem::make_private_directory(&destination.join(".structtrace"))?;
     let project_name = destination
         .file_name()
         .and_then(|value| value.to_str())
@@ -1343,7 +1337,7 @@ mod tests {
             },
             correctness_pointers: &[],
             field_evaluators: &[],
-            keyed_arrays: &["/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/amount:decimal_tolerance:0.01".to_owned()],
+            keyed_arrays: &["/line_items=/sku;/description:normalized_string,/quantity:exact_integer,/unit_price:decimal_exact,/amount:decimal_tolerance:0.01".to_owned()],
             financial_invariants: true,
             exact_json: false,
             gate_mode: GateMode::Regression,
@@ -1355,6 +1349,19 @@ mod tests {
             evaluator.kind,
             structtrace_core::config::EvaluatorKind::KeyedArray { .. }
         )));
+        let keyed = config
+            .evaluators
+            .iter()
+            .find_map(|evaluator| match &evaluator.kind {
+                structtrace_core::config::EvaluatorKind::KeyedArray { fields, .. } => Some(fields),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            keyed.iter().any(|field| {
+                field.pointer == "/unit_price" && field.evaluator == "decimal_exact"
+            })
+        );
         assert!(config.evaluators.iter().any(|evaluator| matches!(
             evaluator.kind,
             structtrace_core::config::EvaluatorKind::FinancialInvariants { .. }

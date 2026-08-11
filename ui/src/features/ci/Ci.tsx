@@ -1,24 +1,34 @@
 import { useMutation } from "@tanstack/react-query";
 import { Braces, Check, Copy, FileCode2, Github, ShieldAlert, Terminal } from "lucide-react";
-import { useState } from "react";
-import { generateCi, getProjects } from "../../api/client";
+import { useEffect, useState } from "react";
+import { generateCi, getProjects, getRun } from "../../api/client";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Card, InlineNotice, PageHeader, Status } from "../../design-system/components";
-import { useWorkspace } from "../../state/workspace";
+import { useSearch } from "@tanstack/react-router";
 
 export function Ci() {
-  const { draft, result } = useWorkspace();
-  const [mode, setMode] = useState<"regression" | "release">(result?.summary.gate.gate_mode === "release" ? "release" : "regression");
+  const search = useSearch({ from: "/app/ci" });
+  const [mode, setMode] = useState<"regression" | "release">("regression");
   const [copied, setCopied] = useState("");
   const projects = useQuery({ queryKey: ["projects"], queryFn: getProjects });
-  const project = projects.data?.find((item) => item.projectId === draft.projectId);
-  const verified = project?.integrity.status === "verified";
-  const generated = useMutation({ mutationFn: () => generateCi(mode, draft.projectId) });
+  const selectedRun = useQuery({ queryKey: ["run", search.run], queryFn: () => getRun(search.run), enabled: Boolean(search.run) });
+  const project = projects.data?.find((item) => item.projectId === search.project);
+  const explicitTarget = Boolean(search.project && search.run);
+  const verified = explicitTarget
+    && project?.integrity.status === "verified"
+    && selectedRun.data?.integrity.status === "verified"
+    && selectedRun.data.projectId === search.project;
+  useEffect(() => {
+    if (selectedRun.data) {
+      setMode(selectedRun.data.summary.gate.gate_mode === "release" ? "release" : "regression");
+    }
+  }, [selectedRun.data, search.run]);
+  const generated = useMutation({ mutationFn: () => generateCi(mode, search.project, search.run) });
   const copy = async (label: string, value: string) => { await navigator.clipboard.writeText(value); setCopied(label); window.setTimeout(() => setCopied(""), 1500); };
   return (
     <div className="page page-wide">
       <PageHeader eyebrow="Automation" title="Export a reproducible CI project" description="Materialize the saved configuration, data contract, paired sources, pinned toolchain, safe gate, and immutable evidence upload." />
-      <InlineNotice tone={verified ? "success" : "danger"} title={verified ? "Committed project revision verified" : "CI authority unavailable"}>{project?.integrity.detail ?? "Run and verify a comparison before exporting an authoritative project revision."}{project?.revisionId && <> Revision <code>{project.revisionId}</code>.</>}</InlineNotice>
+      <InlineNotice tone={verified ? "success" : "danger"} title={verified ? "Explicit project and run verified" : "CI authority unavailable"}>{project?.integrity.detail ?? "Open a verified comparison and choose Export CI project so the route binds an explicit project and run."}{explicitTarget && <> Run <code>{search.run}</code>.</>}{project?.revisionId && <> Revision <code>{project.revisionId}</code>.</>}</InlineNotice>
       <div className="integration-grid">
         <button className="integration-card selected"><Github /><div><strong>GitHub Actions</strong><p>Complete project snapshot with a commit-pinned StructTrace install.</p><Status tone="pass" label="Runnable export" /></div></button>
         <button className="integration-card"><Terminal /><div><strong>Generic shell CI</strong><p>The generated config and authority-safe command are portable to any shell runner.</p><Status tone="info" label="Included" /></div></button>

@@ -29,6 +29,7 @@
 - [Release gates](release-gates.md)
 - [CI integration](ci-integration.md)
 - [Release-candidate validation](release-candidate-validation.md)
+- [Release signing and platform trust](release-signing.md)
 - [Release hardening audit](release-hardening-audit.md)
 - [Private alpha protocol](private-alpha-protocol.md)
 - [Design-partner onboarding](design-partner-onboarding.md)

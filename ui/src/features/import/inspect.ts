@@ -7,6 +7,7 @@ export function detectFormat(name: string, content: string): SourceArtifact["for
   const lower = name.toLowerCase();
   if (lower.endsWith(".csv")) return "csv";
   if (lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) return "jsonl";
+  if (lower.endsWith(".json")) return "json";
   const trimmed = content.trimStart();
   return trimmed.startsWith("[") ? "json" : "jsonl";
 }
@@ -108,7 +109,7 @@ export function pointerCandidates(rows: unknown[]): string[] {
 
 function outputValues(source: SourceArtifact | undefined, pointer: string): unknown[] {
   if (!source || source.status !== "ready") return [];
-  return (source.preview ?? parseRows(source.content, source.format)).map((row) => valueAt(row, pointer)).filter((value) => value !== undefined);
+  return (source.preview ?? (source.content ? parseRows(source.content, source.format) : [])).map((row) => valueAt(row, pointer)).filter((value) => value !== undefined);
 }
 
 function leafPointers(value: unknown, path = "", output = new Set<string>()): Set<string> {

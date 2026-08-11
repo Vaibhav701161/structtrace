@@ -650,7 +650,8 @@ pub enum EvaluatorKind {
 pub struct KeyedArrayField {
     /// Relative JSON Pointer within each item.
     pub pointer: String,
-    /// `exact`, `normalized_string`, `exact_integer`, `decimal_tolerance`, or `canonical_date`.
+    /// `exact`, `normalized_string`, `exact_integer`, `decimal_exact`,
+    /// `decimal_tolerance`, or `canonical_date`.
     pub evaluator: String,
     /// Absolute tolerance for `decimal_tolerance`.
     #[serde(default)]
@@ -1415,6 +1416,7 @@ fn validate_evaluator(id: &str, evaluator: &EvaluatorKind) -> Result<()> {
                     "exact"
                         | "normalized_string"
                         | "exact_integer"
+                        | "decimal_exact"
                         | "decimal_tolerance"
                         | "canonical_date"
                 ) {

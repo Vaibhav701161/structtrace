@@ -49,9 +49,10 @@ validation and must not be inferred from the generator benchmark.
 
 `scripts/measure-recorded-scale.py` deterministically generates 10,000 matched cases and measures
 the release binary through strict ingestion, schema validation, paired scoring, SQLite/artifact and
-report creation, followed by complete replay. The checked-in result records source sizes, generated
-artifact bytes, binary digest, command exit codes, wall time, and peak RSS when `/usr/bin/time` is
-available.
+report creation, followed by complete replay. It then starts the packaged local application and
+measures cheap history listing plus cold and warm indexed case search. The checked-in result records
+source sizes, generated artifact bytes, binary digest, command exit codes, wall time, and peak RSS
+when `/usr/bin/time` is available.
 
 ```bash
 cargo build --workspace --release --locked
@@ -62,6 +63,11 @@ python3 scripts/measure-recorded-scale.py \
 
 The default `limits.max_cases` is therefore 10,000. The compiled 100,000-case ceiling is an
 explicit opt-in boundary, not a measured promise.
+
+The `Exact-source scale validation` workflow runs the same measurement for a manually selected
+commit and every release tag. Its uploaded receipt must name the exact GitHub source SHA, a clean
+worktree, and `passed: true`; this avoids treating an older checked-in result as current-release
+proof.
 
 The clean-tree Linux x86-64 measurement for commit `0669ae9` completed the full 10,000-case run in
 135.54 seconds with 326,584 KiB peak RSS. Complete replay took 2.12 seconds with 288,544 KiB peak

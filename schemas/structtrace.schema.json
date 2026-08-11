@@ -295,7 +295,7 @@
       "allOf": [{"if": {"properties": {"evaluator": {"const": "canonical_date"}}}, "then": {"not": {"required": ["formats"], "properties": {"formats": {"allOf": [{"contains": {"const": "dmy_slash"}}, {"contains": {"const": "mdy_slash"}}]}}}}}],
       "properties": {
         "pointer": {"type": "string"},
-        "evaluator": {"enum": ["exact", "normalized_string", "exact_integer", "decimal_tolerance", "canonical_date"]},
+        "evaluator": {"enum": ["exact", "normalized_string", "exact_integer", "decimal_exact", "decimal_tolerance", "canonical_date"]},
         "absolute": {"type": ["string", "null"]},
         "case_insensitive": {"type": "boolean", "default": true},
         "formats": {"type": "array", "items": {"enum": ["iso", "dmy_slash", "mdy_slash"]}}

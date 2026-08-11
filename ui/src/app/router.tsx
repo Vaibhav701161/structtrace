@@ -22,7 +22,15 @@ const homeRoute = createRoute({ getParentRoute: () => appRoute, path: "/home", c
 const runsRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs", component: () => <SimplePage kind="runs" /> });
 const projectsRoute = createRoute({ getParentRoute: () => appRoute, path: "/projects", component: () => <SimplePage kind="projects" /> });
 const regressionsRoute = createRoute({ getParentRoute: () => appRoute, path: "/regressions", component: () => <SimplePage kind="regressions" /> });
-const ciRoute = createRoute({ getParentRoute: () => appRoute, path: "/ci", component: Ci });
+const ciRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/ci",
+  validateSearch: (search: Record<string, unknown>) => ({
+    project: typeof search.project === "string" ? search.project : "",
+    run: typeof search.run === "string" ? search.run : "",
+  }),
+  component: Ci,
+});
 const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: "/settings/$section", component: () => <SimplePage kind="settings" /> });
 const resultRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId", component: Results });
 const casesRoute = createRoute({ getParentRoute: () => appRoute, path: "/runs/$runId/cases", validateSearch: (search: Record<string, unknown>) => ({ search: typeof search.search === "string" ? search.search : "" }), component: Cases });

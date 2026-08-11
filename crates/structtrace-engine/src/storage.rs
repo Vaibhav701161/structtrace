@@ -258,28 +258,12 @@ impl RunStore {
     }
 }
 
-#[cfg(unix)]
 fn harden_directory_permissions(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    structtrace_core::filesystem::make_private_directory(path)
 }
 
-#[cfg(not(unix))]
-fn harden_directory_permissions(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn harden_file_permissions(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn harden_file_permissions(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+    structtrace_core::filesystem::make_private_file(path)
 }
 
 fn optional_json(value: Option<&serde_json::Value>) -> anyhow::Result<Option<String>> {

@@ -721,31 +721,8 @@ fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> anyhow::Result<
     Ok(())
 }
 
-#[cfg(unix)]
 fn harden_run_permissions(root: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fn visit(path: &Path) -> anyhow::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "run artifact must not be a symlink: {}",
-            path.display()
-        );
-        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                visit(&entry?.path())?;
-            }
-        }
-        Ok(())
-    }
-    visit(root)
-}
-
-#[cfg(not(unix))]
-fn harden_run_permissions(_root: &Path) -> anyhow::Result<()> {
-    Ok(())
+    structtrace_core::filesystem::make_private_tree(root)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1599,18 +1576,21 @@ fn matched_operational_summary(records: &[&PairedCaseRecord]) -> MatchedOperatio
         let baseline = cost_pairs
             .iter()
             .map(|(amount, _, _)| *amount)
-            .sum::<Decimal>()
-            / denominator;
+            .try_fold(Decimal::ZERO, |sum, amount| sum.checked_add(amount))
+            .and_then(|sum| sum.checked_div(denominator));
         let candidate = cost_pairs
             .iter()
             .map(|(_, amount, _)| *amount)
-            .sum::<Decimal>()
-            / denominator;
-        (
-            Some(baseline.normalize().to_string()),
-            Some(candidate.normalize().to_string()),
-            currencies.first().map(|value| (*value).to_owned()),
-        )
+            .try_fold(Decimal::ZERO, |sum, amount| sum.checked_add(amount))
+            .and_then(|sum| sum.checked_div(denominator));
+        match (baseline, candidate) {
+            (Some(baseline), Some(candidate)) => (
+                Some(baseline.normalize().to_string()),
+                Some(candidate.normalize().to_string()),
+                currencies.first().map(|value| (*value).to_owned()),
+            ),
+            _ => (None, None, None),
+        }
     } else {
         (None, None, None)
     };
@@ -1722,11 +1702,16 @@ fn variant_summary(
             .map(|cost| cost.amount.parse::<Decimal>())
             .collect::<Result<Vec<_>, _>>()
             .ok()
-            .map(|values| values.into_iter().sum::<Decimal>());
+            .and_then(|values| {
+                values
+                    .into_iter()
+                    .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(value))
+            });
         if let Some(total) = total {
             summary.operational.total_cost = Some(total.normalize().to_string());
             summary.operational.average_cost = Decimal::from_usize(costs.len())
-                .map(|count| (total / count).normalize().to_string());
+                .and_then(|count| total.checked_div(count))
+                .map(|average| average.normalize().to_string());
             summary.operational.currency = currencies.first().map(|value| (*value).to_owned());
         }
     }

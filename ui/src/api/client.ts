@@ -67,11 +67,15 @@ export async function retryComparisonJob(jobId: string) {
   return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST", body: "{}" }));
 }
 
-export async function stageSource(kind: SourceKind, source: SourceArtifact): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">> {
-  const staged = await request("/sources", {
+export async function stageSource(kind: SourceKind, file: File, format: SourceArtifact["format"]): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">> {
+  const parameters = new URLSearchParams({ kind, name: file.name, format });
+  const response = await fetch(`${appBase}/api/v1/sources?${parameters}`, {
     method: "POST",
-    body: JSON.stringify({ kind, file: { name: source.name, format: source.format, content: source.content } }),
-  }) as { sourceId: string; hash: string; bytes: number; rows: number; previewJson?: string[] };
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file,
+  });
+  const staged = await response.json().catch(() => ({ message: response.statusText })) as { sourceId: string; hash: string; bytes: number; rows: number; previewJson?: string[]; message?: string; code?: string };
+  if (!response.ok) throw new ApiError(staged.code ?? "source_staging_failed", staged.message ?? `Local API returned ${response.status}`, response.status);
   return { ...staged, preview: staged.previewJson?.map(strictJsonParse) };
 }
 
@@ -187,8 +191,8 @@ export async function deleteDraft() {
   await request("/comparisons/draft", { method: "DELETE" });
 }
 
-export async function generateCi(mode: "regression" | "release", projectId: string) {
-  return request("/ci/generate", { method: "POST", body: JSON.stringify({ mode, projectId }) }) as Promise<{
+export async function generateCi(mode: "regression" | "release", projectId: string, runId: string) {
+  return request("/ci/generate", { method: "POST", body: JSON.stringify({ mode, projectId, runId }) }) as Promise<{
     config: string;
     workflow: string;
     command: string;

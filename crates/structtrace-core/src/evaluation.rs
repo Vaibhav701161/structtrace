@@ -1074,15 +1074,36 @@ fn compare_keyed_field(
                         && canonical_integer(actual).is_some()
                 })
         }
-        "decimal_tolerance" => decimal_value(Some(actual))
-            .zip(decimal_value(Some(expected)))
-            .zip(
-                field
-                    .absolute
-                    .as_deref()
-                    .and_then(|value| Decimal::from_str(value).ok()),
-            )
-            .is_some_and(|((actual, expected), tolerance)| (actual - expected).abs() <= tolerance),
+        "decimal_exact" => {
+            let (Some(actual), Some(expected)) =
+                (decimal_value(Some(actual)), decimal_value(Some(expected)))
+            else {
+                return (
+                    EvaluationStatus::Error,
+                    "Item values could not be represented as exact decimals.",
+                );
+            };
+            actual == expected
+        }
+        "decimal_tolerance" => {
+            let (Some(actual), Some(expected), Some(tolerance)) = (
+                decimal_value(Some(actual)),
+                decimal_value(Some(expected)),
+                field.absolute.as_deref().and_then(parse_decimal_text),
+            ) else {
+                return (
+                    EvaluationStatus::Error,
+                    "Item values or tolerance could not be represented as exact decimals.",
+                );
+            };
+            let Some(difference) = actual.checked_sub(expected).map(|value| value.abs()) else {
+                return (
+                    EvaluationStatus::Error,
+                    "Decimal difference exceeded the exact decimal range.",
+                );
+            };
+            difference <= tolerance
+        }
         "canonical_date" => {
             actual
                 .as_str()
@@ -1167,9 +1188,9 @@ fn evaluate_financial_invariants(
     total_pointer: &str,
     absolute: &str,
 ) -> EvaluatorResult {
-    let tolerance = match Decimal::from_str(absolute) {
-        Ok(value) => value,
-        Err(_) => return EvaluatorResult::error(id, "financial tolerance is invalid"),
+    let tolerance = match parse_decimal_text(absolute) {
+        Some(value) => value,
+        None => return EvaluatorResult::error(id, "financial tolerance is invalid"),
     };
     let Some(items) = output.pointer(line_items_pointer).and_then(Value::as_array) else {
         return EvaluatorResult::error(id, "line items were missing or not an array");
@@ -1184,8 +1205,32 @@ fn evaluate_financial_invariants(
         let pointer = format!("{line_items_pointer}/{index}/amount");
         match (quantity, unit_price, amount) {
             (Some(quantity), Some(unit_price), Some(amount)) => {
-                item_sum += amount;
-                let passed = (quantity * unit_price - amount).abs() <= tolerance;
+                let expected_amount = quantity.checked_mul(unit_price);
+                let next_sum = item_sum.checked_add(amount);
+                let difference = expected_amount
+                    .and_then(|value| value.checked_sub(amount))
+                    .map(|value| value.abs());
+                let Some((expected_amount, next_sum, difference)) = expected_amount
+                    .zip(next_sum)
+                    .zip(difference)
+                    .map(|((expected_amount, next_sum), difference)| {
+                        (expected_amount, next_sum, difference)
+                    })
+                else {
+                    had_error = true;
+                    fields.push(FieldEvaluationFact {
+                        pointer,
+                        expected_pointer: None,
+                        status: EvaluationStatus::Error,
+                        expected: None,
+                        actual: item.pointer("/amount").cloned(),
+                        message: "Line-item arithmetic exceeded the exact decimal range."
+                            .to_owned(),
+                    });
+                    continue;
+                };
+                item_sum = next_sum;
+                let passed = difference <= tolerance;
                 fields.push(FieldEvaluationFact {
                     pointer,
                     expected_pointer: None,
@@ -1194,9 +1239,7 @@ fn evaluate_financial_invariants(
                     } else {
                         EvaluationStatus::Failed
                     },
-                    expected: Some(Value::String(
-                        (quantity * unit_price).normalize().to_string(),
-                    )),
+                    expected: Some(Value::String(expected_amount.normalize().to_string())),
                     actual: item.pointer("/amount").cloned(),
                     message: "Line amount must equal quantity multiplied by unit price.".to_owned(),
                 });
@@ -1238,23 +1281,39 @@ fn evaluate_financial_invariants(
         (
             total_pointer,
             total,
-            subtotal.zip(tax).map(|(subtotal, tax)| subtotal + tax),
+            subtotal
+                .zip(tax)
+                .and_then(|(subtotal, tax)| subtotal.checked_add(tax)),
             "Total must equal subtotal plus tax.",
         ),
     ] {
         match (actual, expected_value) {
-            (Some(actual), Some(expected)) => fields.push(FieldEvaluationFact {
-                pointer: pointer.to_owned(),
-                expected_pointer: None,
-                status: if (actual - expected).abs() <= tolerance {
-                    EvaluationStatus::Passed
-                } else {
-                    EvaluationStatus::Failed
-                },
-                expected: Some(Value::String(expected.normalize().to_string())),
-                actual: Some(Value::String(actual.normalize().to_string())),
-                message: message.to_owned(),
-            }),
+            (Some(actual), Some(expected)) => match actual.checked_sub(expected) {
+                Some(difference) => fields.push(FieldEvaluationFact {
+                    pointer: pointer.to_owned(),
+                    expected_pointer: None,
+                    status: if difference.abs() <= tolerance {
+                        EvaluationStatus::Passed
+                    } else {
+                        EvaluationStatus::Failed
+                    },
+                    expected: Some(Value::String(expected.normalize().to_string())),
+                    actual: Some(Value::String(actual.normalize().to_string())),
+                    message: message.to_owned(),
+                }),
+                None => {
+                    had_error = true;
+                    fields.push(FieldEvaluationFact {
+                        pointer: pointer.to_owned(),
+                        expected_pointer: None,
+                        status: EvaluationStatus::Error,
+                        expected: None,
+                        actual: Some(Value::String(actual.normalize().to_string())),
+                        message: "Financial arithmetic exceeded the exact decimal range."
+                            .to_owned(),
+                    });
+                }
+            },
             _ => {
                 had_error = true;
                 fields.push(FieldEvaluationFact {
@@ -1301,10 +1360,60 @@ fn evaluate_financial_invariants(
 
 fn decimal_value(value: Option<&Value>) -> Option<Decimal> {
     value.and_then(|value| match value {
-        Value::String(value) => Decimal::from_str(value).ok(),
-        Value::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+        Value::String(value) => parse_decimal_text(value),
+        Value::Number(value) => parse_decimal_text(&value.to_string()),
         _ => None,
     })
+}
+
+/// Parse only decimal representations that rust_decimal can represent exactly.
+/// Scientific notation is accepted when conversion is exact; lossy conversion is never used.
+fn parse_decimal_text(value: &str) -> Option<Decimal> {
+    let parsed = if value.contains('e') || value.contains('E') {
+        Decimal::from_scientific(value).ok()
+    } else {
+        Decimal::from_str(value).ok()
+    }?;
+    (canonical_decimal_text(value)? == canonical_decimal_text(&parsed.to_string())?)
+        .then_some(parsed)
+}
+
+fn canonical_decimal_text(value: &str) -> Option<(bool, String, i64)> {
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let mut exponent_parts = unsigned.split(['e', 'E']);
+    let mantissa = exponent_parts.next()?;
+    let exponent = exponent_parts
+        .next()
+        .map_or(Some(0_i64), |value| value.parse::<i64>().ok())?;
+    if exponent_parts.next().is_some() {
+        return None;
+    }
+    let mut decimal_parts = mantissa.split('.');
+    let whole = decimal_parts.next()?;
+    let fraction = decimal_parts.next().unwrap_or("");
+    if decimal_parts.next().is_some()
+        || whole.is_empty()
+        || (!fraction.is_empty() && !mantissa.contains('.'))
+        || (mantissa.contains('.') && fraction.is_empty())
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = format!("{whole}{fraction}")
+        .trim_start_matches('0')
+        .to_owned();
+    if digits.is_empty() {
+        return Some((false, "0".to_owned(), 0));
+    }
+    let mut exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    while digits.ends_with('0') {
+        digits.pop();
+        exponent = exponent.checked_add(1)?;
+    }
+    Some((negative, digits, exponent))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1470,23 +1579,22 @@ fn evaluate_numeric(
             )),
         };
     }
-    let actual = Decimal::from_str(actual_text);
-    let reference = Decimal::from_str(expected_text);
-    let (Ok(actual), Ok(reference)) = (actual, reference) else {
-        return EvaluatorResult::failed(
+    let actual = parse_decimal_text(actual_text);
+    let reference = parse_decimal_text(expected_text);
+    let (Some(actual), Some(reference)) = (actual, reference) else {
+        return EvaluatorResult::error(
             id,
-            "Values could not be represented as exact decimals.",
-            Value::Null,
+            "Values could not be represented within the exact decimal range.",
         )
         .with_fields(field(
-            EvaluationStatus::Failed,
+            EvaluationStatus::Error,
             Some(actual_value),
             Some(expected_value),
-            "Values could not be represented as exact decimals.",
+            "Values could not be represented within the exact decimal range.",
         ));
     };
-    let absolute_tolerance = absolute.and_then(|value| Decimal::from_str(value).ok());
-    let relative_tolerance = relative.and_then(|value| Decimal::from_str(value).ok());
+    let absolute_tolerance = absolute.and_then(parse_decimal_text);
+    let relative_tolerance = relative.and_then(parse_decimal_text);
     if absolute.is_some() && absolute_tolerance.is_none()
         || relative.is_some() && relative_tolerance.is_none()
     {
@@ -1498,13 +1606,23 @@ fn evaluate_numeric(
                 "Configured tolerance is not a valid decimal.",
             ));
     }
-    let difference = (actual - reference).abs();
+    let Some(difference) = actual.checked_sub(reference).map(|value| value.abs()) else {
+        return EvaluatorResult::error(id, "Decimal difference exceeded the exact decimal range")
+            .with_fields(field(
+                EvaluationStatus::Error,
+                Some(actual_value),
+                Some(expected_value),
+                "Decimal difference exceeded the exact decimal range.",
+            ));
+    };
     let absolute_pass = absolute_tolerance.is_some_and(|limit| difference <= limit);
     let relative_pass = relative_tolerance.is_some_and(|limit| {
         if reference.is_zero() {
             difference.is_zero()
         } else {
-            difference / reference.abs() <= limit
+            difference
+                .checked_div(reference.abs())
+                .is_some_and(|ratio| ratio <= limit)
         }
     });
     if difference.is_zero() || absolute_pass || relative_pass {
@@ -1966,6 +2084,111 @@ mod tests {
             .unwrap();
         assert_eq!(fact.status, EvaluationStatus::Error);
         assert_eq!(fact.actual, Some(json!("not-a-number")));
+    }
+
+    #[test]
+    fn identical_high_precision_decimals_error_but_never_fail() {
+        let value = "0.12345678901234567890123456789";
+        let result = evaluate_numeric(
+            "decimal",
+            &json!({"value": value}),
+            Some(&json!({"value": value})),
+            "/value",
+            "/value",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert!(!result.passed);
+        assert_eq!(result.fields[0].status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn out_of_range_decimal_is_not_a_semantic_failure() {
+        let result = evaluate_numeric(
+            "decimal",
+            &json!({"value": "9999999999999999999999999999999999999999"}),
+            Some(&json!({"value": "1"})),
+            "/value",
+            "/value",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn scientific_notation_is_accepted_only_when_exactly_representable() {
+        let result = evaluate_numeric(
+            "decimal",
+            &json!({"value": "1e-2"}),
+            Some(&json!({"value": "0.01"})),
+            "/value",
+            "/value",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(result.status, EvaluationStatus::Passed);
+        let unsupported = evaluate_numeric(
+            "decimal",
+            &json!({"value": "1e-29"}),
+            Some(&json!({"value": "1e-29"})),
+            "/value",
+            "/value",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(unsupported.status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn keyed_array_decimal_overflow_is_an_evaluator_error() {
+        let field = KeyedArrayField {
+            pointer: "/amount".to_owned(),
+            evaluator: "decimal_exact".to_owned(),
+            absolute: None,
+            case_insensitive: true,
+            formats: vec!["iso".to_owned()],
+        };
+        let (status, _) = compare_keyed_field(
+            &field,
+            Some(&json!("9999999999999999999999999999999999999999")),
+            Some(&json!("9999999999999999999999999999999999999999")),
+        );
+        assert_eq!(status, EvaluationStatus::Error);
+    }
+
+    #[test]
+    fn financial_overflow_is_an_evaluator_error() {
+        let result = evaluate_financial_invariants(
+            "financial",
+            &json!({
+                "line_items": [{
+                    "quantity": "2",
+                    "unit_price": "79228162514264337593543950335",
+                    "amount": "79228162514264337593543950335"
+                }],
+                "subtotal": "79228162514264337593543950335",
+                "tax": "1",
+                "total": "79228162514264337593543950335"
+            }),
+            "/line_items",
+            "/subtotal",
+            "/tax",
+            "/total",
+            "0.01",
+        );
+        assert_eq!(result.status, EvaluationStatus::Error);
+        assert!(
+            result
+                .fields
+                .iter()
+                .any(|field| field.status == EvaluationStatus::Error)
+        );
     }
 
     proptest! {

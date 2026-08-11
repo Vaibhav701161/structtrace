@@ -45,6 +45,7 @@ audit_source_commit="$(git -C "$audit_root" rev-parse HEAD)"
 audit_dirty_state_fingerprint="$(git -C "$audit_root" status --porcelain=v1 -z | sha256sum | awk '{print $1}')"
 audit_source_tree_digest="$(git -C "$audit_root" archive --format=tar HEAD | sha256sum | awk '{print $1}')"
 audit_cargo_lock_digest="$(sha256sum "$audit_root/Cargo.lock" | awk '{print $1}')"
+audit_ui_lock_digest="$(sha256sum "$audit_root/ui/package-lock.json" | awk '{print $1}')"
 if [[ -z "$(git -C "$audit_root" status --porcelain)" ]]; then
   audit_clean_before=true
 else
@@ -63,6 +64,7 @@ record_check browser_e2e "./scripts/test-local-ui-e2e.sh $audit_browser_args" 'u
 record_check documentation 'mdbook build' 'docs/book/index.html'
 record_check release_cli_help 'target/release/structtrace --help' 'target/release/structtrace'
 audit_binary_digest="$(sha256sum "$audit_root/target/release/structtrace" | awk '{print $1}')"
+audit_frontend_dist_digest="$(cd "$audit_root/ui/dist" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
 
 mkdir -p "$(dirname "$audit_output")"
 jq -n \
@@ -72,6 +74,8 @@ jq -n \
   --arg dirty_state_fingerprint "$audit_dirty_state_fingerprint" \
   --arg source_tree_digest "$audit_source_tree_digest" \
   --arg cargo_lock_sha256 "$audit_cargo_lock_digest" \
+  --arg ui_lock_sha256 "$audit_ui_lock_digest" \
+  --arg frontend_dist_sha256 "$audit_frontend_dist_digest" \
   --arg binary_sha256 "$audit_binary_digest" \
   --arg rustc "$(rustc --version)" \
   --arg cargo "$(cargo --version)" \
@@ -85,6 +89,8 @@ jq -n \
     dirty_state_fingerprint: $dirty_state_fingerprint,
     source_tree_digest: $source_tree_digest,
     cargo_lock_sha256: $cargo_lock_sha256,
+    ui_lock_sha256: $ui_lock_sha256,
+    frontend_dist_sha256: $frontend_dist_sha256,
     binary_sha256: $binary_sha256,
     worktree_clean_before: $worktree_clean_before,
     environment: {rustc: $rustc, cargo: $cargo, platform: $platform},

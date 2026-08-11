@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decision } from "../src/features/results/Results";
+import { decision, effectPosition } from "../src/features/results/Results";
 import type { RunResult } from "../src/api/types";
 
 function result(gate: RunResult["summary"]["gate"]): RunResult {
@@ -8,6 +8,7 @@ function result(gate: RunResult["summary"]["gate"]): RunResult {
     projectName: "project",
     createdAt: 0,
     integrity: { status: "verified", detail: "Replay verified." },
+    regressionSuite: { total: 0, passing: 0, fixed: 0, stillBroken: 0, reintroduced: 0, missing: 0, blocking: false },
     cases: [],
     summary: {
       baseline: { total: 1, parse_valid: 1, schema_valid: 1, semantic_success: 1, deployment_success: 1, valid_but_wrong: 0, errors: 0 },
@@ -42,5 +43,11 @@ describe("decision language", () => {
     expect(value.title).toBe("DO NOT DEPLOY");
     expect(value.text).toContain("Quality thresholds failed");
     expect(value.text).toContain("Evidence requirements are also insufficient");
+  });
+});
+
+describe("full-range effect scale", () => {
+  it.each([[-100, 0], [-75, 12.5], [0, 50], [75, 87.5], [100, 100]])("maps %s pp to %s%%", (effect, expected) => {
+    expect(effectPosition(effect)).toBe(expected);
   });
 });

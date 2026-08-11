@@ -20,7 +20,6 @@ import { acceptRun, getRun } from "../../api/client";
 import type { RunResult } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Skeleton, Status } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
-import { parseArtifact } from "../import/inspect";
 
 export function Results() {
   const { runId } = useParams({ strict: false });
@@ -43,6 +42,12 @@ export function decision(result: RunResult) {
     tone: "fail" as const,
     icon: ShieldAlert,
   };
+  if (result.regressionSuite.blocking) return {
+    title: "PINNED REGRESSION SUITE FAILED",
+    text: `${result.regressionSuite.stillBroken} still broken, ${result.regressionSuite.reintroduced} reintroduced, and ${result.regressionSuite.missing} missing pinned cases block release authority.`,
+    tone: "fail" as const,
+    icon: ShieldAlert,
+  };
   const gate = result.summary.gate;
   if (gate.gate_mode === "release" && gate.deployment_authorized) return { title: "RELEASE AUTHORIZED", text: "Candidate passed every configured release and evidence rule.", tone: "pass" as const, icon: ShieldCheck };
   if (gate.status === "error") return { title: "RUN ERROR", text: gate.runtime_errors[0] ?? "A required rule could not be evaluated safely.", tone: "fail" as const, icon: CircleAlert };
@@ -59,6 +64,14 @@ function ResultContent({ result }: { result: RunResult }) {
   const accepted = useMutation({ mutationFn: () => acceptRun(result.runId) });
   const state = decision(result);
   const summary = result.summary;
+  if (result.integrity.status !== "verified") {
+    return <div className="page page-wide result-page">
+      <PageHeader eyebrow={`${result.projectName} · run ${result.runId}`} title="Evidence inspection only" actions={<Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Download raw inspection record</Button>} />
+      <section className="decision-banner decision-fail"><ShieldAlert size={28} aria-hidden="true" /><div><span>AUTHORITY DISABLED</span><h2>{state.title}</h2><p>No decision metric is shown as authoritative while this run is unverified.</p></div><Status tone="fail" label="Raw evidence only" /></section>
+      <InlineNotice tone="danger" title="Last trustworthy state unavailable">{result.integrity.detail} Open the original manifest-bound artifacts or restore them from the last immutable receipt. Release export, case claims, and baseline promotion remain disabled.</InlineNotice>
+      <Card><h2>Why the dashboard is withheld</h2><p>Displaying percentages from modified or replay-failed artifacts would make untrusted evidence look conclusive. The downloadable inspection record retains the raw summary together with its integrity status for forensic use.</p></Card>
+    </div>;
+  }
   const independentTotal = summary.baseline.total;
   const capturedTotal = summary.descriptive_baseline.total;
   const semanticTotal = summary.jointly_scored_semantic.jointly_scored_cases;
@@ -77,13 +90,14 @@ function ResultContent({ result }: { result: RunResult }) {
     : `Candidate created ${improvements} improvements and ${regressions} regressions. Review every discordant case before changing production behavior.`;
   return (
     <div className="page page-wide result-page">
-      <PageHeader eyebrow={`${result.projectName} · run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} disabled={result.integrity.status !== "verified"} onClick={() => void navigate({ to: "/ci" })}>Export CI project</Button></>} />
+      <PageHeader eyebrow={`${result.projectName} · run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} disabled={result.integrity.status !== "verified" || !result.projectId} onClick={() => void navigate({ to: "/ci", search: { project: result.projectId ?? "", run: result.runId } })}>Export CI project</Button></>} />
       <section className={`decision-banner decision-${state.tone}`}>
         <state.icon size={28} aria-hidden="true" />
         <div><span>RELEASE DECISION</span><h2>{state.title}</h2><p>{state.text}</p></div>
         <Status tone={state.tone === "pass" ? "pass" : state.tone === "fail" ? "fail" : state.tone === "warning" ? "warning" : "info"} label={summary.gate.gate_mode === "release" ? "Release gate" : summary.gate.gate_mode === "regression" ? "Regression gate" : "Advisory"} />
       </section>
       <InlineNotice tone={result.integrity.status === "verified" ? "success" : "danger"} title={result.integrity.status === "verified" ? "Evidence integrity verified" : "Authority disabled"}>{result.integrity.detail}{result.integrity.status !== "verified" && " Case claims, release export, and baseline promotion are disabled until the original artifacts verify."}</InlineNotice>
+      {result.regressionSuite.total > 0 && <InlineNotice tone={result.regressionSuite.blocking ? "danger" : "success"} title={result.regressionSuite.blocking ? "Pinned regression suite blocks release" : "Pinned regression suite passed"}>{result.regressionSuite.fixed + result.regressionSuite.passing} of {result.regressionSuite.total} required cases pass in this candidate. Missing, still-broken, and reintroduced cases are enforced again in generated CI.</InlineNotice>}
       {(summary.gate.quality_failures.length > 0 || summary.gate.evidence_failures.length > 0 || summary.gate.runtime_errors.length > 0) && <Card className="gate-audit"><div><h2>Why this decision was reached</h2><p>Quality, evidence, and runtime findings remain separate. None are hidden by another category.</p></div>{summary.gate.quality_failures.length > 0 && <GateFailures title="Quality failures" items={summary.gate.quality_failures} tone="fail" />}{summary.gate.evidence_failures.length > 0 && <GateFailures title="Evidence failures" items={summary.gate.evidence_failures} tone="warning" />}{summary.gate.runtime_errors.length > 0 && <GateFailures title="Runtime errors" items={summary.gate.runtime_errors} tone="fail" />}</Card>}
       <Card className="explanation"><CircleAlert size={20} /><p>{description}</p></Card>
       <Card className="outcome-visualization">
@@ -120,7 +134,7 @@ function ResultContent({ result }: { result: RunResult }) {
         <div className="evidence-funnel" role="img" aria-label={`${capturedTotal} rows captured, ${independentTotal} independent evidence units, ${semanticTotal} jointly scored semantic pairs`}><FunnelStep label="Captured rows" value={capturedTotal} max={capturedTotal} /><FunnelStep label="Independent units" value={independentTotal} max={capturedTotal} /><FunnelStep label="Semantic pairs" value={semanticTotal} max={capturedTotal} /></div>
         <div className="evidence-metrics"><div><strong>{summary.evidence.total_rows}</strong><span>Rows captured</span></div><div><strong>{summary.evidence.effective_inference_units}</strong><span>Effective independent units</span></div><div><strong>{summary.evidence.exact_duplicate_groups}</strong><span>Exact-duplicate groups</span></div><div className={summary.evidence.repeated_trial_groups ? "bad" : ""}><strong>{summary.evidence.repeated_trial_groups}</strong><span>Repeated-trial conflicts</span></div><div className={summary.evidence.label_conflict_groups ? "bad" : ""}><strong>{summary.evidence.label_conflict_groups}</strong><span>Label conflicts</span></div></div>
       </Card>
-      <div className="result-actions"><Button icon={XCircle} variant="secondary" disabled={result.integrity.status !== "verified"} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Saved cases</Button>{result.integrity.status === "verified" && result.projectId && summary.gate.deployment_authorized && !accepted.isSuccess && <Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={accepted.isPending}>{accepted.isPending ? "Promoting…" : "Accept as next baseline"}</Button>}{accepted.data && <Button icon={ArrowRight} onClick={() => { const parsed = parseArtifact("baseline", accepted.data.source.name, accepted.data.source.content); void startNextIteration({ ...parsed, sourceId: accepted.data.source.sourceId, hash: accepted.data.source.hash }).then(() => navigate({ to: "/new/source" })); }}>Open next comparison</Button>}</div>
+      <div className="result-actions"><Button icon={XCircle} variant="secondary" disabled={result.integrity.status !== "verified"} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Saved cases</Button>{result.integrity.status === "verified" && result.projectId && summary.gate.deployment_authorized && !accepted.isSuccess && <Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={accepted.isPending}>{accepted.isPending ? "Promoting…" : "Accept as next baseline"}</Button>}{accepted.data && <Button icon={ArrowRight} onClick={() => { void startNextIteration({ ...accepted.data.source, kind: "baseline", status: "ready" }).then(() => navigate({ to: "/new/source" })); }}>Open next comparison</Button>}</div>
       {accepted.data && <InlineNotice tone="success" title="Verified baseline revision committed">Replay-verified candidate bytes from run <code>{accepted.data.accepted.runId}</code> now define project revision <code>{accepted.data.accepted.projectRevisionId}</code>. Reopening the project and CI export resolve this same candidate hash.</InlineNotice>}
       {accepted.error && <InlineNotice tone="danger" title="Baseline promotion failed">{accepted.error.message}</InlineNotice>}
     </div>
@@ -133,9 +147,12 @@ function DistributionBar({ label, pass, total }: { label: string; pass: number; 
 }
 
 function EffectInterval({ estimate, lower, upper }: { estimate: number; lower: number; upper: number }) {
-  const domain = 50;
-  const position = (value: number) => Math.max(0, Math.min(100, (value + domain) / (domain * 2) * 100));
-  return <div className="effect-interval" role="img" aria-label={`Paired effect ${estimate.toFixed(1)} percentage points with 95 percent interval ${lower.toFixed(1)} to ${upper.toFixed(1)}`}><div className="effect-axis"><span className="effect-zero" /><span className="effect-range" style={{ left: `${position(lower)}%`, width: `${Math.max(1, position(upper) - position(lower))}%` }} /><span className="effect-point" style={{ left: `${position(estimate)}%` }} /></div><div className="effect-labels"><span>−50 pp harm</span><span>0</span><span>+50 pp benefit</span></div></div>;
+  const position = effectPosition;
+  return <div className="effect-interval" role="img" aria-label={`Paired effect ${estimate.toFixed(1)} percentage points with 95 percent interval ${lower.toFixed(1)} to ${upper.toFixed(1)}`}><div className="effect-axis"><span className="effect-zero" /><span className="effect-range" style={{ left: `${position(lower)}%`, width: `${Math.max(1, position(upper) - position(lower))}%` }} /><span className="effect-point" style={{ left: `${position(estimate)}%` }} /></div><div className="effect-labels"><span>−100 pp harm</span><span>0</span><span>+100 pp benefit</span></div></div>;
+}
+
+export function effectPosition(value: number) {
+  return Math.max(0, Math.min(100, (value + 100) / 2));
 }
 
 function FunnelStep({ label, value, max }: { label: string; value: number; max: number }) { return <div><span>{label}</span><div><i style={{ width: `${max ? Math.max(2, value / max * 100) : 0}%` }} /></div><strong>{value}</strong></div>; }
@@ -152,7 +169,7 @@ export function aggregateHotspots(hotspots: Array<{ pointer: string; regressions
 }
 
 function exportSummary(result: RunResult) {
-  const blob = new Blob([JSON.stringify({ runId: result.runId, projectName: result.projectName, summary: result.summary }, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ runId: result.runId, projectName: result.projectName, integrity: result.integrity, authoritative: result.integrity.status === "verified", summary: result.summary }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;

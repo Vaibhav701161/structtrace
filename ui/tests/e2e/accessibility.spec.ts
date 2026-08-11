@@ -30,7 +30,7 @@ test("invoice demo reaches an honest evidence decision", async ({ page }) => {
   await page.getByRole("link", { name: "Saved cases" }).click();
   const pinnedRow = page.locator(".pinned-list > div").filter({ hasText: caseId ?? "missing-case-id" }).first();
   await expect(pinnedRow).toBeVisible();
-  await pinnedRow.getByRole("button", { name: "Open evidence" }).click();
+  await pinnedRow.getByRole("button", { name: "Open latest evidence" }).click();
   await expect(page.getByRole("dialog", { name: `Case ${caseId}` })).toBeVisible();
 });
 
@@ -138,6 +138,21 @@ test("authorized candidate becomes the next baseline in the same project", async
   await page.getByRole("button", { name: "Run comparison" }).click();
   await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible({ timeout: 20_000 });
   const resultUrl = page.url();
+  const runId = new URL(resultUrl).pathname.split("/").at(-1);
+  await page.getByRole("button", { name: "Export CI project" }).click();
+  const originalCiTarget = new URL(page.url());
+  const originalProjectId = originalCiTarget.searchParams.get("project");
+  expect(originalProjectId).toBeTruthy();
+  expect(originalCiTarget.searchParams.get("run")).toBe(runId);
+  await page.goto(resultUrl);
+  await page.getByRole("button", { name: "New comparison" }).click();
+  await expect(page.getByRole("heading", { name: "What are you comparing?" })).toBeVisible();
+  await page.goto(resultUrl);
+  await page.getByRole("button", { name: "Export CI project" }).click();
+  const historicalCiTarget = new URL(page.url());
+  expect(historicalCiTarget.searchParams.get("project")).toBe(originalProjectId);
+  expect(historicalCiTarget.searchParams.get("run")).toBe(runId);
+  await page.goto(resultUrl);
   await page.getByRole("button", { name: "Accept as next baseline" }).click();
   await expect(page.getByText("Verified baseline revision committed")).toBeVisible();
   await page.getByRole("button", { name: "Export CI project" }).click();

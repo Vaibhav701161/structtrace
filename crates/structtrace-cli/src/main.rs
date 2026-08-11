@@ -989,28 +989,12 @@ fn copy_manifest_allowlist(
     Ok(())
 }
 
-#[cfg(unix)]
 fn harden_archive_directory(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    structtrace_core::filesystem::make_private_directory(path)
 }
 
-#[cfg(not(unix))]
-fn harden_archive_directory(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn harden_archive_file(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn harden_archive_file(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+    structtrace_core::filesystem::make_private_file(path)
 }
 
 fn inspect_schema(cli: &Cli, schema_path: &Path) -> anyhow::Result<u8> {
@@ -2112,14 +2096,11 @@ fn evidence_unit_value(
 }
 
 fn writable_directory(path: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
     let existed = path.exists();
     std::fs::create_dir_all(path)
         .with_context(|| format!("could not create storage directory {}", path.display()))?;
-    #[cfg(unix)]
     if !existed {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        structtrace_core::filesystem::make_private_directory(path)?;
     }
     let marker = path.join(format!(
         ".doctor-write-check-{}-{}",

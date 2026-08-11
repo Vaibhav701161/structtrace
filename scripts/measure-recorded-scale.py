@@ -8,8 +8,11 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import select
 import tempfile
 import time
+from urllib.parse import urlencode, urljoin
+from urllib.request import urlopen
 from datetime import datetime, timezone
 
 
@@ -50,6 +53,33 @@ def timed(command: list[str], cwd: Path) -> dict[str, object]:
         result["peak_rss_kib"] = int(peak)
         timing_path.unlink()
     return result
+
+
+def timed_http(url: str, expected_total: int | None = None) -> dict[str, object]:
+    started = time.monotonic()
+    try:
+        with urlopen(url, timeout=30) as response:  # noqa: S310 - loopback capability URL
+            body = response.read()
+            payload = json.loads(body)
+            total = payload.get("total") if isinstance(payload, dict) else None
+            valid = response.status == 200 and (
+                expected_total is None or total == expected_total
+            )
+            return {
+                "command": ["HTTP GET", url],
+                "exit_code": 0 if valid else 1,
+                "wall_seconds": round(time.monotonic() - started, 3),
+                "status": response.status,
+                "response_bytes": len(body),
+                "matched_cases": total,
+            }
+    except Exception as error:  # benchmark receipt must retain bounded diagnostics
+        return {
+            "command": ["HTTP GET", url],
+            "exit_code": 1,
+            "wall_seconds": round(time.monotonic() - started, 3),
+            "error": f"{type(error).__name__}: {error}",
+        }
 
 
 def main() -> int:
@@ -115,12 +145,51 @@ report: {{include_raw_outputs: false, default_case_filter: all}}
 """,
             encoding="utf-8",
         )
-        commands = [
+        commands: list[dict[str, object]] = [
             timed([str(binary), "--project-root", str(root), "run"], root),
             timed([str(binary), "--project-root", str(root), "replay", "latest"], root),
         ]
         run_dirs = list((root / ".structtrace" / "runs").iterdir())
         run_dir = run_dirs[0]
+        server = subprocess.Popen(
+            [str(binary), "--project-root", str(root), "open", "--no-browser"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            ready, _, _ = select.select([server.stdout], [], [], 30)
+            if not ready or server.stdout is None:
+                raise RuntimeError("local server did not publish its capability URL")
+            line = server.stdout.readline().strip()
+            if not line.startswith("StructTrace Local: "):
+                raise RuntimeError(f"unexpected local-server greeting: {line}")
+            base_url = line.removeprefix("StructTrace Local: ")
+            commands.append(timed_http(urljoin(base_url, "api/v1/runs")))
+            query = urlencode(
+                {"offset": 0, "limit": 50, "filter": "all", "search": "case-009999"}
+            )
+            search_url = urljoin(
+                base_url, f"api/v1/runs/{run_dir.name}/cases?{query}"
+            )
+            commands.append(timed_http(search_url, expected_total=1))
+            commands.append(timed_http(search_url, expected_total=1))
+        except Exception as error:
+            commands.append(
+                {
+                    "command": ["local UI case-search benchmark"],
+                    "exit_code": 1,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=10)
         report = {
             "schema_version": 1,
             "generated_at": datetime.now(timezone.utc).isoformat(),

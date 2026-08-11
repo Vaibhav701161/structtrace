@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 blake3.workspace = true
 jsonschema.workspace = true
 rand.workspace = true

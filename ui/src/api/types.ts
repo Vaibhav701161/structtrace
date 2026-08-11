@@ -12,7 +12,7 @@ export interface SourceArtifact {
   kind: SourceKind;
   name: string;
   format: "jsonl" | "json" | "csv";
-  content: string;
+  content?: string;
   bytes: number;
   rows: number;
   status: "ready" | "staging" | "error";
@@ -38,7 +38,7 @@ export interface FieldRule {
   keyFields?: string[];
   arrayFields?: Array<{
     pointer: string;
-    kind: "exact" | "normalized_string" | "canonical_date" | "exact_integer" | "decimal_tolerance";
+    kind: "exact" | "normalized_string" | "canonical_date" | "exact_integer" | "decimal_exact" | "decimal_tolerance";
     tolerance?: string;
   }>;
   formats?: string;
@@ -167,6 +167,10 @@ export const runResultSchema = z.object({
     status: z.enum(["verified", "modified", "not_verified", "replay_failed"]),
     detail: z.string(),
   }),
+  regressionSuite: z.object({
+    total: z.number(), passing: z.number(), fixed: z.number(), stillBroken: z.number(),
+    reintroduced: z.number(), missing: z.number(), blocking: z.boolean(),
+  }),
 });
 export type RunResult = z.infer<typeof runResultSchema>;
 
@@ -178,7 +182,7 @@ export const acceptedBaselineSchema = z.object({
     gateMode: gateModeSchema, deploymentAuthorized: z.boolean(), artifactFormatVersion: z.number(),
     structtraceVersion: z.string(),
   }),
-  source: z.object({ sourceId: z.string(), hash: z.string(), name: z.string(), format: z.enum(["jsonl", "json", "csv"]), content: z.string(), bytes: z.number() }),
+  source: z.object({ sourceId: z.string(), hash: z.string(), name: z.string(), format: z.enum(["jsonl", "json", "csv"]), bytes: z.number(), rows: z.number(), preview: z.array(z.unknown()) }),
 });
 export type AcceptedBaselineResponse = z.infer<typeof acceptedBaselineSchema>;
 
@@ -203,9 +207,14 @@ export const pinnedCaseSchema = z.object({
   runId: z.string(),
   caseId: z.string(),
   projectName: z.string(),
+  projectId: z.string().default(""),
   pinnedAt: z.number(),
   note: z.string().default(""),
   status: z.enum(["open", "fixed"]).default("open"),
+  originCandidatePass: z.boolean().default(false),
+  suiteStatus: z.enum(["passing", "fixed", "still_broken", "reintroduced", "missing"]).default("still_broken"),
+  lastRunId: z.string().nullable().default(null),
+  evaluations: z.record(z.string(), z.string()).default({}),
 });
 export type PinnedCase = z.infer<typeof pinnedCaseSchema>;
 
@@ -233,7 +242,7 @@ const sourceArtifactSchema = z.object({
   kind: sourceKindSchema,
   name: z.string(),
   format: z.enum(["jsonl", "json", "csv"]),
-  content: z.string(),
+  content: z.string().optional(),
   bytes: z.number(),
   rows: z.number(),
   status: z.enum(["ready", "staging", "error"]),
@@ -247,6 +256,7 @@ export const fieldInventorySchema = z.object({
     baselineCoverage: z.number(), candidateCoverage: z.number(), schemaOnly: z.boolean(),
     candidateOmission: z.boolean(), suggestedRule: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_exact", "keyed_array"]),
     typeDistribution: z.record(z.string(), z.number()),
+    semanticHints: z.array(z.string()),
   })),
   datasetRows: z.number(), baselineRows: z.number(), candidateRows: z.number(),
   analyzedAllRows: z.literal(true),
@@ -255,6 +265,7 @@ export const fieldInventorySchema = z.object({
     missingCandidate: z.number(), invalidDatasetIds: z.number(), invalidBaselineIds: z.number(),
     invalidCandidateIds: z.number(),
   }),
+  mappingCandidates: z.object({ dataset: z.array(z.string()), baseline: z.array(z.string()), candidate: z.array(z.string()) }),
 });
 export type FieldInventory = z.infer<typeof fieldInventorySchema>;
 
@@ -268,7 +279,7 @@ const fieldRuleSchema = z.object({
   keyFields: z.array(z.string()).optional(),
   arrayFields: z.array(z.object({
     pointer: z.string(),
-    kind: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_tolerance"]),
+    kind: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_exact", "decimal_tolerance"]),
     tolerance: z.string().optional(),
   })).optional(),
   formats: z.string().optional(),

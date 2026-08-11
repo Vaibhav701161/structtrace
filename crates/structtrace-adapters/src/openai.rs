@@ -441,7 +441,10 @@ fn calculate_cost(config: &OpenAiCompatibleConfig, usage: &Usage) -> Option<Cost
     let output_price = Decimal::from_str(&pricing.output_per_million).ok()?;
     let input = Decimal::from(usage.input_tokens?);
     let output = Decimal::from(usage.output_tokens?);
-    let amount = (input * input_price + output * output_price) / Decimal::from(1_000_000_u64);
+    let amount = input
+        .checked_mul(input_price)?
+        .checked_add(output.checked_mul(output_price)?)?
+        .checked_div(Decimal::from(1_000_000_u64))?;
     Some(Cost {
         amount: amount.normalize().to_string(),
         currency: pricing.currency.clone(),
@@ -734,6 +737,18 @@ mod tests {
             retry_delay(0, Some(Duration::from_secs(86_400))),
             MAX_RETRY_DELAY
         );
+    }
+
+    #[test]
+    fn cost_overflow_is_omitted_instead_of_panicking_or_wrapping() {
+        let mut pricing = config("http://127.0.0.1:1/v1".to_owned(), 0);
+        pricing.pricing.as_mut().unwrap().input_per_million =
+            "79228162514264337593543950335".to_owned();
+        let usage = Usage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(0),
+        };
+        assert_eq!(calculate_cost(&pricing, &usage), None);
     }
 
     #[tokio::test]

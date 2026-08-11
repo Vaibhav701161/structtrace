@@ -275,11 +275,7 @@ fn write_fixture(path: &Path, contents: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     std::fs::write(path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    structtrace_core::filesystem::make_private_file(path)?;
     Ok(())
 }
 

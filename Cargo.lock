@@ -2335,6 +2335,7 @@ dependencies = [
  "axum",
  "clap",
  "csv",
+ "futures",
  "minijinja",
  "open",
  "rand 0.9.5",
@@ -2357,6 +2358,7 @@ dependencies = [
 name = "structtrace-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "jsonschema",
  "proptest",

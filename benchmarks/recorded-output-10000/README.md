@@ -2,7 +2,7 @@
 
 This benchmark measures the conservative v1 default envelope with deterministic recorded JSONL,
 strict parsing, schema validation, one built-in evaluator, paired analysis, chunked report creation,
-and complete replay.
+complete replay, cheap history listing, and cold/warm indexed case search through the local API.
 
 ```bash
 cargo build --workspace --release --locked
@@ -15,6 +15,10 @@ python3 scripts/measure-recorded-scale.py \
 size, source commit and clean-worktree state, lockfile digest, commands, exit codes, wall time,
 platform, and `passed: true`. It does not establish the 100,000-case hard ceiling; that ceiling
 remains an explicit opt-in boundary pending measurement.
+
+Release tags also run `.github/workflows/scale-validation.yml` and upload the receipt generated
+from that exact source revision. The checked-in receipt is historical evidence, while the CI
+artifact is the authority for a tagged release.
 
 ## Recorded result
 

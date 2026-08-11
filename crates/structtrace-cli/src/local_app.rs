@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use futures::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +36,33 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SCHEMA_BYTES: usize = 16 * 1024 * 1024;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PINNED_CASE_CHECKER: &str = r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+suite_path, runs_root = map(pathlib.Path, sys.argv[1:3])
+required = set(json.loads(suite_path.read_text(encoding="utf-8"))["required_case_ids"])
+runs = []
+for manifest_path in runs_root.glob("*/manifest.json"):
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("status") == "complete" and manifest.get("run_kind", "production") == "production":
+        runs.append((manifest.get("started_at_unix_ms", 0), manifest_path.parent))
+if not runs:
+    raise SystemExit("no complete production run exists")
+run_dir = max(runs)[1]
+observed = {}
+for line in (run_dir / "cases.jsonl").read_text(encoding="utf-8").splitlines():
+    if line.strip():
+        row = json.loads(line)
+        observed[row["case"]["id"]] = bool(row["candidate_evaluation"]["deployment_success"])
+missing = sorted(required - observed.keys())
+failing = sorted(case_id for case_id in required if not observed.get(case_id, False))
+if missing or failing:
+    print(json.dumps({"run": run_dir.name, "missing": missing, "failing": failing}, indent=2))
+    raise SystemExit(1)
+print(json.dumps({"run": run_dir.name, "required": len(required), "passed": len(required)}))
+"#;
 
 const INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
 const APP_JS: &[u8] = include_bytes!("../../../ui/dist/assets/app.js");
@@ -54,6 +82,7 @@ struct AppState {
     pin_lock: Mutex<()>,
     comparison_lock: Mutex<()>,
     jobs: Mutex<HashMap<String, JobEntry>>,
+    inventory_cache: Mutex<HashMap<String, FieldInventoryResponse>>,
     last_activity: AtomicU64,
     active_runs: AtomicUsize,
 }
@@ -102,9 +131,10 @@ struct SourceReference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StageSourceRequest {
+struct StageSourceQuery {
     kind: String,
-    file: BrowserFile,
+    name: String,
+    format: InputFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,8 +218,9 @@ struct AcceptedSourceResponse {
     hash: String,
     name: String,
     format: InputFormat,
-    content: String,
     bytes: usize,
+    rows: usize,
+    preview: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,9 +359,22 @@ struct RunResponse {
     summary: RunSummary,
     schema_provenance: &'static str,
     integrity: RunIntegrity,
+    regression_suite: RegressionSuiteSummary,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegressionSuiteSummary {
+    total: usize,
+    passing: usize,
+    fixed: usize,
+    still_broken: usize,
+    reintroduced: usize,
+    missing: usize,
+    blocking: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RunIntegrityStatus {
     Verified,
@@ -339,11 +383,22 @@ enum RunIntegrityStatus {
     ReplayFailed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunIntegrity {
     status: RunIntegrityStatus,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunIntegrityReceipt {
+    format_version: u32,
+    run_id: String,
+    manifest_hash: String,
+    summary_hash: String,
+    verified_at: u64,
+    cases_replayed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,7 +445,7 @@ struct FieldInventoryRequest {
     candidate_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FieldInventoryResponse {
     fields: Vec<FieldInventoryField>,
@@ -399,9 +454,18 @@ struct FieldInventoryResponse {
     candidate_rows: usize,
     analyzed_all_rows: bool,
     mapping: MappingInventory,
+    mapping_candidates: MappingCandidates,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MappingCandidates {
+    dataset: Vec<String>,
+    baseline: Vec<String>,
+    candidate: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MappingInventory {
     matched: usize,
@@ -417,9 +481,23 @@ struct MappingInventory {
 struct FieldObservations {
     present: usize,
     types: BTreeMap<String, usize>,
+    string_values: usize,
+    integer_like_strings: usize,
+    decimal_like_strings: usize,
+    date_like_strings: usize,
+    uuid_like_strings: usize,
+    uri_like_strings: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default)]
+struct SchemaFieldHint {
+    kind: String,
+    format: Option<String>,
+    pattern: Option<String>,
+    enumerated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FieldInventoryField {
     pointer: String,
@@ -431,6 +509,7 @@ struct FieldInventoryField {
     candidate_omission: bool,
     suggested_rule: &'static str,
     type_distribution: BTreeMap<String, usize>,
+    semantic_hints: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +517,7 @@ struct FieldInventoryField {
 struct CiRequest {
     mode: CiMode,
     project_id: String,
+    run_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -463,11 +543,21 @@ struct PinnedCase {
     run_id: String,
     case_id: String,
     project_name: String,
+    #[serde(default)]
+    project_id: String,
     pinned_at: u64,
     #[serde(default)]
     note: String,
     #[serde(default = "default_saved_case_status")]
     status: String,
+    #[serde(default)]
+    origin_candidate_pass: bool,
+    #[serde(default)]
+    suite_status: String,
+    #[serde(default)]
+    last_run_id: Option<String>,
+    #[serde(default)]
+    evaluations: BTreeMap<String, String>,
 }
 
 fn default_saved_case_status() -> String {
@@ -584,6 +674,7 @@ pub async fn serve(project_root: &Path, open_browser: bool) -> anyhow::Result<()
         pin_lock: Mutex::new(()),
         comparison_lock: Mutex::new(()),
         jobs: Mutex::new(jobs),
+        inventory_cache: Mutex::new(HashMap::new()),
         last_activity: AtomicU64::new(now_seconds()),
         active_runs: AtomicUsize::new(0),
     });
@@ -783,14 +874,15 @@ async fn run_demo(State(state): State<Arc<AppState>>) -> Result<Json<RunResponse
         .lock()
         .map_err(|_| anyhow::anyhow!("local run index is unavailable"))?
         .insert(run.run_id.clone(), run.run_dir.clone());
-    let response = response_from_run(&run.run_dir)?;
+    let response = response_from_run_verified(&state.project_root, &run.run_dir)?;
     drop(guard);
     Ok(Json(response))
 }
 
 async fn stage_source(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<StageSourceRequest>,
+    Query(request): Query<StageSourceQuery>,
+    body: Body,
 ) -> Result<Json<StagedSource>, AppError> {
     if !matches!(
         request.kind.as_str(),
@@ -801,37 +893,90 @@ async fn stage_source(
             "Source kind is not supported.",
         ));
     }
-    if request.file.name.trim().is_empty() || request.file.name.len() > 255 {
+    if request.name.trim().is_empty() || request.name.len() > 255 {
         return Err(AppError::bad_request(
             "invalid_source_name",
             "Source name must contain 1 to 255 characters.",
         ));
     }
-    let bytes = request.file.content.as_bytes();
     let source_limit = if request.kind == "schema" {
         MAX_SCHEMA_BYTES
     } else {
         MAX_FILE_BYTES
     };
-    if bytes.is_empty() || bytes.len() > source_limit {
+    let directory = staged_sources_dir(&state.project_root);
+    std::fs::create_dir_all(&directory)?;
+    make_owner_only_directory(&directory)?;
+    let source_id = Ulid::new().to_string();
+    let temporary = directory.join(format!(".{source_id}.upload"));
+    let mut cleanup = TemporaryUpload::new(temporary.clone());
+    let mut output = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await?;
+    let mut stream = body.into_data_stream();
+    let mut received = 0_usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            AppError::bad_request("invalid_source_body", "Source upload was interrupted.")
+        })?;
+        received = received.checked_add(chunk.len()).ok_or_else(|| {
+            AppError::bad_request("invalid_source_size", "Source size overflowed.")
+        })?;
+        if received > source_limit {
+            return Err(AppError::bad_request(
+                "invalid_source_size",
+                if request.kind == "schema" {
+                    "Schema must contain 1 byte to 16 MiB."
+                } else {
+                    "Source must contain 1 byte to 32 MiB."
+                },
+            ));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut output, &chunk).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut output).await?;
+    output.sync_all().await?;
+    drop(output);
+    if received == 0 {
         return Err(AppError::bad_request(
             "invalid_source_size",
-            if request.kind == "schema" {
-                "Schema must contain 1 byte to 16 MiB."
-            } else {
-                "Source must contain 1 byte to 32 MiB."
-            },
+            "Source must contain at least one byte.",
         ));
     }
-    validate_source_file(&request.file)?;
-    let rows = authoritative_rows(&request.kind, &request.file)?;
-    let mut staged = stage_browser_file(&state.project_root, request.kind, request.file)?;
+    let bytes =
+        structtrace_core::hashing::read_bounded(&temporary, source_limit, "staged source upload")?;
+    let content = String::from_utf8(bytes).map_err(|_| {
+        AppError::bad_request("invalid_source_encoding", "Source must be valid UTF-8.")
+    })?;
+    let file = BrowserFile {
+        name: request.name,
+        format: request.format,
+        content,
+    };
+    validate_source_file(&file)?;
+    let rows = authoritative_rows(&request.kind, &file)?;
+    let mut staged = StagedSource {
+        source_id: source_id.clone(),
+        kind: request.kind,
+        name: file.name,
+        format: file.format,
+        hash: structtrace_core::hashing::hash_file(&temporary)?,
+        bytes: received,
+        rows: 0,
+        preview_json: Vec::new(),
+    };
     staged.rows = rows.len();
     staged.preview_json = rows
         .into_iter()
         .take(25)
         .map(|row| serde_json::to_string(&row))
         .collect::<Result<Vec<_>, _>>()?;
+    let staged_data = directory.join(format!("{source_id}.data"));
+    std::fs::rename(&temporary, &staged_data)?;
+    cleanup.keep();
+    make_owner_only_file(&staged_data)?;
     atomic_write(
         &staged_sources_dir(&state.project_root).join(format!("{}.json", staged.source_id)),
         &serde_json::to_vec_pretty(&staged)?,
@@ -843,6 +988,16 @@ async fn field_inventory(
     State(state): State<Arc<AppState>>,
     Json(request): Json<FieldInventoryRequest>,
 ) -> Result<Json<FieldInventoryResponse>, AppError> {
+    let cache_key = field_inventory_cache_key(&state.project_root, &request)?;
+    if let Some(cached) = state
+        .inventory_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("source inventory cache is unavailable"))?
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(Json(cached));
+    }
     let dataset = authoritative_rows(
         "dataset",
         &load_staged_source(&state.project_root, &request.dataset)?,
@@ -862,7 +1017,7 @@ async fn field_inventory(
         .transpose()?
         .map(|file| structtrace_core::strict_json::value_from_str(&file.content))
         .transpose()?;
-    Ok(Json(build_field_inventory(FieldInventoryInput {
+    let response = build_field_inventory(FieldInventoryInput {
         dataset: &dataset,
         baseline: &baseline,
         candidate: &candidate,
@@ -877,7 +1032,19 @@ async fn field_inventory(
             &request.candidate_id,
         ],
         schema: schema.as_ref(),
-    })))
+    });
+    let mut cache = state
+        .inventory_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("source inventory cache is unavailable"))?;
+    // The cache is deliberately bounded because inventories retain field-level
+    // observations for all mapped sources. Source IDs are content-addressed for
+    // the lifetime of the local server, so eviction never affects correctness.
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(cache_key, response.clone());
+    Ok(Json(response))
 }
 
 async fn run_comparison(
@@ -902,7 +1069,14 @@ async fn run_comparison(
         .lock()
         .map_err(|_| anyhow::anyhow!("local run index is unavailable"))?
         .insert(run.run_id.clone(), run.run_dir.clone());
-    let response = response_from_run(&run.run_dir)?;
+    {
+        let _guard = state
+            .pin_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("regression suite is unavailable"))?;
+        refresh_regression_suite(&state.project_root, &run.run_dir)?;
+    }
+    let response = response_from_run_verified(&state.project_root, &run.run_dir)?;
     drop(guard);
     Ok(Json(response))
 }
@@ -1148,6 +1322,14 @@ async fn execute_job(state: Arc<AppState>, job_id: String) {
         }
     };
     if let Some(run) = completed_run {
+        if let Err(error) = response_from_run_verified(&state.project_root, &run.run_dir) {
+            tracing::error!(error = ?error, run_id = %run.run_id, "completed run failed integrity verification");
+        }
+        if let Ok(_guard) = state.pin_lock.lock() {
+            if let Err(error) = refresh_regression_suite(&state.project_root, &run.run_dir) {
+                tracing::error!(error = ?error, run_id = %run.run_id, "regression suite refresh failed");
+            }
+        }
         if let Ok(mut runs) = state.runs.lock() {
             runs.insert(run.run_id.clone(), run.run_dir.clone());
         }
@@ -1180,7 +1362,10 @@ async fn get_run(
 ) -> Result<Json<RunResponse>, AppError> {
     let run_id = params.get("run_id").context("run ID is missing")?;
     let run_dir = run_dir_for(&state, run_id)?;
-    Ok(Json(response_from_run(&run_dir)?))
+    Ok(Json(response_from_run_verified(
+        &state.project_root,
+        &run_dir,
+    )?))
 }
 
 async fn accept_run(
@@ -1205,6 +1390,18 @@ async fn accept_run(
     }
     let project_id =
         ui_project_id(&run_dir).context("only a persistent UI project can promote a baseline")?;
+    let regression_suite = regression_suite_summary(&state.project_root, &run_dir)?;
+    if regression_suite.blocking {
+        return Err(AppError::bad_request(
+            "regression_suite_blocked",
+            format!(
+                "Baseline promotion is blocked by {} still-broken, {} reintroduced, and {} missing pinned cases.",
+                regression_suite.still_broken,
+                regression_suite.reintroduced,
+                regression_suite.missing
+            ),
+        ));
+    }
     let project_dir = state
         .project_root
         .join(".structtrace/ui/projects")
@@ -1359,7 +1556,7 @@ async fn list_runs(State(state): State<Arc<AppState>>) -> Result<Json<Vec<RunRes
         .collect::<Vec<_>>();
     let mut runs = directories
         .iter()
-        .map(|directory| response_from_run(directory))
+        .map(|directory| response_from_run_cached(&state.project_root, directory))
         .collect::<anyhow::Result<Vec<_>>>()?;
     runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
     Ok(Json(runs))
@@ -1511,7 +1708,7 @@ fn ensure_case_index(run_dir: &Path) -> anyhow::Result<PathBuf> {
         );
         return Ok(index_path);
     }
-    let integrity = inspect_run_integrity(run_dir);
+    let integrity = inspect_run_integrity(run_dir).0;
     anyhow::ensure!(
         integrity.status == RunIntegrityStatus::Verified,
         integrity.detail
@@ -1708,7 +1905,7 @@ async fn get_draft(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Ap
         "local comparison draft",
     )?;
     let mut draft = structtrace_core::strict_json::value_from_slice(&bytes)?;
-    hydrate_draft_source_contents(&state.project_root, &mut draft)?;
+    hydrate_draft_source_previews(&state.project_root, &mut draft)?;
     Ok(Json(serde_json::json!({"draft": draft})))
 }
 
@@ -1857,7 +2054,7 @@ async fn get_project(
     let mut draft: Value = read_json(&path)?;
     let project_root = path.parent().context("project draft path has no parent")?;
     apply_current_revision_to_draft(&state.project_root, project_root, &mut draft)?;
-    hydrate_draft_source_contents(&state.project_root, &mut draft)?;
+    hydrate_draft_source_previews(&state.project_root, &mut draft)?;
     Ok(Json(serde_json::json!({"draft": draft})))
 }
 
@@ -1880,7 +2077,7 @@ fn apply_current_revision_to_draft(
         "name": response.source.name,
         "format": response.source.format,
         "bytes": response.source.bytes,
-        "rows": response.source.content.lines().filter(|line| !line.trim().is_empty()).count(),
+        "rows": response.source.rows,
         "status": "ready"
     });
     draft["sources"]
@@ -1954,7 +2151,7 @@ async fn duplicate_project(
         &state.project_root.join(".structtrace/ui/draft.json"),
         &serde_json::to_vec_pretty(&draft)?,
     )?;
-    hydrate_draft_source_contents(&state.project_root, &mut draft)?;
+    hydrate_draft_source_previews(&state.project_root, &mut draft)?;
     Ok(Json(serde_json::json!({"draft": draft})))
 }
 
@@ -2033,20 +2230,25 @@ async fn pin_regression(
         index,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let found = connection
+    let record_json = connection
         .query_row(
-            "SELECT 1 FROM cases WHERE case_id = ?1",
+            "SELECT record_json FROM cases WHERE case_id = ?1",
             [&request.case_id],
-            |_| Ok(()),
+            |row| row.get::<_, String>(0),
         )
         .optional()?
-        .is_some();
-    if !found {
-        return Err(AppError::not_found(
-            "case_not_found",
-            "Case is not present in the immutable run evidence.",
-        ));
-    }
+        .ok_or_else(|| {
+            AppError::not_found(
+                "case_not_found",
+                "Case is not present in the immutable run evidence.",
+            )
+        })?;
+    let record: PairedCaseRecord = structtrace_core::strict_json::from_str(&record_json)?;
+    // Demo evidence is intentionally read-only and has no persisted UI project.
+    // It can still be bookmarked for inspection, but an empty project id keeps it
+    // outside the recurring suite that is evaluated by future project runs.
+    let project_id = ui_project_id(&run_dir).unwrap_or_default();
+    let origin_candidate_pass = record.candidate_evaluation.deployment_success;
     let _guard = state
         .pin_lock
         .lock()
@@ -2063,9 +2265,27 @@ async fn pin_regression(
         run_id: request.run_id,
         case_id: request.case_id,
         project_name: manifest.project_name,
+        project_id,
         pinned_at: now_seconds(),
         note: String::new(),
         status: "open".to_owned(),
+        origin_candidate_pass,
+        suite_status: if origin_candidate_pass {
+            "passing"
+        } else {
+            "still_broken"
+        }
+        .to_owned(),
+        last_run_id: Some(manifest.run_id.clone()),
+        evaluations: BTreeMap::from([(
+            manifest.run_id,
+            if origin_candidate_pass {
+                "passing"
+            } else {
+                "still_broken"
+            }
+            .to_owned(),
+        )]),
     };
     pins.push(pin.clone());
     write_pins(&state.project_root, &pins)?;
@@ -2128,6 +2348,27 @@ async fn generate_ci(
 ) -> Result<Json<CiResponse>, AppError> {
     validate_project_id(&request.project_id)
         .map_err(|error| AppError::bad_request("invalid_project_id", error.to_string()))?;
+    let run_dir = run_dir_for(&state, &request.run_id)?;
+    if ui_project_id(&run_dir).as_deref() != Some(request.project_id.as_str()) {
+        return Err(AppError::bad_request(
+            "ci_run_project_mismatch",
+            "The requested run does not belong to the requested project.",
+        ));
+    }
+    let run_integrity = inspect_run_integrity(&run_dir).0;
+    if run_integrity.status != RunIntegrityStatus::Verified {
+        return Err(AppError::bad_request(
+            "ci_run_integrity_failed",
+            "The explicitly selected run failed full integrity replay.",
+        ));
+    }
+    let regression_suite = regression_suite_summary(&state.project_root, &run_dir)?;
+    if matches!(request.mode, CiMode::Release) && regression_suite.blocking {
+        return Err(AppError::bad_request(
+            "regression_suite_blocked",
+            "Release CI export is blocked until every pinned case passes in the selected run.",
+        ));
+    }
     let (mode, command) = match request.mode {
         CiMode::Regression => ("regression", "structtrace gate latest"),
         CiMode::Release => ("release", "structtrace release-check latest"),
@@ -2142,8 +2383,14 @@ async fn generate_ci(
             "Run this project once before exporting CI.",
         ));
     }
-    let (committed, project, _) = current_project_revision(&project_root)?
+    let (committed, project, receipt) = current_project_revision(&project_root)?
         .context("This project has no verified committed revision to export.")?;
+    if receipt.source_run_id != request.run_id {
+        return Err(AppError::bad_request(
+            "ci_run_not_current_revision",
+            "The selected run is not the source of this project's current committed revision.",
+        ));
+    }
     let mut parsed = Config::load(&project.join("structtrace.yaml"))?;
     parsed.gate.mode = match request.mode {
         CiMode::Regression => GateMode::Regression,
@@ -2167,9 +2414,24 @@ async fn generate_ci(
             "This StructTrace binary has no valid embedded 40-character source revision. Build from a clean Git checkout or install a verified release binary before exporting CI.",
         ));
     }
+    let pinned_case_ids = read_pins(&state.project_root)?
+        .into_iter()
+        .filter(|pin| pin.project_id == request.project_id)
+        .map(|pin| pin.case_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let workflow = format!(
         "# Generated from a complete verified StructTrace project revision.\nname: StructTrace\n\non:\n  pull_request:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  structured-output-regression:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n      - name: Check out project\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n      - name: Check out pinned StructTrace source\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n        with:\n          repository: Vaibhav701161/structtrace\n          ref: {revision}\n          path: .structtrace-tool\n      - name: Install pinned StructTrace binary\n        run: cargo install --locked --path .structtrace-tool/crates/structtrace-cli\n      - name: Verify required comparison inputs\n        run: test -s data/golden.jsonl && test -s outputs/baseline.jsonl && test -s outputs/candidate.jsonl && test -s schemas/output.schema.json && test -s project-revision.json\n      - name: Validate project\n        run: structtrace doctor --strict\n      - name: Run comparison\n        run: structtrace run\n      - name: Replay immutable evidence\n        run: structtrace replay latest\n      - name: Verify decision authority\n        run: {command}\n      - name: Upload immutable evidence\n        if: always()\n        uses: actions/upload-artifact@v4\n        with:\n          name: structtrace-evidence\n          path: .structtrace/runs/\n          if-no-files-found: error\n          retention-days: 14\n"
     );
+    let workflow = if pinned_case_ids.is_empty() {
+        workflow
+    } else {
+        workflow.replace(
+            "      - name: Upload immutable evidence",
+            "      - name: Enforce pinned regression suite\n        run: python scripts/check-pinned-cases.py regression-suite.json .structtrace/runs\n      - name: Upload immutable evidence",
+        )
+    };
     let export = state
         .project_root
         .join(".structtrace/exports")
@@ -2199,6 +2461,22 @@ async fn generate_ci(
         &export.join(".github/workflows/structtrace.yml"),
         workflow.as_bytes(),
     )?;
+    if !pinned_case_ids.is_empty() {
+        std::fs::create_dir_all(export.join("scripts"))?;
+        atomic_write(
+            &export.join("regression-suite.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "project_id": request.project_id,
+                "source_run_id": request.run_id,
+                "required_case_ids": pinned_case_ids.clone(),
+            }))?,
+        )?;
+        atomic_write(
+            &export.join("scripts/check-pinned-cases.py"),
+            PINNED_CASE_CHECKER.as_bytes(),
+        )?;
+    }
     let integration = format!(
         "# StructTrace CI integration\n\nThis directory is a complete, runnable snapshot of project `{}`.\n\nBefore each comparison, your existing generation step must replace `outputs/candidate.jsonl` with one row per golden case. Keep `outputs/baseline.jsonl` unchanged until an authorized baseline is deliberately promoted. The workflow validates all required files, runs the exact saved evaluators, executes `{command}`, and uploads immutable evidence even when the gate fails.\n\nStructTrace source is pinned to commit `{revision}`. Update that pin only through a reviewed dependency change.\n",
         parsed.project.name
@@ -2216,6 +2494,10 @@ async fn generate_ci(
     .into_iter()
     .map(str::to_owned)
     .collect::<Vec<_>>();
+    if !pinned_case_ids.is_empty() {
+        files.push("regression-suite.json".to_owned());
+        files.push("scripts/check-pinned-cases.py".to_owned());
+    }
     if let Some(accepted) = &committed.accepted_baseline {
         if accepted.staged_source_hash != accepted.candidate_artifact_hash {
             return Err(AppError::bad_request(
@@ -2693,7 +2975,7 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
     }
     let mut schema_fields = BTreeMap::new();
     if let Some(schema) = input.schema {
-        observe_schema_fields(schema, "", &mut schema_fields);
+        observe_schema_fields(schema, schema, "", &mut schema_fields, &mut HashSet::new());
     }
     let pointers = expected_fields
         .keys()
@@ -2726,7 +3008,7 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
             } else if type_distribution.is_empty() {
                 schema_fields
                     .get(&pointer)
-                    .cloned()
+                    .map(|hint| hint.kind.clone())
                     .unwrap_or_else(|| "unknown".to_owned())
             } else {
                 "mixed".to_owned()
@@ -2734,11 +3016,66 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
             let expected_coverage = coverage(expected_observation, input.dataset.len());
             let candidate_coverage = coverage(candidate_observation, input.candidate.len());
             let lower = pointer.to_ascii_lowercase();
+            let observations = [
+                expected_observation,
+                baseline_observation,
+                candidate_observation,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let string_values = observations
+                .iter()
+                .map(|item| item.string_values)
+                .sum::<usize>();
+            let integer_like = string_values > 0
+                && observations
+                    .iter()
+                    .map(|item| item.integer_like_strings)
+                    .sum::<usize>()
+                    == string_values;
+            let decimal_like = string_values > 0
+                && observations
+                    .iter()
+                    .map(|item| item.decimal_like_strings)
+                    .sum::<usize>()
+                    == string_values;
+            let date_like = string_values > 0
+                && observations
+                    .iter()
+                    .map(|item| item.date_like_strings)
+                    .sum::<usize>()
+                    == string_values;
+            let uuid_like = string_values > 0
+                && observations
+                    .iter()
+                    .map(|item| item.uuid_like_strings)
+                    .sum::<usize>()
+                    == string_values;
+            let uri_like = string_values > 0
+                && observations
+                    .iter()
+                    .map(|item| item.uri_like_strings)
+                    .sum::<usize>()
+                    == string_values;
+            let schema_hint = schema_fields.get(&pointer);
+            let schema_date = schema_hint
+                .and_then(|hint| hint.format.as_deref())
+                .is_some_and(|format| matches!(format, "date" | "date-time"));
             let suggested_rule = match observed_type.as_str() {
                 "array" => "keyed_array",
                 "integer" => "exact_integer",
                 "number" => "decimal_exact",
-                "string" if lower.contains("date") || lower.ends_with("_at") => "canonical_date",
+                "string" if integer_like => "exact_integer",
+                "string" if decimal_like => "decimal_exact",
+                "string"
+                    if schema_date
+                        || date_like
+                        || lower.contains("date")
+                        || lower.ends_with("_at") =>
+                {
+                    "canonical_date"
+                }
                 "string"
                     if ["name", "title", "description", "label", "text"]
                         .iter()
@@ -2748,6 +3085,34 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
                 }
                 _ => "exact",
             };
+            let mut semantic_hints = Vec::new();
+            if integer_like {
+                semantic_hints.push("integer_like_string".to_owned());
+            } else if decimal_like {
+                semantic_hints.push("decimal_like_string".to_owned());
+            }
+            if date_like || schema_date {
+                semantic_hints.push("date".to_owned());
+            }
+            if uuid_like || schema_hint.and_then(|hint| hint.format.as_deref()) == Some("uuid") {
+                semantic_hints.push("uuid".to_owned());
+            }
+            if uri_like
+                || schema_hint
+                    .and_then(|hint| hint.format.as_deref())
+                    .is_some_and(|format| matches!(format, "uri" | "uri-reference"))
+            {
+                semantic_hints.push("uri".to_owned());
+            }
+            if schema_hint.is_some_and(|hint| hint.enumerated) {
+                semantic_hints.push("enum".to_owned());
+            }
+            if schema_hint.and_then(|hint| hint.pattern.as_ref()).is_some() {
+                semantic_hints.push("schema_pattern".to_owned());
+            }
+            if let Some(format) = schema_hint.and_then(|hint| hint.format.as_ref()) {
+                semantic_hints.push(format!("schema_format:{format}"));
+            }
             FieldInventoryField {
                 pointer,
                 observed_type,
@@ -2760,6 +3125,7 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
                 candidate_omission: candidate_coverage < expected_coverage,
                 suggested_rule,
                 type_distribution,
+                semantic_hints,
             }
         })
         .collect();
@@ -2801,6 +3167,11 @@ fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryRespon
             invalid_baseline_ids,
             invalid_candidate_ids,
         },
+        mapping_candidates: MappingCandidates {
+            dataset: mapping_pointer_candidates(input.dataset),
+            baseline: mapping_pointer_candidates(input.baseline),
+            candidate: mapping_pointer_candidates(input.candidate),
+        },
     }
 }
 
@@ -2836,6 +3207,14 @@ fn observe_fields(value: &Value, path: &str, fields: &mut BTreeMap<String, Field
             .types
             .entry(json_type_name(value).to_owned())
             .or_insert(0) += 1;
+        if let Value::String(text) = value {
+            observations.string_values += 1;
+            observations.integer_like_strings += usize::from(is_integer_text(text));
+            observations.decimal_like_strings += usize::from(is_decimal_text(text));
+            observations.date_like_strings += usize::from(is_date_text(text));
+            observations.uuid_like_strings += usize::from(is_uuid_text(text));
+            observations.uri_like_strings += usize::from(is_uri_text(text));
+        }
     }
     match value {
         Value::Object(object) => {
@@ -2853,31 +3232,166 @@ fn observe_fields(value: &Value, path: &str, fields: &mut BTreeMap<String, Field
     }
 }
 
-fn observe_schema_fields(schema: &Value, path: &str, fields: &mut BTreeMap<String, String>) {
+fn observe_schema_fields(
+    root: &Value,
+    schema: &Value,
+    path: &str,
+    fields: &mut BTreeMap<String, SchemaFieldHint>,
+    active_refs: &mut HashSet<String>,
+) {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if let Some(pointer) = reference.strip_prefix('#') {
+            let pointer = if pointer.is_empty() { "" } else { pointer };
+            if active_refs.insert(reference.to_owned()) {
+                if let Some(resolved) = root.pointer(pointer) {
+                    if !path.is_empty() {
+                        merge_schema_hint(fields.entry(path.to_owned()).or_default(), resolved);
+                    }
+                    observe_schema_fields(root, resolved, path, fields, active_refs);
+                }
+                active_refs.remove(reference);
+            }
+        }
+    }
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            for branch in branches {
+                if !path.is_empty() {
+                    merge_schema_hint(fields.entry(path.to_owned()).or_default(), branch);
+                }
+                observe_schema_fields(root, branch, path, fields, active_refs);
+            }
+        }
+    }
+    for keyword in ["if", "then", "else", "dependentSchemas"] {
+        if let Some(branch) = schema.get(keyword) {
+            if let Some(branches) = branch.as_object().filter(|_| keyword == "dependentSchemas") {
+                for branch in branches.values() {
+                    observe_schema_fields(root, branch, path, fields, active_refs);
+                }
+            } else {
+                observe_schema_fields(root, branch, path, fields, active_refs);
+            }
+        }
+    }
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
         for (key, definition) in properties {
             let key = key.replace('~', "~0").replace('/', "~1");
             let pointer = format!("{path}/{key}");
-            let kind = definition
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            fields.insert(pointer.clone(), kind);
-            observe_schema_fields(definition, &pointer, fields);
+            merge_schema_hint(fields.entry(pointer.clone()).or_default(), definition);
+            observe_schema_fields(root, definition, &pointer, fields, active_refs);
         }
     }
     if let Some(items) = schema.get("items") {
         let pointer = format!("{path}/*");
-        fields.entry(pointer.clone()).or_insert_with(|| {
-            items
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned()
-        });
-        observe_schema_fields(items, &pointer, fields);
+        merge_schema_hint(fields.entry(pointer.clone()).or_default(), items);
+        observe_schema_fields(root, items, &pointer, fields, active_refs);
     }
+    if let Some(items) = schema.get("prefixItems").and_then(Value::as_array) {
+        let pointer = format!("{path}/*");
+        for item in items {
+            merge_schema_hint(fields.entry(pointer.clone()).or_default(), item);
+            observe_schema_fields(root, item, &pointer, fields, active_refs);
+        }
+    }
+}
+
+fn merge_schema_hint(hint: &mut SchemaFieldHint, schema: &Value) {
+    let kind = schema
+        .get("type")
+        .and_then(|value| match value {
+            Value::String(kind) => Some(kind.as_str()),
+            Value::Array(kinds) => kinds.iter().find_map(Value::as_str),
+            _ => None,
+        })
+        .unwrap_or("unknown");
+    if hint.kind.is_empty() || hint.kind == "unknown" {
+        hint.kind = kind.to_owned();
+    } else if kind != "unknown" && hint.kind != kind {
+        hint.kind = "mixed".to_owned();
+    }
+    hint.format = hint.format.clone().or_else(|| {
+        schema
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    hint.pattern = hint.pattern.clone().or_else(|| {
+        schema
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    hint.enumerated |= schema.get("enum").and_then(Value::as_array).is_some();
+}
+
+fn mapping_pointer_candidates(rows: &[Value]) -> Vec<String> {
+    fn visit(value: &Value, path: &str, output: &mut std::collections::BTreeSet<String>) {
+        let Value::Object(object) = value else {
+            return;
+        };
+        for (key, child) in object {
+            let key = key.replace('~', "~0").replace('/', "~1");
+            let pointer = format!("{path}/{key}");
+            output.insert(pointer.clone());
+            if child.is_object() {
+                visit(child, &pointer, output);
+            }
+        }
+    }
+    let mut output = std::collections::BTreeSet::new();
+    for row in rows {
+        visit(row, "", &mut output);
+    }
+    output.into_iter().collect()
+}
+
+fn is_integer_text(value: &str) -> bool {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn is_decimal_text(value: &str) -> bool {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && (whole == "0" || !whole.starts_with('0'))
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        && (!value.contains('.') || !fraction.is_empty())
+}
+
+fn is_date_text(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn is_uuid_text(value: &str) -> bool {
+    value.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .all(|index| value.as_bytes().get(*index) == Some(&b'-'))
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+}
+
+fn is_uri_text(value: &str) -> bool {
+    value.split_once("://").is_some_and(|(scheme, rest)| {
+        !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+            && !rest.is_empty()
+    })
 }
 
 fn coverage(observation: Option<&FieldObservations>, total: usize) -> f64 {
@@ -3115,7 +3629,11 @@ fn schema_for_value(value: &Value) -> Value {
     }
 }
 
-fn response_from_run(run_dir: &Path) -> anyhow::Result<RunResponse> {
+fn response_from_run_with_integrity(
+    project_root: &Path,
+    run_dir: &Path,
+    integrity: RunIntegrity,
+) -> anyhow::Result<RunResponse> {
     let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
     let manifest: structtrace_core::artifact::RunManifest =
         read_json(&run_dir.join("manifest.json"))?;
@@ -3131,29 +3649,111 @@ fn response_from_run(run_dir: &Path) -> anyhow::Result<RunResponse> {
                 "inferred_from_expected_values"
             }
         },
-        integrity: inspect_run_integrity(run_dir),
+        regression_suite: regression_suite_summary(project_root, run_dir)?,
+        integrity,
     })
 }
 
-fn inspect_run_integrity(run_dir: &Path) -> RunIntegrity {
+fn response_from_run_verified(project_root: &Path, run_dir: &Path) -> anyhow::Result<RunResponse> {
+    let (integrity, cases_replayed) = inspect_run_integrity(run_dir);
+    if integrity.status == RunIntegrityStatus::Verified {
+        write_run_integrity_receipt(project_root, run_dir, cases_replayed)?;
+    }
+    response_from_run_with_integrity(project_root, run_dir, integrity)
+}
+
+fn response_from_run_cached(project_root: &Path, run_dir: &Path) -> anyhow::Result<RunResponse> {
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let receipt = read_json::<RunIntegrityReceipt>(
+        &run_integrity_receipts_dir(project_root).join(format!("{}.json", manifest.run_id)),
+    );
+    let integrity = match receipt {
+        Ok(receipt)
+            if receipt.format_version == 1
+                && receipt.run_id == manifest.run_id
+                && structtrace_core::hashing::hash_file(&run_dir.join("manifest.json"))?
+                    == receipt.manifest_hash
+                && structtrace_core::hashing::hash_file(&run_dir.join("summary.json"))?
+                    == receipt.summary_hash =>
+        {
+            RunIntegrity {
+                status: RunIntegrityStatus::Verified,
+                detail: format!(
+                    "Cached immutable receipt from {} binds the manifest and summary after a full replay of {} cases. Open the run to reverify all artifacts.",
+                    receipt.verified_at, receipt.cases_replayed
+                ),
+            }
+        }
+        Ok(receipt) if receipt.run_id == manifest.run_id => RunIntegrity {
+            status: RunIntegrityStatus::Modified,
+            detail: format!(
+                "The manifest or summary no longer matches the last verified receipt from {}.",
+                receipt.verified_at
+            ),
+        },
+        _ => RunIntegrity {
+            status: RunIntegrityStatus::NotVerified,
+            detail: "No immutable replay receipt exists. Open this run to verify it before using its metrics."
+                .to_owned(),
+        },
+    };
+    response_from_run_with_integrity(project_root, run_dir, integrity)
+}
+
+fn run_integrity_receipts_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".structtrace/ui/run-integrity")
+}
+
+fn write_run_integrity_receipt(
+    project_root: &Path,
+    run_dir: &Path,
+    cases_replayed: usize,
+) -> anyhow::Result<()> {
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let directory = run_integrity_receipts_dir(project_root);
+    std::fs::create_dir_all(&directory)?;
+    make_owner_only_directory(&directory)?;
+    let receipt = RunIntegrityReceipt {
+        format_version: 1,
+        run_id: manifest.run_id.clone(),
+        manifest_hash: structtrace_core::hashing::hash_file(&run_dir.join("manifest.json"))?,
+        summary_hash: structtrace_core::hashing::hash_file(&run_dir.join("summary.json"))?,
+        verified_at: now_seconds(),
+        cases_replayed,
+    };
+    atomic_write(
+        &directory.join(format!("{}.json", manifest.run_id)),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )
+}
+
+fn inspect_run_integrity(run_dir: &Path) -> (RunIntegrity, usize) {
     let manifest: structtrace_core::artifact::RunManifest =
         match read_json(&run_dir.join("manifest.json")) {
             Ok(manifest) => manifest,
             Err(error) => {
-                return RunIntegrity {
-                    status: RunIntegrityStatus::NotVerified,
-                    detail: format!("Run manifest could not be verified: {error}"),
-                };
+                return (
+                    RunIntegrity {
+                        status: RunIntegrityStatus::NotVerified,
+                        detail: format!("Run manifest could not be verified: {error}"),
+                    },
+                    0,
+                );
             }
         };
     if manifest.artifact_format_version != structtrace_core::ARTIFACT_FORMAT_VERSION {
-        return RunIntegrity {
-            status: RunIntegrityStatus::NotVerified,
-            detail: format!(
-                "Artifact format {} requires a compatible StructTrace version.",
-                manifest.artifact_format_version
-            ),
-        };
+        return (
+            RunIntegrity {
+                status: RunIntegrityStatus::NotVerified,
+                detail: format!(
+                    "Artifact format {} requires a compatible StructTrace version.",
+                    manifest.artifact_format_version
+                ),
+            },
+            0,
+        );
     }
     for (relative, expected) in manifest.artifacts.iter().chain(&manifest.input_artifacts) {
         let relative_path = Path::new(relative);
@@ -3167,49 +3767,69 @@ fn inspect_run_integrity(run_dir: &Path) -> RunIntegrity {
                 )
             })
         {
-            return RunIntegrity {
-                status: RunIntegrityStatus::ReplayFailed,
-                detail: "Manifest contains an unsafe artifact path.".to_owned(),
-            };
+            return (
+                RunIntegrity {
+                    status: RunIntegrityStatus::ReplayFailed,
+                    detail: "Manifest contains an unsafe artifact path.".to_owned(),
+                },
+                0,
+            );
         }
         match structtrace_core::hashing::hash_file(&run_dir.join(relative_path)) {
             Ok(actual) if actual == *expected => {}
             Ok(_) => {
-                return RunIntegrity {
-                    status: RunIntegrityStatus::Modified,
-                    detail: format!("Manifest-bound artifact {relative} has been modified."),
-                };
+                return (
+                    RunIntegrity {
+                        status: RunIntegrityStatus::Modified,
+                        detail: format!("Manifest-bound artifact {relative} has been modified."),
+                    },
+                    0,
+                );
             }
             Err(_) => {
-                return RunIntegrity {
-                    status: RunIntegrityStatus::Modified,
-                    detail: format!("Manifest-bound artifact {relative} is missing or unreadable."),
-                };
+                return (
+                    RunIntegrity {
+                        status: RunIntegrityStatus::Modified,
+                        detail: format!(
+                            "Manifest-bound artifact {relative} is missing or unreadable."
+                        ),
+                    },
+                    0,
+                );
             }
         }
     }
     match structtrace_engine::replay_run(run_dir) {
-        Ok(report) if report.verified => RunIntegrity {
-            status: RunIntegrityStatus::Verified,
-            detail: format!(
-                "Every manifest-bound artifact matched and {} case scores replayed exactly.",
-                report.cases_replayed
-            ),
-        },
-        Ok(report) => RunIntegrity {
-            status: RunIntegrityStatus::ReplayFailed,
-            detail: format!(
-                "Replay rejected this run: {} artifact, {} cross-artifact, {} row-score, and {} summary mismatches.",
-                report.artifact_hash_mismatches.len(),
-                report.cross_artifact_mismatches.len(),
-                report.row_score_mismatches.len(),
-                report.summary_mismatches.len()
-            ),
-        },
-        Err(error) => RunIntegrity {
-            status: RunIntegrityStatus::ReplayFailed,
-            detail: format!("Replay could not verify this run: {error}"),
-        },
+        Ok(report) if report.verified => (
+            RunIntegrity {
+                status: RunIntegrityStatus::Verified,
+                detail: format!(
+                    "Every manifest-bound artifact matched and {} case scores replayed exactly.",
+                    report.cases_replayed
+                ),
+            },
+            report.cases_replayed,
+        ),
+        Ok(report) => (
+            RunIntegrity {
+                status: RunIntegrityStatus::ReplayFailed,
+                detail: format!(
+                    "Replay rejected this run: {} artifact, {} cross-artifact, {} row-score, and {} summary mismatches.",
+                    report.artifact_hash_mismatches.len(),
+                    report.cross_artifact_mismatches.len(),
+                    report.row_score_mismatches.len(),
+                    report.summary_mismatches.len()
+                ),
+            },
+            report.cases_replayed,
+        ),
+        Err(error) => (
+            RunIntegrity {
+                status: RunIntegrityStatus::ReplayFailed,
+                detail: format!("Replay could not verify this run: {error}"),
+            },
+            0,
+        ),
     }
 }
 
@@ -3287,8 +3907,107 @@ fn write_pins(project_root: &Path, pins: &[PinnedCase]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn refresh_regression_suite(project_root: &Path, run_dir: &Path) -> anyhow::Result<()> {
+    use std::io::BufRead;
+
+    let Some(project_id) = ui_project_id(run_dir) else {
+        return Ok(());
+    };
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let file = std::fs::File::open(run_dir.join("cases.jsonl"))?;
+    let mut current = HashMap::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let record: PairedCaseRecord = structtrace_core::strict_json::from_str(&line?)?;
+        current.insert(
+            record.case.id,
+            record.candidate_evaluation.deployment_success,
+        );
+    }
+    let mut pins = read_pins(project_root)?;
+    let mut changed = false;
+    for pin in pins.iter_mut().filter(|pin| pin.project_id == project_id) {
+        let status = match current.get(&pin.case_id).copied() {
+            Some(true) if pin.origin_candidate_pass => "passing",
+            Some(true) => "fixed",
+            Some(false)
+                if pin.origin_candidate_pass
+                    || matches!(pin.suite_status.as_str(), "passing" | "fixed") =>
+            {
+                "reintroduced"
+            }
+            Some(false) => "still_broken",
+            None => "missing",
+        }
+        .to_owned();
+        pin.suite_status = status.clone();
+        pin.last_run_id = Some(manifest.run_id.clone());
+        pin.evaluations.insert(manifest.run_id.clone(), status);
+        changed = true;
+    }
+    if changed {
+        write_pins(project_root, &pins)?;
+    }
+    Ok(())
+}
+
+fn regression_suite_summary(
+    project_root: &Path,
+    run_dir: &Path,
+) -> anyhow::Result<RegressionSuiteSummary> {
+    let Some(project_id) = ui_project_id(run_dir) else {
+        return Ok(RegressionSuiteSummary::default());
+    };
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let pins = read_pins(project_root)?;
+    let mut summary = RegressionSuiteSummary::default();
+    for status in pins
+        .iter()
+        .filter(|pin| pin.project_id == project_id)
+        .filter_map(|pin| pin.evaluations.get(&manifest.run_id))
+    {
+        summary.total += 1;
+        match status.as_str() {
+            "passing" => summary.passing += 1,
+            "fixed" => summary.fixed += 1,
+            "still_broken" => summary.still_broken += 1,
+            "reintroduced" => summary.reintroduced += 1,
+            _ => summary.missing += 1,
+        }
+    }
+    summary.blocking = summary.still_broken > 0 || summary.reintroduced > 0 || summary.missing > 0;
+    Ok(summary)
+}
+
 fn staged_sources_dir(project_root: &Path) -> PathBuf {
     project_root.join(".structtrace/ui/staged-sources")
+}
+
+struct TemporaryUpload {
+    path: PathBuf,
+    retained: bool,
+}
+
+impl TemporaryUpload {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            retained: false,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for TemporaryUpload {
+    fn drop(&mut self) {
+        if !self.retained {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn stage_browser_file(
@@ -3328,16 +4047,20 @@ fn accepted_response(
     };
     let staged: StagedSource =
         read_json(&staged_sources_dir(root).join(format!("{}.json", reference.source_id)))?;
-    let file = load_staged_source(root, &reference)?;
     Ok(AcceptedBaselineResponse {
         accepted,
         source: AcceptedSourceResponse {
             source_id: staged.source_id,
             hash: staged.hash,
-            name: file.name,
-            format: file.format,
-            bytes: file.content.len(),
-            content: file.content,
+            name: staged.name,
+            format: staged.format,
+            bytes: staged.bytes,
+            rows: staged.rows,
+            preview: staged
+                .preview_json
+                .iter()
+                .map(|row| structtrace_core::strict_json::value_from_str(row))
+                .collect::<Result<Vec<_>, _>>()?,
         },
     })
 }
@@ -3549,6 +4272,44 @@ fn load_staged_source(root: &Path, reference: &SourceReference) -> anyhow::Resul
     })
 }
 
+fn field_inventory_cache_key(
+    root: &Path,
+    request: &FieldInventoryRequest,
+) -> anyhow::Result<String> {
+    fn source_hash(root: &Path, reference: &SourceReference) -> anyhow::Result<String> {
+        validate_source_id(&reference.source_id)?;
+        let metadata: StagedSource =
+            read_json(&staged_sources_dir(root).join(format!("{}.json", reference.source_id)))?;
+        anyhow::ensure!(
+            metadata.source_id == reference.source_id,
+            "source metadata does not match its reference"
+        );
+        Ok(metadata.hash)
+    }
+
+    let schema_hash = request
+        .schema
+        .as_ref()
+        .map(|reference| source_hash(root, reference))
+        .transpose()?;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "dataset": source_hash(root, &request.dataset)?,
+        "baseline": source_hash(root, &request.baseline)?,
+        "candidate": source_hash(root, &request.candidate)?,
+        "schema": schema_hash,
+        "outputs": [
+            &request.dataset_output,
+            &request.baseline_output,
+            &request.candidate_output,
+        ],
+        "ids": [
+            &request.dataset_id,
+            &request.baseline_id,
+            &request.candidate_id,
+        ],
+    }))?)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -3571,28 +4332,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn make_owner_only_directory(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    structtrace_core::filesystem::make_private_directory(path)
 }
 
-#[cfg(not(unix))]
-fn make_owner_only_directory(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn make_owner_only_file(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_owner_only_file(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+    structtrace_core::filesystem::make_private_file(path)
 }
 
 fn strip_draft_source_contents(value: &mut Value) {
@@ -3604,7 +4349,7 @@ fn strip_draft_source_contents(value: &mut Value) {
     }
 }
 
-fn hydrate_draft_source_contents(root: &Path, value: &mut Value) -> anyhow::Result<()> {
+fn hydrate_draft_source_previews(root: &Path, value: &mut Value) -> anyhow::Result<()> {
     let Some(sources) = value.get_mut("sources").and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -3614,13 +4359,6 @@ fn hydrate_draft_source_contents(root: &Path, value: &mut Value) -> anyhow::Resu
             .and_then(Value::as_str)
             .context("saved source reference is missing sourceId")?
             .to_owned();
-        let file = load_staged_source(
-            root,
-            &SourceReference {
-                source_id: source_id.clone(),
-            },
-        )?;
-        source.insert("content".to_owned(), Value::String(file.content));
         let staged: StagedSource =
             read_json(&staged_sources_dir(root).join(format!("{source_id}.json")))?;
         source.insert(
@@ -3909,6 +4647,98 @@ mod tests {
             .unwrap();
         assert!(schema_only.schema_only);
         assert!(inventory.analyzed_all_rows);
+        assert!(
+            inventory
+                .mapping_candidates
+                .dataset
+                .contains(&"/expected/late".to_owned())
+        );
+    }
+
+    #[test]
+    fn schema_inventory_resolves_composition_local_refs_prefix_items_and_cycles() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "format": "uuid"},
+                        "next": {"$ref": "#/$defs/node"}
+                    }
+                }
+            },
+            "allOf": [
+                {"type": "object", "properties": {"customer": {"$ref": "#/$defs/node"}}},
+                {"type": "object", "properties": {"amount": {"oneOf": [{"type": "number"}, {"type": "string", "pattern": "^-?[0-9]+$"}]}}}
+            ],
+            "properties": {
+                "tuple": {"type": "array", "prefixItems": [{"type": "string", "format": "date"}, {"type": "integer"}]}
+            },
+            "if": {"properties": {"kind": {"enum": ["invoice"]}}},
+            "then": {"properties": {"invoice_id": {"type": "string"}}}
+        });
+        let mut fields = BTreeMap::new();
+        observe_schema_fields(&schema, &schema, "", &mut fields, &mut HashSet::new());
+        for pointer in [
+            "/customer",
+            "/customer/id",
+            "/customer/next",
+            "/amount",
+            "/tuple",
+            "/tuple/*",
+            "/kind",
+            "/invoice_id",
+        ] {
+            assert!(fields.contains_key(pointer), "missing {pointer}");
+        }
+        assert_eq!(fields["/customer/id"].format.as_deref(), Some("uuid"));
+        assert!(fields["/amount"].pattern.is_some());
+        assert!(fields["/kind"].enumerated);
+    }
+
+    #[test]
+    fn full_source_semantic_suggestions_cover_numeric_date_uuid_uri_and_schema_hints() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let make = |output: Value| serde_json::json!({"id": "a", "output": output});
+        let value = serde_json::json!({
+            "count": "12", "amount": "12.50", "date": "2026-08-11",
+            "request_id": id, "endpoint": "https://example.com/items", "state": "ready"
+        });
+        let rows = vec![make(value.clone())];
+        let schema = serde_json::json!({"type":"object","properties":{
+            "state":{"type":"string","enum":["ready","done"]},
+            "request_id":{"type":"string","format":"uuid"},
+            "endpoint":{"type":"string","format":"uri"}
+        }});
+        let inventory = build_field_inventory(FieldInventoryInput {
+            dataset: &rows,
+            baseline: &rows,
+            candidate: &rows,
+            output_pointers: ["/output", "/output", "/output"],
+            id_pointers: ["/id", "/id", "/id"],
+            schema: Some(&schema),
+        });
+        let field = |pointer: &str| {
+            inventory
+                .fields
+                .iter()
+                .find(|field| field.pointer == pointer)
+                .unwrap()
+        };
+        assert_eq!(field("/count").suggested_rule, "exact_integer");
+        assert_eq!(field("/amount").suggested_rule, "decimal_exact");
+        assert_eq!(field("/date").suggested_rule, "canonical_date");
+        assert!(
+            field("/request_id")
+                .semantic_hints
+                .contains(&"uuid".to_owned())
+        );
+        assert!(
+            field("/endpoint")
+                .semantic_hints
+                .contains(&"uri".to_owned())
+        );
+        assert!(field("/state").semantic_hints.contains(&"enum".to_owned()));
     }
 
     #[test]
@@ -3930,7 +4760,8 @@ mod tests {
     fn ci_request_uses_the_public_camel_case_api_contract() {
         let request: CiRequest = serde_json::from_value(serde_json::json!({
             "mode": "release",
-            "projectId": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4"
+            "projectId": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4",
+            "runId": "01K2TEST000000000000000000"
         }))
         .unwrap();
         assert!(matches!(request.mode, CiMode::Release));
@@ -3938,7 +4769,8 @@ mod tests {
         assert!(
             serde_json::from_value::<CiRequest>(serde_json::json!({
                 "mode": "release",
-                "project_id": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4"
+                "project_id": "6a7e824f-7e05-4ae6-b1ee-a8dafba785f4",
+                "run_id": "01K2TEST000000000000000000"
             }))
             .is_err()
         );
@@ -3949,7 +4781,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let run = crate::bundled_demo::run_invoice(root.path()).unwrap();
         assert_eq!(
-            inspect_run_integrity(&run.run_dir).status,
+            inspect_run_integrity(&run.run_dir).0.status,
             RunIntegrityStatus::Verified
         );
         let summary = run.run_dir.join("summary.json");
@@ -3957,8 +4789,26 @@ mod tests {
         bytes.push(b' ');
         std::fs::write(summary, bytes).unwrap();
         assert_eq!(
-            inspect_run_integrity(&run.run_dir).status,
+            inspect_run_integrity(&run.run_dir).0.status,
             RunIntegrityStatus::Modified
+        );
+    }
+
+    #[test]
+    fn cached_history_receipts_keep_one_hundred_run_rows_cheap() {
+        let root = tempfile::tempdir().unwrap();
+        let run = crate::bundled_demo::run_invoice(root.path()).unwrap();
+        let verified = response_from_run_verified(root.path(), &run.run_dir).unwrap();
+        assert_eq!(verified.integrity.status, RunIntegrityStatus::Verified);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            let cached = response_from_run_cached(root.path(), &run.run_dir).unwrap();
+            assert_eq!(cached.integrity.status, RunIntegrityStatus::Verified);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "100 receipt-backed history rows took {:?}",
+            started.elapsed()
         );
     }
 

@@ -6,7 +6,6 @@ import {
   Braces,
   Check,
   CheckCircle2,
-  ChevronDown,
   CircleDot,
   FileJson,
   FileSpreadsheet,
@@ -83,14 +82,12 @@ function SourceDrop({ kind, title, description, required, source, onSource }: {
 }) {
   const input = useRef<HTMLInputElement>(null);
   const read = (file: File) => {
-    void file.arrayBuffer().then((bytes) => {
-      const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      const pending: SourceArtifact = { kind, name: file.name, format: kind === "schema" ? "json" : detectFormat(file.name, content), content, bytes: new Blob([content]).size, rows: 0, status: "staging", message: "Strict validation and hashing on the local server…", sourceId: "", hash: "" };
-      onSource(pending);
-      void stageSource(kind, pending)
-        .then((staged) => onSource({ ...pending, ...staged, status: "ready", message: undefined }))
-        .catch((error: Error) => onSource({ ...pending, sourceId: "", hash: "", status: "error", message: error.message }));
-    }).catch(() => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The file is not valid UTF-8 and was refused before parsing.", sourceId: "", hash: "" }));
+    const format = kind === "schema" ? "json" : detectFormat(file.name, "");
+    const pending: SourceArtifact = { kind, name: file.name, format, bytes: file.size, rows: 0, status: "staging", message: "Streaming to the strict local parser and content-addressed store…", sourceId: "", hash: "" };
+    onSource(pending);
+    void stageSource(kind, file, format)
+      .then((staged) => onSource({ ...pending, ...staged, status: "ready", message: undefined }))
+      .catch((error: Error) => onSource({ ...pending, sourceId: "", hash: "", status: "error", message: error.message }));
   };
   return (
     <article className={`source-card ${source?.status === "ready" ? "source-ready" : ""} ${source?.status === "error" ? "source-error" : ""}`}>
@@ -119,9 +116,9 @@ function MappingStep() {
   const dataset = draft.sources.dataset!;
   const baseline = draft.sources.baseline!;
   const candidate = draft.sources.candidate!;
-  const dataRows = useMemo(() => dataset.preview ?? parseRows(dataset.content, dataset.format), [dataset]);
-  const baselineRows = useMemo(() => baseline.preview ?? parseRows(baseline.content, baseline.format), [baseline]);
-  const candidateRows = useMemo(() => candidate.preview ?? parseRows(candidate.content, candidate.format), [candidate]);
+  const dataRows = useMemo(() => dataset.preview ?? (dataset.content ? parseRows(dataset.content, dataset.format) : []), [dataset]);
+  const baselineRows = useMemo(() => baseline.preview ?? (baseline.content ? parseRows(baseline.content, baseline.format) : []), [baseline]);
+  const candidateRows = useMemo(() => candidate.preview ?? (candidate.content ? parseRows(candidate.content, candidate.format) : []), [candidate]);
   const dataPointers = useMemo(() => pointerCandidates(dataRows), [dataRows]);
   const baselinePointers = useMemo(() => pointerCandidates(baselineRows), [baselineRows]);
   const candidatePointers = useMemo(() => pointerCandidates(candidateRows), [candidateRows]);
@@ -154,6 +151,9 @@ function MappingStep() {
     }),
   });
   const mappingAudit = inventory.data?.mapping;
+  const completeDataPointers = inventory.data?.mappingCandidates.dataset ?? dataPointers;
+  const completeBaselinePointers = inventory.data?.mappingCandidates.baseline ?? baselinePointers;
+  const completeCandidatePointers = inventory.data?.mappingCandidates.candidate ?? candidatePointers;
   const duplicates = mappingAudit?.duplicateDatasetIds ?? [];
   const matched = mappingAudit?.matched ?? 0;
   const missingCandidate = mappingAudit?.missingCandidate ?? 0;
@@ -164,15 +164,15 @@ function MappingStep() {
   const set = (key: keyof typeof draft.mapping, value: string) => updateDraft({ mapping: { ...draft.mapping, [key]: value } });
   return (
     <>
-      <PageHeader eyebrow="Step 2 of 6" title="Confirm how your files are structured" description="StructTrace suggests mappings from a server-parsed sample. Complete field coverage is analyzed in the next step." />
+      <PageHeader eyebrow="Step 2 of 6" title="Confirm how your files are structured" description="StructTrace suggests mappings from the complete server-parsed source. You can also enter any valid JSON Pointer manually." />
       <div className="mapping-grid">
-        <MappingCard title="Golden data" source={dataset} rows={dataRows} options={dataPointers} fields={[
+        <MappingCard title="Golden data" source={dataset} rows={dataRows} options={completeDataPointers} fields={[
           ["Case ID", "datasetId", draft.mapping.datasetId], ["Input", "datasetInput", draft.mapping.datasetInput], ["Expected output", "datasetExpected", draft.mapping.datasetExpected],
         ]} set={set} />
-        <MappingCard title="Baseline" source={baseline} rows={baselineRows} options={baselinePointers} fields={[["Case ID", "baselineId", draft.mapping.baselineId], ["Output", "baselineOutput", draft.mapping.baselineOutput]]} set={set} />
-        <MappingCard title="Candidate" source={candidate} rows={candidateRows} options={candidatePointers} fields={[["Case ID", "candidateId", draft.mapping.candidateId], ["Output", "candidateOutput", draft.mapping.candidateOutput]]} set={set} />
+        <MappingCard title="Baseline" source={baseline} rows={baselineRows} options={completeBaselinePointers} fields={[["Case ID", "baselineId", draft.mapping.baselineId], ["Output", "baselineOutput", draft.mapping.baselineOutput]]} set={set} />
+        <MappingCard title="Candidate" source={candidate} rows={candidateRows} options={completeCandidatePointers} fields={[["Case ID", "candidateId", draft.mapping.candidateId], ["Output", "candidateOutput", draft.mapping.candidateOutput]]} set={set} />
       </div>
-      <Card className="envelope-mapping"><div className="panel-heading"><div><h2>Optional output-envelope fields</h2><p>Preserve provider status, errors, latency, token usage, cost, and metadata in immutable evidence. Leave unavailable fields blank.</p></div></div><div className="envelope-grid"><EnvelopeFields prefix="baseline" title="Baseline envelope" mapping={draft.mapping} options={baselinePointers} set={set} /><EnvelopeFields prefix="candidate" title="Candidate envelope" mapping={draft.mapping} options={candidatePointers} set={set} /></div></Card>
+      <Card className="envelope-mapping"><div className="panel-heading"><div><h2>Optional output-envelope fields</h2><p>Preserve provider status, errors, latency, token usage, cost, and metadata in immutable evidence. Leave unavailable fields blank.</p></div></div><div className="envelope-grid"><EnvelopeFields prefix="baseline" title="Baseline envelope" mapping={draft.mapping} options={completeBaselinePointers} set={set} /><EnvelopeFields prefix="candidate" title="Candidate envelope" mapping={draft.mapping} options={completeCandidatePointers} set={set} /></div></Card>
       <Card className="coverage-card">
         <div><strong>{matched.toLocaleString()}</strong><span>matched cases</span></div>
         <div className={duplicates.length ? "metric-bad" : ""}><strong>{duplicates.length}</strong><span>duplicate IDs</span></div>
@@ -196,7 +196,7 @@ function MappingCard({ title, source, rows, options, fields, set }: {
   return (
     <Card className="mapping-card">
       <div className="mapping-title"><div><h2>{title}</h2><p>{source.name}</p></div><Status tone="pass" label={`${source.rows} total rows`} /></div>
-      {fields.map(([label, key, value]) => <label className="field-select" key={key}><span>{label}<small>Suggested · verify</small></span><div><select value={value} onChange={(event) => set(key, event.target.value)}>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select><ChevronDown size={15} /></div></label>)}
+      {fields.map(([label, key, value]) => { const listId = `mapping-${key}`; return <label className="field-select" key={key}><span>{label}<small>Suggested · verify or type a pointer</small></span><div><input list={listId} value={value} onChange={(event) => set(key, event.target.value)} /><datalist id={listId}>{options.map((pointer) => <option key={pointer} value={pointer} />)}</datalist></div></label>; })}
       <div className="sample-json"><small>Server-parsed sample record</small><pre>{exactJsonStringify(rows[0], 2).slice(0, 620)}</pre></div>
     </Card>
   );
@@ -205,7 +205,7 @@ function MappingCard({ title, source, rows, options, fields, set }: {
 function inferOptionalPointer(options: string[], candidates: string[], previous?: string) { return candidates.find((pointer) => options.includes(pointer)) ?? (previous && options.includes(previous) ? previous : ""); }
 function EnvelopeFields({ prefix, title, mapping, options, set }: { prefix: "baseline" | "candidate"; title: string; mapping: Mapping; options: string[]; set: (key: MappingKey, value: string) => void }) {
   const suffixes = [["Status", "Status"], ["Error", "Error"], ["Latency", "Latency"], ["Token usage", "Usage"], ["Cost", "Cost"], ["Provider metadata", "Metadata"]] as const;
-  return <fieldset><legend>{title}</legend>{suffixes.map(([label, suffix]) => { const key = `${prefix}${suffix}` as MappingKey; return <label key={key}><span>{label}</span><select value={mapping[key] ?? ""} onChange={(event) => set(key, event.target.value)}><option value="">Not available</option>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select></label>; })}</fieldset>;
+  return <fieldset><legend>{title}</legend>{suffixes.map(([label, suffix]) => { const key = `${prefix}${suffix}` as MappingKey; const listId = `mapping-${key}`; return <label key={key}><span>{label}</span><input list={listId} value={mapping[key] ?? ""} placeholder="Not available" onChange={(event) => set(key, event.target.value)} /><datalist id={listId}>{options.map((pointer) => <option key={pointer} value={pointer} />)}</datalist></label>; })}</fieldset>;
 }
 
 function CorrectnessStep() {
@@ -229,7 +229,7 @@ function CorrectnessStep() {
       candidateCoverage: field.candidateCoverage, observedType: field.observedType,
       keys: field.suggestedRule === "keyed_array" ? identity?.pointer.slice(field.pointer.length + 2) : undefined,
       keyFields: field.suggestedRule === "keyed_array" ? (identity ? [identity.pointer.slice(field.pointer.length + 2)] : []) : undefined,
-      arrayFields: field.suggestedRule === "keyed_array" ? children.filter((item) => item !== identity).map((item) => ({ pointer: item.pointer.slice(field.pointer.length + 2), kind: item.suggestedRule === "keyed_array" || item.suggestedRule === "decimal_exact" ? "exact" as const : item.suggestedRule })) : undefined,
+      arrayFields: field.suggestedRule === "keyed_array" ? children.filter((item) => item !== identity).map((item) => ({ pointer: item.pointer.slice(field.pointer.length + 2), kind: item.suggestedRule === "keyed_array" ? "exact" as const : item.suggestedRule })) : undefined,
     } satisfies FieldRule;
   }), [inventory.data]);
   const [initialized, setInitialized] = useState(false);
@@ -241,6 +241,7 @@ function CorrectnessStep() {
   const update = (pointer: string, next: Partial<FieldRule>) => setRules(draft.rules.map((rule) => rule.pointer === pointer ? { ...rule, ...next } : rule));
   const enabled = draft.rules.filter((rule) => rule.enabled);
   const keyedRules = enabled.filter((rule) => rule.kind === "keyed_array");
+  const keyedRulesValid = keyedRules.every((rule) => (rule.keyFields?.length ?? 0) > 0 && (rule.arrayFields?.length ?? 0) > 0);
   return (
     <>
       <PageHeader eyebrow="Step 3 of 6" title="What does correct mean for your application?" description="Schema validity is never treated as task correctness. Every bounded source row and the caller schema are analyzed before suggestions appear." />
@@ -261,8 +262,8 @@ function CorrectnessStep() {
       </Card>
       {keyedRules.map((rule) => <KeyedArrayBuilder key={rule.pointer} rule={rule} update={(next) => update(rule.pointer, next)} />)}
       {enabled.length > 0 && <Card className="rule-preview"><div className="panel-heading"><div><h2>Rule behavior preview</h2><p>These examples describe the deterministic result states before the configuration is saved.</p></div><Status tone="info" label={`${enabled.length} active`} /></div><div className="rule-preview-grid">{enabled.slice(0, 6).map((rule) => <div key={rule.pointer}><code>{rule.pointer}</code><span><b className="preview-pass">Pass</b>{passExample(rule)}</span><span><b className="preview-fail">Regression</b>{failureExample(rule)}</span><span><b className="preview-error">Unscored/error</b>Missing expected reference or evaluator failure never counts as a pass.</span></div>)}</div></Card>}
-      <InlineNotice title="Why suggestions appear">Suggestions come only from observed JSON types and field names. They are never silently activated or changed after you review them.</InlineNotice>
-      <WizardActions back={navigation.back} next={navigation.next} disabled={!enabled.length} />
+      <InlineNotice title="Why suggestions appear">Suggestions combine complete-source values with JSON Schema type, format, pattern, and enum hints. They are never silently activated or changed after you review them.</InlineNotice>
+      <WizardActions back={navigation.back} next={navigation.next} disabled={!enabled.length || !keyedRulesValid} />
     </>
   );
 }
@@ -290,10 +291,11 @@ function KeyedArrayBuilder({ rule, update }: { rule: FieldRule; update: (next: P
       {allPointers.map((pointer) => {
         const field = comparison(pointer);
         const role = keys.has(pointer) ? "key" : field?.kind ?? "ignore";
-        return <div className="array-field-row" key={pointer}><code>{pointer}</code><select value={role} onChange={(event) => setRole(pointer, event.target.value)} aria-label={`Role for ${pointer}`}><option value="key">Match key</option><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_tolerance">Decimal tolerance</option><option value="ignore">Do not compare</option></select><span>{role === "key" ? "Pairs the same item across variants" : role === "ignore" ? "Excluded from correctness" : role === "decimal_tolerance" ? <label>± <input value={field?.tolerance ?? "0.01"} onChange={(event) => update({ arrayFields: fields.map((item) => item.pointer === pointer ? { ...item, tolerance: event.target.value } : item) })} aria-label={`Tolerance for ${pointer}`} /></label> : "Deterministic evaluator"}</span></div>;
+        return <div className="array-field-row" key={pointer}><code>{pointer}</code><select value={role} onChange={(event) => setRole(pointer, event.target.value)} aria-label={`Role for ${pointer}`}><option value="key">Match key</option><option value="exact">Exact value</option><option value="normalized_string">Normalized text</option><option value="canonical_date">Calendar date</option><option value="exact_integer">Exact integer</option><option value="decimal_exact">Exact decimal</option><option value="decimal_tolerance">Decimal tolerance</option><option value="ignore">Do not compare</option></select><span>{role === "key" ? "Pairs the same item across variants" : role === "ignore" ? "Excluded from correctness" : role === "decimal_tolerance" ? <label>± <input value={field?.tolerance ?? "0.01"} onChange={(event) => update({ arrayFields: fields.map((item) => item.pointer === pointer ? { ...item, tolerance: event.target.value } : item) })} aria-label={`Tolerance for ${pointer}`} /></label> : "Deterministic evaluator"}</span></div>;
       })}
     </div>
     {!keys.size && <InlineNotice tone="danger" title="Choose at least one stable item key">A keyed array cannot pair items safely without an identity such as SKU, product code, or ID.</InlineNotice>}
+    {!fields.length && <InlineNotice tone="danger" title="Choose at least one compared item field">Pairing items is not correctness by itself. Select at least one non-key field to compare.</InlineNotice>}
   </Card>;
 }
 function formatCoverage(value: number) { return `${Math.round(value * 100)}%`; }
@@ -316,7 +318,6 @@ function EvidenceStep() {
       <div className="gate-grid">{modes.map(({ mode, title, text, badge }) => <button key={mode} disabled={mode === "release" && !releaseAvailable} className={draft.gateMode === mode ? "selected" : ""} onClick={() => updateDraft({ gateMode: mode, minCases: mode === "release" ? Math.max(100, draft.minCases) : draft.minCases })}><span className="radio-dot">{draft.gateMode === mode && <span />}</span><div><h2>{title}{badge && <em>{badge}</em>}</h2><p>{mode === "release" && !releaseAvailable ? "Unavailable until you provide the caller-facing JSON Schema." : text}</p></div></button>)}</div>
       <Card className="evidence-profile">
         <div className="panel-heading"><div><h2>{draft.gateMode === "release" ? "Conservative release profile" : "Balanced evidence profile"}</h2><p>Plain-language thresholds generated into the reproducible configuration.</p></div><ShieldCheck size={22} /></div>
-        <label className="range-field"><span><strong>Required independent cases</strong><small>Current dataset contains {rows.toLocaleString()} rows.{draft.gateMode === "release" ? " Release authority requires at least 100." : ""}</small></span><input type="number" min={draft.gateMode === "release" ? "100" : "1"} max="100000" value={draft.minCases} onChange={(event) => updateDraft({ minCases: Math.max(draft.gateMode === "release" ? 100 : 1, Number(event.target.value)) })} /></label>
         <label className={`setting-row ${!financialReady ? "disabled-row" : ""}`}><span><strong>Invoice financial invariants</strong><small>{financialReady ? "Cross-checks line amounts, subtotal, tax, and total with absolute tolerance 0.01." : "Unavailable because /line_items, /subtotal, /tax, and /total were not all discovered."}</small></span><input type="checkbox" disabled={!financialReady} checked={draft.financialInvariants && financialReady} onChange={(event) => updateDraft({ financialInvariants: event.target.checked })} /></label>
         <div className="evidence-rules"><span><Check size={15} /> At least 99% fully evaluated</span><span><Check size={15} /> No repeated-trial conflicts</span><span><Check size={15} /> Candidate may regress by at most 0 pp</span>{draft.gateMode === "release" && <><span><Check size={15} /> Candidate deployment success at least 95%</span><span><Check size={15} /> Candidate strict JSON and schema validity 100%</span></>}</div>
       </Card>

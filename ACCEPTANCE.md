@@ -2,9 +2,11 @@
 
 This file separates locally observed evidence from checks that require external
 infrastructure or users. It is not a substitute for CI logs or user feedback.
-The reproducible `scripts/record-local-acceptance.sh` command writes exact commit, toolchain,
-platform, command exit status, and log hashes to `acceptance/local-release-audit.json`; prose in
-this file is not treated as machine evidence.
+The reproducible `scripts/record-local-acceptance.sh` command writes an ignored local receipt with
+the exact commit, source archive, dependency locks, frontend build, toolchain, platform, command
+exit status, and log hashes. CI uploads the receipt and logs for the exact source revision. Tagged
+release evidence additionally binds the downloadable archive, extracted binary, SPDX SBOM, and
+platform smoke commands. No checked-in `passed: true` file is treated as timeless proof.
 
 ## Locally verified
 
@@ -84,7 +86,7 @@ this file is not treated as machine evidence.
 | Real deployment decision | **PENDING** |
 | Misleading gates / privacy incidents | **PENDING external observation**; no claim can be made before the alpha |
 | Browser performance matrix | Chromium and Firefox functional/accessibility checks now pass locally; clean-browser 1,000/10,000-row open/filter measurements and WebKit evidence remain unrecorded across release operating systems |
-| Windows descendant containment | command/Python execution remains beta until Job Object tests pass on a real Windows runner |
+| Windows descendant containment | Job Object containment is implemented; exact-revision Windows runner evidence remains required before release |
 | Interleaved live-provider execution | OpenAI-compatible execution remains experimental; paired-interleaved scheduling and per-case paid-run resume are not complete |
 
 ## Material boundaries
