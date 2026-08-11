@@ -34,12 +34,13 @@ function RunsPage() {
   const navigate = useNavigate();
   const runs = useQuery({ queryKey: ["runs"], queryFn: getRuns });
   return <div className="page page-wide"><PageHeader title="Comparisons" description="Completed evidence is retained with an explicit integrity state and survives a local server restart." />{runs.data?.length ? <Card className="history-table"><div className="history-head"><span>Comparison</span><span>Decision</span><span>Deployment change</span><span>Independent cases</span><span /></div>{runs.data.map((run) => {
-    const gate = run.summary.gate;
-    const qualityFailed = gate.quality_failures.length > 0;
-    const verified = run.integrity.status === "verified";
+    const gate = run.gate;
+    const difference = run.differencePp;
+    const qualityFailed = (gate?.quality_failures.length ?? 0) > 0;
+    const verified = run.integrity.status === "verified" && gate !== null && difference !== null && run.independentCases !== null;
     const label = !verified ? "Authority disabled" : gate.deployment_authorized ? "Release authorized" : qualityFailed ? "Do not deploy" : gate.status === "insufficient_evidence" ? "Not enough evidence" : gate.status === "failed" ? "Do not deploy" : gate.gate_mode === "regression" ? "Regression passed" : "Analysis complete";
-    const tone = !verified || qualityFailed || gate.status === "failed" ? "fail" : gate.status === "insufficient_evidence" ? "warning" : gate.deployment_authorized ? "pass" : "info";
-    return <button className="history-row" key={run.runId} onClick={() => void navigate({ to: "/runs/$runId", params: { runId: run.runId } })}><span><strong>{run.projectName}</strong><small>{run.runId} · {verified ? "receipt verified" : run.integrity.status}</small></span><Status tone={tone} label={label} /><code>{verified ? `${run.summary.paired.difference_pp >= 0 ? "+" : ""}${run.summary.paired.difference_pp.toFixed(1)} pp` : "withheld"}</code><strong>{verified ? run.summary.evidence.effective_inference_units : "—"}</strong><ArrowRight size={16} /></button>;
+    const tone = !verified || qualityFailed || gate?.status === "failed" ? "fail" : gate.status === "insufficient_evidence" ? "warning" : gate.deployment_authorized ? "pass" : "info";
+    return <button className="history-row" key={run.runId} onClick={() => void navigate({ to: "/runs/$runId", params: { runId: run.runId } })}><span><strong>{run.projectName}</strong><small>{run.runId} · {verified ? "receipt verified" : run.integrity.status}</small></span><Status tone={tone} label={label} /><code>{verified && difference !== null ? `${difference >= 0 ? "+" : ""}${difference.toFixed(1)} pp` : "withheld"}</code><strong>{verified ? run.independentCases : "—"}</strong><ArrowRight size={16} /></button>;
   })}</Card> : <Card><EmptyState icon={History} title={runs.isLoading ? "Loading comparisons…" : "No production comparisons yet"} description="Complete a recorded-output comparison and its decision will appear here." /></Card>}</div>;
 }
 

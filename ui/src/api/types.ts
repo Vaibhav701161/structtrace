@@ -174,6 +174,29 @@ export const runResultSchema = z.object({
 });
 export type RunResult = z.infer<typeof runResultSchema>;
 
+export const runListItemSchema = z.object({
+  runId: z.string(),
+  projectId: z.string().nullable(),
+  projectName: z.string(),
+  createdAt: z.number(),
+  differencePp: z.number().nullable(),
+  independentCases: z.number().nullable(),
+  gate: z.object({
+    gate_mode: gateModeSchema,
+    status: z.enum(["passed", "failed", "not_configured", "insufficient_evidence", "error"]),
+    deployment_authorized: z.boolean(),
+    quality_failures: z.array(z.string()),
+    evidence_failures: z.array(z.string()),
+    runtime_errors: z.array(z.string()),
+    rules: z.array(z.unknown()),
+  }).nullable(),
+  integrity: z.object({
+    status: z.enum(["verified", "modified", "not_verified", "replay_failed"]),
+    detail: z.string(),
+  }),
+});
+export type RunListItem = z.infer<typeof runListItemSchema>;
+
 export const acceptedBaselineSchema = z.object({
   accepted: z.object({
     runId: z.string(), projectId: z.string(), acceptedAt: z.number(),

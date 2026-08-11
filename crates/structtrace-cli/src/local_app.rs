@@ -27,6 +27,7 @@ use serde_json::Value;
 use structtrace_core::{
     artifact::{PairedCaseRecord, RunSummary},
     config::{Config, DatasetFields, EvaluatorKind, GateMode},
+    gate::GateDecision,
 };
 use ulid::Ulid;
 
@@ -362,6 +363,19 @@ struct RunResponse {
     regression_suite: RegressionSuiteSummary,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunListResponse {
+    run_id: String,
+    project_id: Option<String>,
+    project_name: String,
+    created_at: u64,
+    difference_pp: Option<f64>,
+    independent_cases: Option<usize>,
+    gate: Option<GateDecision>,
+    integrity: RunIntegrity,
+}
+
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegressionSuiteSummary {
@@ -399,6 +413,18 @@ struct RunIntegrityReceipt {
     summary_hash: String,
     verified_at: u64,
     cases_replayed: usize,
+    #[serde(default)]
+    listing: Option<RunListMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunListMetrics {
+    project_name: String,
+    created_at: u64,
+    difference_pp: f64,
+    independent_cases: usize,
+    gate: GateDecision,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1546,7 +1572,9 @@ async fn get_accepted_baseline(
     Ok(Json(accepted_response(&state.project_root, accepted)?))
 }
 
-async fn list_runs(State(state): State<Arc<AppState>>) -> Result<Json<Vec<RunResponse>>, AppError> {
+async fn list_runs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<RunListResponse>>, AppError> {
     let directories = state
         .runs
         .lock()
@@ -3662,43 +3690,86 @@ fn response_from_run_verified(project_root: &Path, run_dir: &Path) -> anyhow::Re
     response_from_run_with_integrity(project_root, run_dir, integrity)
 }
 
-fn response_from_run_cached(project_root: &Path, run_dir: &Path) -> anyhow::Result<RunResponse> {
+fn response_from_run_cached(
+    project_root: &Path,
+    run_dir: &Path,
+) -> anyhow::Result<RunListResponse> {
     let manifest: structtrace_core::artifact::RunManifest =
         read_json(&run_dir.join("manifest.json"))?;
     let receipt = read_json::<RunIntegrityReceipt>(
         &run_integrity_receipts_dir(project_root).join(format!("{}.json", manifest.run_id)),
     );
-    let integrity = match receipt {
+    let (integrity, listing) = match receipt {
         Ok(receipt)
-            if receipt.format_version == 1
+            if receipt.format_version == 2
                 && receipt.run_id == manifest.run_id
+                && receipt.listing.is_some()
                 && structtrace_core::hashing::hash_file(&run_dir.join("manifest.json"))?
                     == receipt.manifest_hash
                 && structtrace_core::hashing::hash_file(&run_dir.join("summary.json"))?
                     == receipt.summary_hash =>
         {
-            RunIntegrity {
-                status: RunIntegrityStatus::Verified,
-                detail: format!(
-                    "Cached immutable receipt from {} binds the manifest and summary after a full replay of {} cases. Open the run to reverify all artifacts.",
-                    receipt.verified_at, receipt.cases_replayed
-                ),
-            }
+            let detail = format!(
+                "Cached immutable receipt from {} binds the manifest and summary after a full replay of {} cases. Open the run to reverify all artifacts.",
+                receipt.verified_at, receipt.cases_replayed
+            );
+            (
+                RunIntegrity {
+                    status: RunIntegrityStatus::Verified,
+                    detail,
+                },
+                receipt.listing,
+            )
         }
-        Ok(receipt) if receipt.run_id == manifest.run_id => RunIntegrity {
-            status: RunIntegrityStatus::Modified,
-            detail: format!(
-                "The manifest or summary no longer matches the last verified receipt from {}.",
-                receipt.verified_at
-            ),
-        },
-        _ => RunIntegrity {
-            status: RunIntegrityStatus::NotVerified,
-            detail: "No immutable replay receipt exists. Open this run to verify it before using its metrics."
-                .to_owned(),
-        },
+        Ok(receipt) if receipt.run_id == manifest.run_id && receipt.format_version == 2 => (
+            RunIntegrity {
+                status: RunIntegrityStatus::Modified,
+                detail: format!(
+                    "The manifest or summary no longer matches the last verified receipt from {}.",
+                    receipt.verified_at
+                ),
+            },
+            None,
+        ),
+        _ => (
+            RunIntegrity {
+                status: RunIntegrityStatus::NotVerified,
+                detail: "No current immutable replay receipt exists. Open this run to verify it before using its metrics."
+                    .to_owned(),
+            },
+            None,
+        ),
     };
-    response_from_run_with_integrity(project_root, run_dir, integrity)
+    let (project_name, created_at, difference_pp, independent_cases, gate) = listing.map_or_else(
+        || {
+            (
+                manifest.project_name.clone(),
+                u64::try_from(manifest.started_at_unix_ms).unwrap_or(u64::MAX),
+                None,
+                None,
+                None,
+            )
+        },
+        |metrics| {
+            (
+                metrics.project_name,
+                metrics.created_at,
+                Some(metrics.difference_pp),
+                Some(metrics.independent_cases),
+                Some(metrics.gate),
+            )
+        },
+    );
+    Ok(RunListResponse {
+        run_id: manifest.run_id,
+        project_id: ui_project_id(run_dir),
+        project_name,
+        created_at,
+        difference_pp,
+        independent_cases,
+        gate,
+        integrity,
+    })
 }
 
 fn run_integrity_receipts_dir(project_root: &Path) -> PathBuf {
@@ -3712,16 +3783,24 @@ fn write_run_integrity_receipt(
 ) -> anyhow::Result<()> {
     let manifest: structtrace_core::artifact::RunManifest =
         read_json(&run_dir.join("manifest.json"))?;
+    let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
     let directory = run_integrity_receipts_dir(project_root);
     std::fs::create_dir_all(&directory)?;
     make_owner_only_directory(&directory)?;
     let receipt = RunIntegrityReceipt {
-        format_version: 1,
+        format_version: 2,
         run_id: manifest.run_id.clone(),
         manifest_hash: structtrace_core::hashing::hash_file(&run_dir.join("manifest.json"))?,
         summary_hash: structtrace_core::hashing::hash_file(&run_dir.join("summary.json"))?,
         verified_at: now_seconds(),
         cases_replayed,
+        listing: Some(RunListMetrics {
+            project_name: manifest.project_name.clone(),
+            created_at: u64::try_from(manifest.started_at_unix_ms).unwrap_or(u64::MAX),
+            difference_pp: summary.paired.difference_pp,
+            independent_cases: summary.evidence.effective_inference_units,
+            gate: summary.gate,
+        }),
     };
     atomic_write(
         &directory.join(format!("{}.json", manifest.run_id)),
@@ -4804,12 +4883,26 @@ mod tests {
         for _ in 0..100 {
             let cached = response_from_run_cached(root.path(), &run.run_dir).unwrap();
             assert_eq!(cached.integrity.status, RunIntegrityStatus::Verified);
+            assert!(cached.difference_pp.is_some());
+            assert!(serde_json::to_vec(&cached).unwrap().len() < 32 * 1024);
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "100 receipt-backed history rows took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn unverified_history_row_never_reads_or_exposes_large_summary_metrics() {
+        let root = tempfile::tempdir().unwrap();
+        let run = crate::bundled_demo::run_invoice(root.path()).unwrap();
+        std::fs::write(run.run_dir.join("summary.json"), b"not trusted JSON").unwrap();
+        let cached = response_from_run_cached(root.path(), &run.run_dir).unwrap();
+        assert_eq!(cached.integrity.status, RunIntegrityStatus::NotVerified);
+        assert!(cached.difference_pp.is_none());
+        assert!(cached.independent_cases.is_none());
+        assert!(cached.gate.is_none());
     }
 
     #[test]

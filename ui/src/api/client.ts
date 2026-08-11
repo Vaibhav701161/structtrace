@@ -1,4 +1,4 @@
-import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, fieldInventorySchema, jobResponseSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
+import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, fieldInventorySchema, jobResponseSchema, pinnedCaseSchema, projectSummarySchema, runListItemSchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
 import { strictJsonParse } from "../lib/lossless-json";
 
 function capabilityBase(): string {
@@ -106,7 +106,7 @@ export async function getRunCases(runId: string, offset: number, filter: string,
 }
 
 export async function getRuns() {
-  return runResultSchema.array().parse(await request("/runs"));
+  return runListItemSchema.array().parse(await request("/runs"));
 }
 
 export async function getProjects() {
