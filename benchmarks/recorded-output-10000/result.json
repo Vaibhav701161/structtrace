@@ -1,48 +1,48 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-10T15:33:43.564767+00:00",
+  "generated_at": "2026-08-11T09:52:34.732155+00:00",
   "cases": 10000,
   "platform": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
   "rustc": "rustc 1.87.0 (17067e9ac 2025-05-09)",
-  "source_commit": "0cd51fe8db5d5972925bb27110f27552766c9bc0",
+  "source_commit": "297215aabc83786f86ed4104a79ee0c8e123e4f8",
   "source_worktree_clean": true,
-  "cargo_lock_sha256": "57c806d3e7edebbfb7d8d4d50f28f572a806afb133520d365846346dd685c294",
-  "binary_sha256": "b1464e8213ac1cb24352eda243b9b055bc61b12342f741ada453a89d143f2acf",
+  "cargo_lock_sha256": "9ae3824a91188f1537478bc48e758c4755c614cb3b47c32ea81a4a3be8091ffb",
+  "binary_sha256": "5acd92720ba9160ab9170b5d251a82034e836d863f464b1d901531d6d18f3604",
   "source_bytes": {
     "dataset": 938890,
     "baseline": 770000,
     "candidate": 770000
   },
-  "run_artifact_bytes": 72182337,
+  "run_artifact_bytes": 72632417,
   "commands": [
     {
       "command": [
         "/home/vaibhav/structtrace/target/release/structtrace",
         "--project-root",
-        "/tmp/structtrace-scale-bcsbk9mk",
+        "/tmp/structtrace-scale-otlppvn7",
         "run"
       ],
       "exit_code": 0,
-      "wall_seconds": 153.085,
-      "stdout_tail": "STRUCTTRACE RUN COMPLETE\n\nRun:          01KZP4S3Z21AB2R4XFZAN1JR41\nBaseline:     10000/10000 (100.0%)\nCandidate:    10000/10000 (100.0%)\nDifference:   +0.00 percentage points\nTransitions:  0 candidate-only, 0 baseline-only\nGate:         advisory NOT CONFIGURED\nAuthorization: NO DEPLOYMENT AUTHORIZATION\nReport:       /tmp/structtrace-scale-bcsbk9mk/.structtrace/runs/01KZP4S3Z21AB2R4XFZAN1JR41/report/index.html\nOpen with:    structtrace report 01KZP4S3Z21AB2R4XFZAN1JR41 --open\n              (chunked reports may not work through file://)\n",
+      "wall_seconds": 156.644,
+      "stdout_tail": "STRUCTTRACE RUN COMPLETE\n\nRun:          01KZR3N28RCT5CTQBKCRCFTH8G\nBaseline:     10000/10000 (100.0%)\nCandidate:    10000/10000 (100.0%)\nDifference:   +0.00 percentage points\nTransitions:  0 candidate-only, 0 baseline-only\nGate:         advisory NOT CONFIGURED\nAuthorization: NO DEPLOYMENT AUTHORIZATION\nReport:       /tmp/structtrace-scale-otlppvn7/.structtrace/runs/01KZR3N28RCT5CTQBKCRCFTH8G/report/index.html\nOpen with:    structtrace report 01KZR3N28RCT5CTQBKCRCFTH8G --open\n              (chunked reports may not work through file://)\n",
       "stderr_tail": "",
-      "measured_wall_seconds": 153.08,
-      "peak_rss_kib": 325640
+      "measured_wall_seconds": 156.64,
+      "peak_rss_kib": 326232
     },
     {
       "command": [
         "/home/vaibhav/structtrace/target/release/structtrace",
         "--project-root",
-        "/tmp/structtrace-scale-bcsbk9mk",
+        "/tmp/structtrace-scale-otlppvn7",
         "replay",
         "latest"
       ],
       "exit_code": 0,
-      "wall_seconds": 2.17,
-      "stdout_tail": "STRUCTTRACE REPLAY\n\nRun:                          01KZP4S3Z21AB2R4XFZAN1JR41\nCases replayed:               10000\nVariant outputs replayed:     20000\nBuilt-in evaluator results recomputed: 20000\nExternal evaluator receipts verified: 0\nExternal evaluator programs re-executed: 0\n\nArtifact hash mismatches:     0\nCross-artifact mismatches:  0\nRow-score mismatches:         0\nSummary mismatches:           0\n\nREPLAY VERIFIED\n",
+      "wall_seconds": 2.311,
+      "stdout_tail": "STRUCTTRACE REPLAY\n\nRun:                          01KZR3N28RCT5CTQBKCRCFTH8G\nCases replayed:               10000\nVariant outputs replayed:     20000\nBuilt-in evaluator results recomputed: 20000\nExternal evaluator receipts verified: 0\nExternal evaluator programs re-executed: 0\n\nArtifact hash mismatches:     0\nCross-artifact mismatches:  0\nRow-score mismatches:         0\nSummary mismatches:           0\n\nREPLAY VERIFIED\n",
       "stderr_tail": "",
-      "measured_wall_seconds": 2.16,
-      "peak_rss_kib": 288124
+      "measured_wall_seconds": 2.3,
+      "peak_rss_kib": 287512
     }
   ],
   "passed": true
