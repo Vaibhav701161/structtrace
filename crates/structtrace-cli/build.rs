@@ -4,6 +4,7 @@ use std::{env, path::Path, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR");
     let revision = Command::new("git")
         .args([

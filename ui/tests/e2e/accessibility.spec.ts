@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { execFileSync } from "node:child_process";
 
 test("welcome screen has no detectable WCAG A/AA violations", async ({ page }) => {
   await page.goto(process.env.STRUCTTRACE_UI_URL ?? "/");
@@ -147,7 +148,8 @@ test("authorized candidate becomes the next baseline in the same project", async
   await expect(page.getByText(/files were materialized/)).toBeVisible();
   const generatedWorkflow = page.locator(".generated-file").filter({ hasText: ".github/workflows/structtrace.yml" });
   await expect(generatedWorkflow).toContainText("structtrace release-check latest");
-  await expect(generatedWorkflow).toContainText(/ref: [0-9a-f]{40}/);
+  const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", cwd: ".." }).trim();
+  await expect(generatedWorkflow).toContainText(`ref: ${sourceRevision}`);
   await page.goto(resultUrl);
   await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible();
   await page.getByRole("link", { name: "Projects" }).click();
