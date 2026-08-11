@@ -1,0 +1,10 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+---
+<DocsLayout title="Evidence and replay" description="Learn how StructTrace binds sources, retains immutable runs, verifies reports, and replays deterministic evidence." lead="The report is a view over an evidence bundle. The manifest, retained inputs, row facts, summaries, and replay path are the authority boundary.">
+  <h2>Finalized run</h2><p>Completed runs are immutable. Their manifest binds the relevant configuration, dataset, schema, implementation sources, model-facing schemas, output artifacts, evaluation rows, summary, and report files.</p>
+  <h2>Replay</h2><pre><code>structtrace replay latest</code></pre><p>Replay streams and hashes retained inputs, rejects unsafe paths and symlinks, reconstructs normalized rows, recomputes built-in evaluators, verifies custom-evaluator receipts, and compares derived summaries. Side-effecting evaluator programs are not silently executed again.</p>
+  <h2>High-assurance gate</h2><pre><code>structtrace gate latest --verify replay</code></pre><p>This binds the gate decision to a successful replay in the same command. Stable exit codes distinguish success, regression, insufficient evidence, artifact failure, and runtime error.</p>
+  <h2>Share exports</h2><pre><code>structtrace report latest --export-share ./share</code></pre><p>The aggregate-only derivative omits case bodies and process logs. It does not replace reviewing the source artifact for sensitive aggregates or project names.</p>
+  <h2>Archives</h2><p>Verified archives include only allowlisted manifest-bound files and a BLAKE3 receipt. Debug files, arbitrary additions, secrets, and symlinks are excluded. Preserve a corrupt run as evidence and create a new run rather than editing it.</p>
+</DocsLayout>

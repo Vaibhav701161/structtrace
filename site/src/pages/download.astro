@@ -1,0 +1,34 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+import Callout from "../components/Callout.astro";
+---
+<BaseLayout title="Download | StructTrace" description="Install StructTrace locally, verify releases, and see the exact support status for Linux, macOS, and Windows.">
+  <PageHero eyebrow="Download" title="Run the real engine locally." lead="StructTrace is preparing its first public alpha artifacts. Source installation is available now; prebuilt downloads appear only after the tagged archives pass their platform smoke tests." >
+    <div class="button-row"><a class="button" href="https://github.com/Vaibhav701161/structtrace/releases">Open GitHub Releases</a><a class="button button-secondary" href="/docs/install">Installation guide</a></div>
+  </PageHero>
+  <section class="section shell">
+    <div class="section-head"><h2>Release targets.</h2><p>No platform is labeled supported until its final packaged artifact has passed the real CLI, demo, replay, embedded-UI, and capability-server smoke path.</p></div>
+    <div class="release-grid">
+      <article class="release-card"><header><h3>Linux x86_64</h3><span class="release-state">ALPHA PIPELINE</span></header><p>Static musl archive, checksum, SPDX SBOM, source archive, release evidence, and provenance attestation.</p><a href="https://github.com/Vaibhav701161/structtrace/releases">View releases</a></article>
+      <article class="release-card"><header><h3>macOS Apple Silicon</h3><span class="release-state">ALPHA PIPELINE</span></header><p>Apple Silicon archive with the same final-package validation. Binary signing and notarization are not currently claimed.</p><a href="https://github.com/Vaibhav701161/structtrace/releases">View releases</a></article>
+      <article class="release-card"><header><h3>macOS Intel</h3><span class="release-state">ALPHA PIPELINE</span></header><p>Intel archive built and tested on a dedicated hosted runner. Binary signing and notarization are not currently claimed.</p><a href="https://github.com/Vaibhav701161/structtrace/releases">View releases</a></article>
+      <article class="release-card"><header><h3>Windows x86_64</h3><span class="release-state">ALPHA PIPELINE</span></header><p>MSVC archive and PowerShell installer with checksum verification and packaged local-server smoke tests.</p><a href="https://github.com/Vaibhav701161/structtrace/releases">View releases</a></article>
+    </div>
+    <Callout label="Current status" tone="warning"><p>The repository is a release candidate until the first versioned artifacts are published and clean-machine installation evidence is recorded. The website does not turn an unverified artifact into a supported download.</p></Callout>
+  </section>
+  <article class="narrow prose">
+    <h2>Install from source</h2>
+    <p>Requires stable Rust 1.87 or newer.</p>
+    <pre><code>git clone https://github.com/Vaibhav701161/structtrace.git
+cd structtrace
+cargo install --path crates/structtrace-cli --locked
+structtrace doctor
+structtrace demo invoice --open</code></pre>
+    <h2>Verify a published archive</h2>
+    <p>Every target ships a sibling <code>.sha256</code> file. Published binary archives also receive a GitHub build-provenance attestation.</p>
+    <pre><code>sha256sum -c structtrace-x86_64-unknown-linux-musl.tar.gz.sha256
+gh attestation verify structtrace-x86_64-unknown-linux-musl.tar.gz \
+  --repo Vaibhav701161/structtrace</code></pre>
+  </article>
+</BaseLayout>

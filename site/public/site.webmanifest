@@ -1,0 +1,10 @@
+{
+  "name": "StructTrace",
+  "short_name": "StructTrace",
+  "description": "Catch valid-but-wrong structured output regressions before shipping a change.",
+  "start_url": "/",
+  "display": "browser",
+  "background_color": "#f1eee8",
+  "theme_color": "#95502f",
+  "icons": [{"src":"/assets/structtrace-app-icon.svg","sizes":"any","type":"image/svg+xml"}]
+}

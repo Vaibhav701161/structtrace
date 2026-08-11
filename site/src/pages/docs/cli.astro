@@ -1,0 +1,21 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+---
+<DocsLayout title="CLI reference" description="Reference the stable StructTrace command surface for projects, runs, reports, gates, replay, demos, and the local UI." lead="The CLI is the reproducibility and automation interface behind the local browser product. Use `structtrace --help` and each subcommand's help for the exact installed version.">
+  <table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
+    <tr><td><code>structtrace open</code></td><td>Start the capability-protected local browser product.</td></tr>
+    <tr><td><code>structtrace init</code></td><td>Create a project from a template, preset, or existing output files.</td></tr>
+    <tr><td><code>structtrace run</code></td><td>Execute or load both variants and finalize paired evidence.</td></tr>
+    <tr><td><code>structtrace report</code></td><td>Serve, open, or export a verified completed report.</td></tr>
+    <tr><td><code>structtrace gate</code></td><td>Evaluate the configured advisory, regression, or release gate.</td></tr>
+    <tr><td><code>structtrace replay</code></td><td>Verify and recompute retained evidence without rerunning variants.</td></tr>
+    <tr><td><code>structtrace runs</code></td><td>List, inspect, archive, and deliberately delete inactive runs.</td></tr>
+    <tr><td><code>structtrace doctor</code></td><td>Check configuration and environment with explicit side-effect levels.</td></tr>
+    <tr><td><code>structtrace demo</code></td><td>Run bundled invoice, support-ticket, or accepted-research fixtures.</td></tr>
+  </tbody></table>
+  <h2>Project selection</h2><pre><code>structtrace --project-root ./my-project run
+structtrace --project-root ./my-project report latest --open</code></pre>
+  <h2>Run selectors</h2><p><code>latest</code> resolves only completed production runs. Bundled fixtures are isolated behind <code>latest-demo</code>, <code>latest-research</code>, and <code>latest-any</code>.</p>
+  <h2>Machine-readable output</h2><p>Commands that support structured output expose their exact options in <code>--help</code>. CI gate mode can emit annotations and a metrics table while retaining the stable process exit code.</p>
+  <h2>Versioned reference</h2><p>For every flag and configuration field, use the <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/configuration-reference.md">configuration reference</a> and the installed binary's help. The website intentionally does not duplicate unstable flags.</p>
+</DocsLayout>

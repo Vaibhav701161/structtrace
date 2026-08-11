@@ -1,0 +1,31 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+import Callout from "../components/Callout.astro";
+---
+<BaseLayout title="Security | StructTrace" description="Understand StructTrace's local trust boundary, capability-protected server, filesystem controls, and explicit limits.">
+  <PageHero eyebrow="Security model" title="Local-first is an architectural boundary." lead="The public site does not receive evaluation data. Full StructTrace runs use a capability-protected loopback server and local evidence store." >
+    <div class="button-row"><a class="button button-secondary" href="https://github.com/Vaibhav701161/structtrace/security/policy">Read SECURITY.md</a><a class="button button-secondary" href="https://github.com/Vaibhav701161/structtrace/security/advisories/new">Report privately</a></div>
+  </PageHero>
+  <section class="section shell">
+    <div class="section-head"><h2>The trust boundary.</h2><p>Security claims below follow the implementation and repository policy. They are not certification claims.</p></div>
+    <div class="card-grid">
+      <article class="card"><h3>Loopback only</h3><p>The report and product server binds to a random <code>127.0.0.1</code> port, not a public interface.</p></article>
+      <article class="card"><h3>Capability URL</h3><p>Every server uses a fresh random 256-bit URL capability and checks Host, Origin, and Referer boundaries.</p></article>
+      <article class="card"><h3>Verified assets</h3><p>Manifest-bound report files are rechecked before serving. Unbound files, unsafe paths, symlinks, and changes fail closed.</p></article>
+      <article class="card"><h3>Constrained network</h3><p>There is no telemetry. Network calls occur only for model endpoints explicitly configured by the user.</p></article>
+      <article class="card"><h3>Bounded retention</h3><p>Raw outputs, provider envelopes, logs, report sizes, and subprocess streams have explicit limits and configurable retention.</p></article>
+      <article class="card"><h3>Label isolation</h3><p>Live adapters receive opaque transport tokens and model-visible fields, never golden expected values or dataset identifiers.</p></article>
+    </div>
+    <Callout label="Important limit" tone="warning"><p>User-authorized commands, Python callables, and custom evaluators run with the permissions of the StructTrace process. StructTrace does not sandbox that code. Review configuration from untrusted repositories before executing it.</p></Callout>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Public website controls.</h2><p>The static site adds no account, form, analytics, cookie, runtime font, or evaluation API.</p></div>
+    <table class="metric-table" tabindex="0"><tbody>
+      <tr><th>Content security</th><td>Self-only scripts, styles, images, media, fonts, and connections; objects and framing disabled.</td></tr>
+      <tr><th>Browser permissions</th><td>Camera, microphone, geolocation, payment, USB, sensors, and display capture disabled.</td></tr>
+      <tr><th>Tracking</th><td>No analytics, advertising, fingerprinting, telemetry, or cookies.</td></tr>
+      <tr><th>Data flow</th><td>The `/try` route displays checked-in fixture results in the browser. It does not upload files or execute a hosted evaluator.</td></tr>
+    </tbody></table>
+  </section>
+</BaseLayout>

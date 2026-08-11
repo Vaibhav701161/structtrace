@@ -7,6 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-155eef.svg)](LICENSE)
 [![No telemetry](https://img.shields.io/badge/telemetry-none-087a55.svg)](SECURITY.md)
 
+**[Website](https://structtrace.tech)** · **[Guided demo](https://structtrace.tech/try)** ·
+**[Documentation](https://structtrace.tech/docs)** · **[Research foundation](https://structtrace.tech/research)**
+
 StructTrace is paired regression testing for stable-contract structured extraction pipelines. It
 evaluates the same golden cases against a baseline and candidate while a caller-facing JSON Schema
 remains fixed. It separates structural validity from deterministic task correctness, preserves

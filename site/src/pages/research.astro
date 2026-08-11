@@ -1,0 +1,45 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+import Callout from "../components/Callout.astro";
+const research = "https://github.com/Vaibhav701161/constrained-senstivity-lab";
+const pinned = `${research}/blob/ac461b9fcf6a31df614fd3c540cc3458bc49d10e`;
+---
+<BaseLayout title="Research foundation | StructTrace" description="Read the artifact-backed constrained-decoding studies that motivated StructTrace and the limits of their claims.">
+  <PageHero eyebrow="Research foundation" title="The failure was not invalid JSON. The failure was valid JSON carrying the wrong answer." lead="StructTrace grew out of paired experiments on contract sensitivity. The result was not a universal optimization. It was a measurement requirement." >
+    <div class="button-row"><a class="button" href={research}>Open the research repository</a><a class="button button-secondary" href="https://youtu.be/82-3grLsO2M">Watch the research walkthrough</a></div>
+  </PageHero>
+  <section class="section shell">
+    <div class="section-head"><h2>The evidence chain.</h2><p>Each row is a separate paired study. Effects are not pooled across models or tasks.</p></div>
+    <table class="metric-table" tabindex="0">
+      <thead><tr><th>Study</th><th>Paired cases</th><th>Control</th><th>Treatment</th><th>Treatment-only</th><th>Control-only</th><th>Effect and interval</th></tr></thead>
+      <tbody>
+        <tr><th><a href={`${pinned}/experiments/corrected-replication/results/qwen2.5-7b-corrected/paired-summary-exact.json`}>Corrected Qwen representation</a></th><td>49</td><td>18/49</td><td>24/49</td><td>9</td><td>3</td><td class="positive">+12.2 pp [0.0, 26.5]</td></tr>
+        <tr><th><a href={`${pinned}/experiments/canonical-schema-equivalence-correction/paired-summary.json`}>Canonical Llama replication</a></th><td>150</td><td>92/150</td><td>82/150</td><td>6</td><td>16</td><td class="negative">-6.7 pp [-12.7, -0.7]</td></tr>
+        <tr><th><a href={`${pinned}/experiments/tool-call-gate/paired-summary.json`}>Executable tool-call pilot</a></th><td>30</td><td>26/30</td><td>24/30</td><td>1</td><td>3</td><td class="negative">-6.7 pp [-20.0, 6.7]</td></tr>
+      </tbody>
+    </table>
+    <Callout label="Claim boundary" tone="warning"><p>The Qwen estimate was positive but its paired interval touched zero and exact McNemar p was 0.146. The canonically matched Llama replication reversed direction. The bounded tool-call pilot detected no benefit. These results do not prove that constrained decoding generally harms or helps correctness.</p></Callout>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>What happened before the replication.</h2><p>The original 49-item Qwen comparison exposed the validity-versus-correctness gap that shaped the product.</p></div>
+    <div class="card-grid">
+      <article class="card"><p class="label">Prompt-only</p><h3>39/49 recoverably correct</h3><p>The reasoning-first prompt produced valid JSON objects, but zero answers satisfied the stricter numeric-string schema as written.</p></article>
+      <article class="card"><p class="label">Outlines and XGrammar</p><h3>30/49 correct, 49/49 schema-valid</h3><p>Both constrained backends reached complete structural validity while losing nine recoverably correct answers on the paired set.</p></article>
+      <article class="card"><p class="label">Observed gap</p><h3>-18.4 percentage points</h3><p>The same bounded setup showed that better compliance did not imply better task performance.</p></article>
+    </div>
+    <p class="kicker research-source-note">Source: <a href={`${pinned}/results/qwen2.5-7b/primary/combined/summary_clean.json`}>canonical machine-readable initial summary</a>. One Qwen model, one cleaned GSM8K subset, one prompt family.</p>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Why this became StructTrace.</h2><p>The honest conclusion was to measure migrations on the workload that will actually ship.</p></div>
+    <div class="workflow-grid">
+      <article class="workflow-step"><code>FINDING / VALIDITY</code><h3>Structure can hide error.</h3><p>Product response: report parsing, schema validity, semantic correctness, and valid-but-wrong separately.</p></article>
+      <article class="workflow-step"><code>FINDING / SENSITIVITY</code><h3>Representation changes answers.</h3><p>Product response: use paired case IDs and show every repair and regression instead of only marginal averages.</p></article>
+      <article class="workflow-step"><code>FINDING / REVERSAL</code><h3>One model did not generalize.</h3><p>Product response: no universal optimizer claim. Teams evaluate their own model, prompt, contract, and cases.</p></article>
+    </div>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Provenance is part of the product.</h2><p>The StructTrace repository pins the research source revision and SHA-256 digest of every accepted summary used to create its normalized demonstration fixtures.</p></div>
+    <div class="button-row"><a class="button button-secondary" href="https://github.com/Vaibhav701161/structtrace/blob/main/provenance/research-foundation.json">Inspect the provenance manifest</a><a class="button button-secondary" href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/research-foundation.md">Read the full lineage</a></div>
+  </section>
+</BaseLayout>

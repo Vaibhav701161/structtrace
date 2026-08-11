@@ -20,4 +20,10 @@
 /product/design/StructTrace_Codex_UI_Build_Prompt.md
 /product/design/StructTrace_UI_UX_Product_Spec.md
 /docs/release-readiness-todo.md
+/STRUCTTRACE_KNOWLEDGE_TRANSFER.md
+/site/node_modules/
+/site/dist/
+/site/.astro/
+/site/playwright-report/
+/site/test-results/
 /acceptance/*-release-audit.json

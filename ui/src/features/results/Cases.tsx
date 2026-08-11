@@ -115,7 +115,7 @@ function firstFailure(record: CaseRecord) {
   const primaryIds = new Set(record.candidate_evaluation?.primary_outcome?.evaluator_ids ?? []);
   const results = Object.values(record.candidate_evaluation?.evaluators ?? {}).filter((item: any) => primaryIds.has(String(item?.evaluator_id))) as CaseRecord[];
   const failed = results.find((item: CaseRecord) => item.status === "failed" || item.passed === false);
-  return failed?.fields?.[0]?.pointer ?? failed?.details?.pointer ?? "—";
+  return failed?.fields?.[0]?.pointer ?? failed?.details?.pointer ?? "Not available";
 }
 
 function CaseDrawer({ result, record, focusedPointer, close, previous, next }: { result: RunResult; record: CaseRecord; focusedPointer: string; close: () => void; previous?: () => void; next?: () => void }) {
@@ -206,9 +206,9 @@ function UnifiedDiff({ expected, baseline, candidate, highlights, changedOnly }:
   const baselineRows = new Map(structuralDiff(expected, baseline).map((row) => [row.path, row]));
   const candidateRows = new Map(structuralDiff(expected, candidate).map((row) => [row.path, row]));
   const paths = [...new Set([...expectedRows.keys(), ...baselineRows.keys(), ...candidateRows.keys()])].sort();
-  return <div className="unified-diff"><div className="unified-head"><span>JSON pointer</span><span>Expected</span><span>Baseline</span><span>Candidate</span></div>{paths.filter((path) => !changedOnly || baselineRows.get(path)?.state !== "unchanged" || candidateRows.get(path)?.state !== "unchanged" || rowRelevant(path, highlights)).map((path) => { const baselineRow = baselineRows.get(path); const candidateRow = candidateRows.get(path); return <div className={[...highlights].some((pointer) => pointerMatches(pointer, path)) ? "unified-row json-row-failed" : "unified-row"} key={path}><button onClick={() => void navigator.clipboard.writeText(path || "/")}><Copy size={12} /><code>{path || "/"}</code></button><code>{expectedRows.get(path)?.value ?? "—"}</code><DiffValue row={baselineRow} /><DiffValue row={candidateRow} /></div>; })}</div>;
+  return <div className="unified-diff"><div className="unified-head"><span>JSON pointer</span><span>Expected</span><span>Baseline</span><span>Candidate</span></div>{paths.filter((path) => !changedOnly || baselineRows.get(path)?.state !== "unchanged" || candidateRows.get(path)?.state !== "unchanged" || rowRelevant(path, highlights)).map((path) => { const baselineRow = baselineRows.get(path); const candidateRow = candidateRows.get(path); return <div className={[...highlights].some((pointer) => pointerMatches(pointer, path)) ? "unified-row json-row-failed" : "unified-row"} key={path}><button onClick={() => void navigator.clipboard.writeText(path || "/")}><Copy size={12} /><code>{path || "/"}</code></button><code>{expectedRows.get(path)?.value ?? "Missing"}</code><DiffValue row={baselineRow} /><DiffValue row={candidateRow} /></div>; })}</div>;
 }
-function DiffValue({ row }: { row: DiffRow | undefined }) { return <span className={`unified-value diff-${row?.state ?? "removed"}`}><i>{diffMark(row?.state ?? "removed")}</i><code>{row?.value ?? "—"}</code></span>; }
+function DiffValue({ row }: { row: DiffRow | undefined }) { return <span className={`unified-value diff-${row?.state ?? "removed"}`}><i>{diffMark(row?.state ?? "removed")}</i><code>{row?.value ?? "Missing"}</code></span>; }
 
 function itemPointer(field: CaseRecord) { return String(field.expected_pointer ?? ""); }
 function pointerMatches(pattern: string, path: string) { const expected = pattern.split("/"); const actual = path.split("/"); return expected.length === actual.length && expected.every((segment, index) => segment === "*" || segment === actual[index]); }
@@ -246,7 +246,7 @@ export function structuralDiff(expected: unknown, actual: unknown): DiffRow[] {
   return [...new Set([...left.keys(), ...right.keys()])].sort().map((path) => {
     const expectedRow = left.get(path); const actualRow = right.get(path);
     if (!expectedRow) return { ...actualRow!, state: "added" as const };
-    if (!actualRow) return { ...expectedRow, value: "—", state: "removed" as const };
+    if (!actualRow) return { ...expectedRow, value: "Missing", state: "removed" as const };
     const expectedValue = valueAtPointer(expected, path); const actualValue = valueAtPointer(aligned, path);
     const state: DiffState = valueType(expectedValue) !== valueType(actualValue) ? "type_changed" : expectedRow.value === actualRow.value ? "unchanged" : "changed";
     return { ...actualRow, state };

@@ -1,0 +1,25 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+import Callout from "../../components/Callout.astro";
+---
+<DocsLayout title="Install StructTrace" description="Install StructTrace from a verified release or from locked Rust source." lead="Use a tagged archive once the first public alpha is published. Until then, the honest supported path is a locked source installation.">
+  <h2>Install from source</h2>
+  <p>Install stable Rust 1.87 or newer, then run:</p>
+  <pre><code>git clone https://github.com/Vaibhav701161/structtrace.git
+cd structtrace
+cargo install --path crates/structtrace-cli --locked
+structtrace --version
+structtrace doctor</code></pre>
+  <h2>Verify the local product</h2>
+  <pre><code>structtrace demo invoice --open</code></pre>
+  <p>The command materializes the checked-in 12-case invoice fixture, runs the real recorded-output engine, and opens its capability-protected report. The gate should report insufficient evidence because the fixture is intentionally below its 100-case threshold.</p>
+  <h2>Open the browser workspace</h2>
+  <pre><code>structtrace open</code></pre>
+  <p>If the browser cannot be opened, StructTrace keeps serving and prints the local capability URL. For scripted smoke checks use:</p>
+  <pre><code>structtrace open --no-browser</code></pre>
+  <Callout label="No cloud account" tone="success"><p>After installation, the recorded-output workflow and bundled UI work offline. No login or StructTrace service is required.</p></Callout>
+  <h2>Published archive verification</h2>
+  <p>Once a release exists, compare the archive against its sibling SHA-256 file and verify its GitHub provenance attestation.</p>
+  <pre><code>sha256sum -c &lt;archive&gt;.sha256
+gh attestation verify &lt;archive&gt; --repo Vaibhav701161/structtrace</code></pre>
+</DocsLayout>

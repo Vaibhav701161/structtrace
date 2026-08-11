@@ -1,0 +1,21 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+interface Props { title: string; description: string; lead: string; }
+const { title, description, lead } = Astro.props;
+const active = Astro.url.pathname;
+const groups = [
+  ["Start", [["Documentation", "/docs"], ["Install", "/docs/install"], ["First comparison", "/docs/first-comparison"]]],
+  ["Understand", [["Core concepts", "/docs/concepts"], ["Evidence and replay", "/docs/evidence"]]],
+  ["Reference", [["CLI", "/docs/cli"], ["Full reference", "https://github.com/Vaibhav701161/structtrace/tree/main/docs/src"]]],
+] as const;
+---
+<BaseLayout title={`${title} | StructTrace docs`} description={description}>
+  <div class="docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      {groups.map(([name, links]) => <><strong>{name}</strong>{links.map(([label, href]) => <a href={href} aria-current={active === href ? "page" : undefined}>{label}</a>)}</>)}
+    </aside>
+    <article class="docs-content prose">
+      <p class="eyebrow">Documentation</p><h1 class="docs-title">{title}</h1><p class="docs-intro">{lead}</p><slot />
+    </article>
+  </div>
+</BaseLayout>

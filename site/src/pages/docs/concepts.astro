@@ -1,0 +1,11 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+---
+<DocsLayout title="Core concepts" description="Understand baseline and candidate pairing, valid-but-wrong outputs, evidence units, gates, and release authorization." lead="StructTrace keeps structural, semantic, operational, and inferential questions separate so one green metric cannot hide another failure.">
+  <h2>Baseline and candidate</h2><p>Both variants are evaluated on the same joined case identities, against the same external schema, expected values, evaluators, primary outcome, and evidence-unit policy.</p>
+  <h2>Structural versus semantic correctness</h2><p>Strict parsing asks whether the whole output is valid JSON. Schema validity asks whether it satisfies the external contract. Semantic correctness asks whether explicit deterministic rules agree with the expected task outcome. A schema-valid output that fails the primary outcome is valid but wrong.</p>
+  <h2>Independent evidence units</h2><p>Rows are execution observations, not automatically independent evidence. StructTrace groups repeated observations by a declared identity or a safe default fingerprint. Exact duplicates do not multiply inference. Conflicting repeated trials force insufficient evidence instead of selecting one row.</p>
+  <h2>Paired transitions</h2><table><tbody><tr><th>Both pass</th><td>Baseline and candidate succeed.</td></tr><tr><th>Regression</th><td>Baseline succeeds and candidate fails.</td></tr><tr><th>Improvement</th><td>Baseline fails and candidate succeeds.</td></tr><tr><th>Both fail</th><td>Neither succeeds.</td></tr></tbody></table>
+  <h2>Release authorization</h2><p>A positive average is not authorization. StructTrace evaluates quality failures, evidence insufficiency, and runtime errors separately. Advisory never authorizes. Regression covers configured relative change only. Release requires a complete safe profile and is the sole mode that can authorize deployment.</p>
+  <h2>Fully evaluated semantic pairs</h2><p>Operational failure is not relabeled as an incorrect answer. The complete-denominator deployment view keeps it as failure; the semantic-only view reports only pairs with explicit binary semantic outcomes for both variants and states how many were excluded.</p>
+</DocsLayout>

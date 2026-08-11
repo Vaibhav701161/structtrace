@@ -10,7 +10,26 @@ permissions:
   attestations: write
 
 jobs:
+  site-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npm audit --audit-level=high
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+      - run: npm test
+        working-directory: site
+
   build:
+    needs: site-preflight
     strategy:
       matrix:
         include:
@@ -109,6 +128,8 @@ jobs:
           subject-path: structtrace-${{ matrix.target }}.${{ matrix.archive }}
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             structtrace-${{ matrix.target }}.${{ matrix.archive }}
             structtrace-${{ matrix.target }}.${{ matrix.archive }}.sha256
@@ -119,7 +140,7 @@ jobs:
             release-ui-tests.log
 
   publish-installers:
-    needs: build
+    needs: [site-preflight, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -136,6 +157,7 @@ jobs:
             install.ps1
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             install.sh
             install.sh.sha256

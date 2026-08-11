@@ -1,0 +1,102 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+const title = "StructTrace | Catch valid-but-wrong structured output regressions";
+const description = "Compare baseline and candidate structured outputs, separate schema validity from task correctness, and generate replayable local release evidence.";
+const baselineExample = `{
+  "line_items": [
+    {"description": "Masks", "amount": "40.00"},
+    {"description": "Sanitizer", "amount": "36.00"}
+  ],
+  "total": "82.08"
+}`;
+const candidateExample = `{
+  "line_items": [
+    {"description": "Masks", "amount": "40.00"}
+  ],
+  "total": "82.08"
+}`;
+---
+<BaseLayout title={title} description={description}>
+  <section class="hero">
+    <div class="shell hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Structured-output release evidence</p>
+        <h1>Your schema passed.<span>Did the answer?</span></h1>
+        <p>Catch valid-but-wrong regressions before switching models, prompts, providers, decoders, or implementations.</p>
+        <div class="button-row">
+          <a class="button" href="/try">Try the invoice demo</a>
+          <a class="button button-secondary" href="/download">Download StructTrace</a>
+          <a class="button button-quiet" href="https://github.com/Vaibhav701161/structtrace">View on GitHub</a>
+        </div>
+        <div class="trust-line"><span><i></i>Local-first</span><span><i></i>No account</span><span><i></i>No telemetry</span></div>
+      </div>
+      <div class="product-frame" itemprop="screenshot">
+        <div class="frame-bar"><i></i><i></i><i></i><code>invoice-extraction / local evidence</code></div>
+        <img src="/screenshots/structtrace-results.webp" width="1440" height="1000" alt="StructTrace local results screen showing an insufficient-evidence decision and paired regression metrics" />
+      </div>
+    </div>
+  </section>
+
+  <section class="proof-rail" aria-label="Product facts">
+    <div><strong>One Rust path</strong><span>Every adapter enters the same parsing, scoring, statistics, gate, artifact, and replay engine.</span></div>
+    <div><strong>Complete denominator</strong><span>Missing outputs, invalid JSON, evaluator errors, and timeouts stay visible as failures.</span></div>
+    <div><strong>Replayable evidence</strong><span>Immutable local runs and BLAKE3-bound artifacts can be verified without rerunning a model.</span></div>
+    <div><strong>Data stays local</strong><span>The browser UI is served from your machine. The public site never receives evaluation data.</span></div>
+  </section>
+
+  <section class="section shell">
+    <div class="section-head"><h2>From output files to a release decision.</h2><p>StructTrace keeps the first workflow intentionally narrow: compare one baseline and candidate against the same external contract and the same cases.</p></div>
+    <div class="workflow-grid">
+      <article class="workflow-step"><code>01 / SOURCE</code><h3>Drop outputs</h3><p>Import JSONL, JSON, or CSV. Inspect field mappings before StructTrace creates the reproducible project.</p></article>
+      <article class="workflow-step"><code>02 / EVALUATE</code><h3>Define correctness</h3><p>Use deterministic rules for identity, dates, exact numbers, tolerances, arrays, tool arguments, and invariants.</p></article>
+      <article class="workflow-step"><code>03 / DECIDE</code><h3>See regressions</h3><p>Inspect every paired transition, evidence limit, failure hotspot, and exact case before changing production.</p></article>
+    </div>
+  </section>
+
+  <section class="section shell">
+    <div class="section-head"><h2>Valid JSON can carry the wrong answer.</h2><p>A parser and JSON Schema can confirm shape. They cannot establish whether an extracted total, selected tool, or business outcome is correct.</p></div>
+    <div class="comparison-card">
+      <article class="comparison-side">
+        <header><div><p class="label">Baseline / invoice-011</p><h3>Correct extraction</h3></div><span class="status-pill">SCHEMA VALID</span></header>
+        <pre class="json-block">{baselineExample}</pre>
+      </article>
+      <article class="comparison-side">
+        <header><div><p class="label">Candidate / invoice-011</p><h3>Valid, but wrong</h3></div><span class="status-pill fail">SCHEMA VALID</span></header>
+        <pre class="json-block">{candidateExample}</pre>
+      </article>
+      <div class="evidence-line"><strong>Regression:</strong> <code>/line_items</code> is missing the Sanitizer entry. The object satisfies the schema, but the extraction outcome fails.</div>
+    </div>
+  </section>
+
+  <section class="section shell">
+    <div class="section-head"><h2>A local product, not a data-collection service.</h2><p>The public website explains and demonstrates the workflow. Full evaluations run through the actual Rust engine on your machine.</p></div>
+    <div class="diagram" role="img" aria-label="StructTrace local architecture" tabindex="0">
+      <div class="diagram-row"><span class="diagram-node">Your data</span><span class="diagram-arrow">→</span><span class="diagram-node">Local browser UI</span><span class="diagram-arrow">→</span><span class="diagram-node emphasis">Rust engine</span><span class="diagram-arrow">→</span><span class="diagram-node">Immutable evidence</span><span class="diagram-arrow">→</span><span class="diagram-node">CI gate</span></div>
+    </div>
+    <div class="card-grid card-grid-spaced">
+      <article class="card"><h3>Strict boundaries</h3><p>Duplicate keys fail. Remote schema retrieval is disabled. Dataset labels never enter live application prompts.</p></article>
+      <article class="card"><h3>Honest uncertainty</h3><p>Small, duplicated, conflicted, or incompletely evaluated datasets cannot silently authorize a release.</p></article>
+      <article class="card"><h3>Portable proof</h3><p>Reports, manifests, source hashes, outcome rows, and replay receipts remain inspectable outside the UI.</p></article>
+    </div>
+  </section>
+
+  <section class="section shell">
+    <div class="section-head"><h2>Built because structural success hid semantic loss.</h2><p>Constrained-decoding experiments motivated the product. Cross-family replication also showed why StructTrace measures instead of prescribing one universal optimization.</p></div>
+    <table class="metric-table" tabindex="0">
+      <caption>Accepted studies remain separate. Effects are not pooled.</caption>
+      <thead><tr><th>Gate</th><th>Cases</th><th>Control</th><th>Treatment</th><th>Paired effect</th></tr></thead>
+      <tbody>
+        <tr><th>Corrected Qwen representation</th><td>49</td><td>18/49</td><td>24/49</td><td class="positive">+12.2 pp</td></tr>
+        <tr><th>Canonical Llama replication</th><td>150</td><td>92/150</td><td>82/150</td><td class="negative">-6.7 pp</td></tr>
+        <tr><th>Executable tool-call pilot</th><td>30</td><td>26/30</td><td>24/30</td><td class="negative">-6.7 pp</td></tr>
+      </tbody>
+    </table>
+    <p class="kicker research-source-note">The estimates use different models and tasks. They are displayed as a research chain, not one combined effect.</p>
+    <div class="button-row"><a class="button button-secondary" href="/research">Read the evidence and claim boundaries</a></div>
+  </section>
+
+  <section class="section shell">
+    <div class="section-head"><h2>Start with the real local workflow.</h2><p>Use the bundled invoice comparison, inspect the three regressions and three improvements, then bring one of your own stable-contract migrations.</p></div>
+    <div class="button-row"><a class="button" href="/download">Get StructTrace</a><a class="button button-secondary" href="/docs/first-comparison">Run your first comparison</a></div>
+  </section>
+</BaseLayout>

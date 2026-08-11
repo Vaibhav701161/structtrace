@@ -98,6 +98,28 @@ jobs:
       - run: cargo install mdbook --version 0.4.43 --locked
       - run: mdbook build
 
+  public-site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npm audit --audit-level=high
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+      - run: npm test
+        working-directory: site
+      - run: npx playwright install --with-deps chromium
+        working-directory: site
+      - run: npm run test:e2e -- --project=chromium
+        working-directory: site
+
   dependency-policy:
     runs-on: ubuntu-latest
     steps:

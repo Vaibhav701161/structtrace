@@ -1,0 +1,19 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+---
+<BaseLayout title="Privacy | StructTrace" description="StructTrace has no account, telemetry, analytics, or hosted evaluation data collection.">
+  <PageHero eyebrow="Privacy" title="Your evaluation data stays on your machine." lead="StructTrace is a local product. This public website is static and does not provide a cloud evaluation service." />
+  <article class="narrow prose">
+    <h2>Public website</h2>
+    <p>The website does not create user accounts, set application cookies, run analytics, load remote fonts, or accept evaluation datasets. The bundled demo presents fixed public fixture data already included in the repository.</p>
+    <h2>Local application</h2>
+    <p>Full comparisons run on the user's computer. Source files, normalized outputs, run metadata, reports, and replay artifacts are retained under the local project according to its storage configuration. They are not uploaded to StructTrace.</p>
+    <h2>Explicit provider traffic</h2>
+    <p>If a user configures the Experimental OpenAI-compatible adapter, StructTrace sends the configured request to that endpoint. The provider's privacy terms then apply. Credentials are read from the named environment variable and are not stored in StructTrace artifacts.</p>
+    <h2>Sharing evidence</h2>
+    <p>Case-level artifacts may contain private inputs and outputs. Review them before sharing. Prefer the aggregate-only share export when case content is not required. Redaction is defensive, not a promise that every sensitive value can be inferred and removed automatically.</p>
+    <h2>Questions</h2>
+    <p>Open a repository discussion for general questions. Report sensitive security issues through a <a href="https://github.com/Vaibhav701161/structtrace/security/advisories/new">private GitHub security advisory</a>.</p>
+  </article>
+</BaseLayout>

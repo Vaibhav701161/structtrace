@@ -1,0 +1,49 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+import demoVideo from "../../../media/structtrace-product-demo.mp4?url";
+---
+<BaseLayout title="Product | StructTrace" description="See how StructTrace turns paired structured outputs into deterministic, replayable release evidence.">
+  <PageHero eyebrow="Product" title="One comparison. Every failure kept visible." lead="StructTrace joins baseline and candidate outputs by case identity, evaluates both against the same contract and correctness rules, and explains exactly what changed." >
+    <div class="button-row"><a class="button" href="/try">Try the workflow</a><a class="button button-secondary" href="/docs/first-comparison">Read the guide</a></div>
+  </PageHero>
+  <section class="section shell">
+    <div class="section-head"><h2>The evaluation path.</h2><p>Recorded files are the Stable candidate. Command and Python adapters are Beta. Direct OpenAI-compatible execution remains Experimental.</p></div>
+    <div class="diagram" role="img" aria-label="StructTrace evaluation path" tabindex="0"><div class="diagram-row"><span class="diagram-node">Cases + expected</span><span class="diagram-arrow">→</span><span class="diagram-node">Baseline + candidate</span><span class="diagram-arrow">→</span><span class="diagram-node emphasis">Strict evaluation</span><span class="diagram-arrow">→</span><span class="diagram-node">Paired evidence</span><span class="diagram-arrow">→</span><span class="diagram-node">Gate + replay</span></div></div>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Watch the real product path.</h2><p>The 71-second capture uses the release binary and embedded local UI. It contains no composited product screen or hosted evaluator.</p></div>
+    <video class="product-video" controls preload="none" poster="/screenshots/structtrace-results.webp">
+      <source src={demoVideo} type="video/mp4" />
+      <a href={demoVideo}>Download the product walkthrough video.</a>
+    </video>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>The actual local workflow.</h2><p>These images are deterministic Playwright captures from the capability-protected Rust server and embedded production UI.</p></div>
+    <div class="screenshot-grid">
+      <figure class="screenshot-card"><img src="/screenshots/structtrace-source-setup.webp" width="1440" height="1000" loading="lazy" alt="StructTrace recorded-output source setup screen" /><figcaption><strong>Source setup</strong>Golden, baseline, candidate, and unchanged external schema remain visibly distinct.</figcaption></figure>
+      <figure class="screenshot-card"><img src="/screenshots/structtrace-correctness-builder.webp" width="1440" height="1000" loading="lazy" alt="StructTrace deterministic correctness rule builder" /><figcaption><strong>Correctness builder</strong>Rules are selected against fields discovered from the full bounded sources and schema.</figcaption></figure>
+      <figure class="screenshot-card"><img src="/screenshots/structtrace-cases.webp" width="1440" height="1000" loading="lazy" alt="StructTrace paired case explorer filtered to regressions" /><figcaption><strong>Paired cases</strong>Search and filters lead from aggregate evidence to the exact regression rows.</figcaption></figure>
+      <figure class="screenshot-card"><img src="/screenshots/structtrace-case-detail.webp" width="1440" height="1000" loading="lazy" alt="StructTrace case detail showing baseline and candidate evidence" /><figcaption><strong>Case evidence</strong>JSON-aware differences, evaluator facts, and evidence integrity are retained together.</figcaption></figure>
+    </div>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>What the engine measures.</h2><p>No single validity number substitutes for the rest.</p></div>
+    <div class="card-grid">
+      <article class="card numbered-card"><span>01</span><h3>Strict parsing</h3><p>The entire trimmed output must be one JSON value. Duplicate keys are rejected at every untrusted JSON boundary.</p></article>
+      <article class="card numbered-card"><span>02</span><h3>External validity</h3><p>The unchanged caller-facing JSON Schema is validated with remote retrieval disabled.</p></article>
+      <article class="card numbered-card"><span>03</span><h3>Task correctness</h3><p>Deterministic rules score exact fields, normalized text, dates, numbers, keyed arrays, tool arguments, and invariants.</p></article>
+      <article class="card numbered-card"><span>04</span><h3>Deployment success</h3><p>Operational, structural, and semantic failures stay in the full denominator.</p></article>
+      <article class="card numbered-card"><span>05</span><h3>Paired transitions</h3><p>Every case becomes both-pass, regression, improvement, or both-fail over explicit independent evidence units.</p></article>
+      <article class="card numbered-card"><span>06</span><h3>Release authority</h3><p>Evidence sufficiency, quality rules, and runtime errors remain distinct. Only a configured Release gate can authorize deployment.</p></article>
+    </div>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Evidence that survives the dashboard.</h2><p>A completed run is an immutable local record, not a mutable chart.</p></div>
+    <div class="card-grid">
+      <article class="card"><code>MANIFEST</code><h3>Source-bound</h3><p>Configuration, datasets, schemas, implementation sources, model-facing schemas, and output artifacts are hash-bound.</p></article>
+      <article class="card"><code>REPLAY</code><h3>Independently recomputed</h3><p>Built-in evaluator facts and summaries are reconstructed from retained inputs. Tampering fails closed.</p></article>
+      <article class="card"><code>CI</code><h3>Reviewable automation</h3><p>The visual setup exports a project-specific CI starter with stable gate states and exit codes.</p></article>
+    </div>
+  </section>
+</BaseLayout>

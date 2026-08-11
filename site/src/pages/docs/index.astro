@@ -1,0 +1,35 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+---
+<DocsLayout title="Start with the decision" description="Learn StructTrace from installation through a replayable paired release decision." lead="StructTrace compares a baseline and candidate on the same cases. Start with recorded outputs, then add live adapters only when you need them.">
+  <div class="prose-nav">
+    <a href="/docs/install"><strong>Install locally</strong><small>Source and release paths</small></a>
+    <a href="/docs/first-comparison"><strong>First comparison</strong><small>Invoice demo to real files</small></a>
+    <a href="/docs/concepts"><strong>Core concepts</strong><small>Validity, correctness, and authority</small></a>
+  </div>
+  <h2>What StructTrace does</h2>
+  <p>StructTrace evaluates paired structured outputs against one fixed external JSON Schema and explicit deterministic correctness rules. It preserves operational and evaluation failures, calculates paired transitions over independent evidence units, generates a local report, applies a multi-state gate, and retains enough evidence for deterministic replay.</p>
+  <h2>The recommended path</h2>
+  <ol>
+    <li>Run the bundled invoice demo and inspect why its gate refuses release authority.</li>
+    <li>Import a golden dataset plus baseline and candidate output files.</li>
+    <li>Define what correct means field by field.</li>
+    <li>Run one paired comparison and inspect every discordant case.</li>
+    <li>Replay the evidence, pin recurring regressions, and only then add the gate to CI.</li>
+  </ol>
+  <pre><code>structtrace doctor
+structtrace demo invoice --open
+structtrace init my-comparison --template recorded
+structtrace --project-root my-comparison run
+structtrace --project-root my-comparison report latest --open
+structtrace --project-root my-comparison replay latest</code></pre>
+  <h2>Support levels</h2>
+  <table><thead><tr><th>Workflow</th><th>Status</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td>Recorded JSONL</td><td>Stable candidate</td><td>No process, Python, or provider dependency.</td></tr>
+    <tr><td>Command adapter</td><td>Beta</td><td>Bounded versioned JSONL protocol, no shell by default.</td></tr>
+    <tr><td>Python callable</td><td>Beta</td><td>Persistent bounded worker with failures retained per case.</td></tr>
+    <tr><td>OpenAI-compatible</td><td>Experimental</td><td>Explicit endpoint; broader provider and scheduling evidence remains open.</td></tr>
+  </tbody></table>
+  <h2>Long-form reference</h2>
+  <p>The repository contains the complete versioned documentation for <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/inputs-and-configuration.md">inputs and configuration</a>, <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/evaluation.md">evaluation</a>, <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/release-gates.md">release gates</a>, <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/replay.md">replay</a>, and <a href="https://github.com/Vaibhav701161/structtrace/blob/main/docs/src/troubleshooting.md">troubleshooting</a>.</p>
+</DocsLayout>

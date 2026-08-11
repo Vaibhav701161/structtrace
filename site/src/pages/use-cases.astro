@@ -1,0 +1,26 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+---
+<BaseLayout title="Use cases | StructTrace" description="Use StructTrace for stable-contract extraction migrations, tool calls, model changes, prompt changes, and decoder changes.">
+  <PageHero eyebrow="Use cases" title="Change the system. Keep the contract. Measure the outcome." lead="StructTrace is designed for paired migrations where callers expect the same structured contract before and after the change." />
+  <section class="section shell">
+    <div class="card-grid">
+      <article class="card"><p class="label">Model migration</p><h3>Compare providers or model families</h3><p>Keep cases, external schema, and deterministic correctness fixed while baseline and candidate outputs change.</p></article>
+      <article class="card"><p class="label">Prompt change</p><h3>Catch semantic drift behind valid JSON</h3><p>Detect cases where format compliance stays high but extracted values or classifications regress.</p></article>
+      <article class="card"><p class="label">Decoder change</p><h3>Measure constrained-output sensitivity</h3><p>Compare decoding implementations without assuming that more schema-valid generations are more correct.</p></article>
+      <article class="card"><p class="label">Document extraction</p><h3>Verify financial and identity fields</h3><p>Use exact decimals, canonical dates, keyed line items, normalized strings, and mapped arithmetic invariants.</p></article>
+      <article class="card"><p class="label">Tool calls</p><h3>Check selection and argument semantics</h3><p>Score the selected tool, exact argument paths, and deterministic postconditions in retained outputs.</p></article>
+      <article class="card"><p class="label">Regression suite</p><h3>Pin failures across iterations</h3><p>Track passing, fixed, still-broken, reintroduced, and missing cases before accepting a candidate as the next baseline.</p></article>
+    </div>
+  </section>
+  <section class="section shell">
+    <div class="section-head"><h2>Not the right tool for every problem.</h2><p>Clear boundaries make the evidence easier to trust.</p></div>
+    <table class="metric-table" tabindex="0"><thead><tr><th>Good fit</th><th>Not a current promise</th></tr></thead><tbody>
+      <tr><td>Stable external contract and paired cases</td><td>Schema migration or contract generation</td></tr>
+      <tr><td>Deterministic correctness rules</td><td>A default LLM judge for subjective quality</td></tr>
+      <tr><td>Local recorded outputs</td><td>Production tracing or multi-tenant observability</td></tr>
+      <tr><td>Reviewable release evidence</td><td>A universal schema or prompt optimizer</td></tr>
+    </tbody></table>
+  </section>
+</BaseLayout>

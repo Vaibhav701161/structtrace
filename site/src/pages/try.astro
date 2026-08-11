@@ -1,0 +1,54 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PageHero from "../components/PageHero.astro";
+import Callout from "../components/Callout.astro";
+const expectedCase = `"line_items": [
+  {"description":"Masks","amount":"40.00"},
+  {"description":"Sanitizer","amount":"36.00"}
+]
+"total": "82.08"`;
+const candidateCase = `"line_items": [
+  {"description":"Masks","amount":"40.00"}
+]
+"total": "82.08"`;
+---
+<BaseLayout title="Invoice demo | StructTrace" description="Explore a deterministic 12-case StructTrace invoice comparison without uploading data or running a hosted evaluator.">
+  <PageHero eyebrow="Zero-install demo" title="See the valid-but-wrong failure in one minute." lead="This guided view is derived from the same bundled invoice fixture used by the Rust product. It demonstrates the workflow but does not run your data or claim production evidence." />
+  <section class="narrow prose" data-demo>
+    <div class="demo-shell">
+      <div class="demo-note"><strong>Workflow demonstration:</strong> 12 cases are not enough independent evidence for a production release decision.</div>
+      <div class="demo-tabs" role="tablist" aria-label="Demo views">
+        <button type="button" role="tab" data-demo-step="summary">1. Decision</button>
+        <button type="button" role="tab" data-demo-step="cases">2. Paired cases</button>
+        <button type="button" role="tab" data-demo-step="evidence">3. Regression evidence</button>
+      </div>
+      <section class="demo-panel" data-demo-panel="summary">
+        <p class="label">Regression gate</p><h2>NOT ENOUGH EVIDENCE</h2>
+        <p>The candidate repaired two missing currency fields, but introduced three valid-but-wrong cases. The configured gate requires 100 independent cases.</p>
+        <div class="demo-score"><div><span>Schema valid</span><strong>10/12 → 12/12</strong><small>+16.7 pp</small></div><div><span>Semantically correct</span><strong>9/12 → 9/12</strong><small>0.0 pp</small></div><div><span>Valid but wrong</span><strong>1/12 → 3/12</strong><small>+16.7 pp</small></div></div>
+        <div class="transition-grid"><div><strong>6</strong><span>Both pass</span></div><div><strong>3</strong><span>Regressions</span></div><div><strong>3</strong><span>Improvements</span></div><div><strong>0</strong><span>Both fail</span></div></div>
+      </section>
+      <section class="demo-panel" data-demo-panel="cases" hidden>
+        <p class="label">Paired transitions</p><h2>Every discordant case stays inspectable.</h2>
+        <table class="case-table"><thead><tr><th>Case</th><th>Transition</th><th>What changed</th></tr></thead><tbody>
+          <tr><td>invoice-002</td><td class="case-improvement">Improvement</td><td>Missing currency repaired</td></tr>
+          <tr><td>invoice-005</td><td class="case-regression">Regression</td><td>Tax and total changed incorrectly</td></tr>
+          <tr><td>invoice-008</td><td class="case-improvement">Improvement</td><td>Vendor name repaired</td></tr>
+          <tr><td>invoice-009</td><td class="case-regression">Regression</td><td>Total changed to 315.00</td></tr>
+          <tr><td>invoice-010</td><td class="case-improvement">Improvement</td><td>Missing currency repaired</td></tr>
+          <tr><td>invoice-011</td><td class="case-regression">Regression</td><td>Sanitizer line item removed</td></tr>
+        </tbody></table>
+      </section>
+      <section class="demo-panel" data-demo-panel="evidence" hidden>
+        <p class="label">Case invoice-011</p><h2>Schema-valid. Semantically wrong.</h2>
+        <div class="comparison-card">
+          <article class="comparison-side"><header><h3>Expected and baseline</h3><span class="status-pill">PASS</span></header><pre class="json-block">{expectedCase}</pre></article>
+          <article class="comparison-side"><header><h3>Candidate</h3><span class="status-pill fail">REGRESSION</span></header><pre class="json-block">{candidateCase}</pre></article>
+          <div class="evidence-line"><code>/line_items</code>: required keyed item <code>Sanitizer</code> is missing.</div>
+        </div>
+      </section>
+    </div>
+    <Callout label="Integrity note" tone="neutral"><p>The counts above are asserted by Rust tests against the checked-in fixture. This page displays those fixed results; it does not recreate the evaluator in JavaScript.</p></Callout>
+    <div class="button-row"><a class="button" href="/download">Run the full product locally</a><a class="button button-secondary" href="https://github.com/Vaibhav701161/structtrace/tree/main/examples/document-extraction">Inspect the fixture</a></div>
+  </section>
+</BaseLayout>

@@ -1,0 +1,24 @@
+---
+import DocsLayout from "../../components/DocsLayout.astro";
+import Callout from "../../components/Callout.astro";
+---
+<DocsLayout title="Your first comparison" description="Create a StructTrace recorded-output comparison, define correctness, inspect regressions, and replay the evidence." lead="Begin with retained outputs. This isolates evaluation semantics from provider behavior and gives the most reproducible first run.">
+  <h2>1. Prepare four inputs</h2>
+  <ul><li>a JSONL, JSON, or CSV dataset with case identity, input, and expected values;</li><li>baseline outputs joined by the same case identity;</li><li>candidate outputs joined by the same case identity;</li><li>the unchanged caller-facing JSON Schema.</li></ul>
+  <h2>2. Create the project visually</h2>
+  <pre><code>structtrace open</code></pre>
+  <p>Select <strong>Compare a change</strong>, add the four files, confirm detected envelope mappings, and choose deterministic correctness rules. StructTrace stages browser-selected sources under the local project, binds their BLAKE3 digests, and generates the reproducible project configuration.</p>
+  <h2>3. Define correctness</h2>
+  <p>Use exact JSON when every detail matters. For extraction, define rules per field: normalized strings, canonical dates, exact integers, exact or tolerant decimals, keyed arrays, and mapped financial invariants. Suggestions do not silently become truth.</p>
+  <Callout label="Preflight" tone="warning"><p>StructTrace checks every golden value against its evaluator before loading outputs or executing adapters. Invalid reference data is a dataset defect, not a candidate regression.</p></Callout>
+  <h2>4. Choose evidence authority</h2>
+  <ul><li><strong>Advisory</strong> reports evidence and never authorizes deployment.</li><li><strong>Regression</strong> checks configured relative non-regression.</li><li><strong>Release</strong> adds absolute quality and evidence floors and is the only authorizing mode.</li></ul>
+  <h2>5. Inspect paired results</h2>
+  <p>Begin with the gate state and its reasons. Then review captured rows, independent units, fully evaluated semantic pairs, regressions, improvements, both-pass, both-fail, effect interval, field hotspots, and every discordant case.</p>
+  <h2>6. Replay before relying on it</h2>
+  <pre><code>structtrace --project-root my-comparison replay latest
+structtrace --project-root my-comparison gate latest --verify replay</code></pre>
+  <p>Replay checks manifest hashes, reconstructs built-in evaluator results, verifies retained external-evaluator receipts, and recomputes summaries without re-executing user code.</p>
+  <h2>7. Generate CI after the local run is understood</h2>
+  <p>The UI exports a complete project and a reviewable GitHub Actions starter. Add project-specific installation and data-generation steps before treating it as runnable automation.</p>
+</DocsLayout>
