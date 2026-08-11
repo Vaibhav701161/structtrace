@@ -78,7 +78,7 @@ export interface ComparisonDraft {
 export const jobResponseSchema = z.object({
   jobId: z.string(),
   projectId: z.string(),
-  status: z.enum(["queued", "running", "complete", "failed", "cancelled", "interrupted"]),
+  status: z.enum(["queued", "waiting_for_executor", "running", "complete", "failed", "cancelled", "interrupted"]),
   stage: z.string(),
   completed: z.number(),
   total: z.number(),
@@ -163,20 +163,36 @@ export const runResultSchema = z.object({
   }),
   cases: z.array(z.unknown()).default([]),
   schemaProvenance: z.enum(["caller_supplied", "inferred_from_expected_values"]).optional(),
+  integrity: z.object({
+    status: z.enum(["verified", "modified", "not_verified", "replay_failed"]),
+    detail: z.string(),
+  }),
 });
 export type RunResult = z.infer<typeof runResultSchema>;
 
 export const acceptedBaselineSchema = z.object({
-  accepted: z.object({ runId: z.string(), projectId: z.string(), acceptedAt: z.number(), candidateArtifactHash: z.string(), sourceId: z.string() }),
+  accepted: z.object({
+    runId: z.string(), projectId: z.string(), acceptedAt: z.number(),
+    runManifestHash: z.string(), summaryHash: z.string(), candidateArtifactHash: z.string(),
+    stagedSourceHash: z.string(), sourceId: z.string(), projectRevisionId: z.string(),
+    gateMode: gateModeSchema, deploymentAuthorized: z.boolean(), artifactFormatVersion: z.number(),
+    structtraceVersion: z.string(),
+  }),
   source: z.object({ sourceId: z.string(), hash: z.string(), name: z.string(), format: z.enum(["jsonl", "json", "csv"]), content: z.string(), bytes: z.number() }),
 });
 export type AcceptedBaselineResponse = z.infer<typeof acceptedBaselineSchema>;
 
-export const projectSummarySchema = z.object({ projectId: z.string(), name: z.string(), runCount: z.number(), updatedAt: z.number() });
+export const projectSummarySchema = z.object({
+  projectId: z.string(), name: z.string(), runCount: z.number(), updatedAt: z.number(),
+  revisionId: z.string().nullable(),
+  revisionState: z.enum(["completed", "accepted"]).nullable(),
+  acceptedBaseline: acceptedBaselineSchema.shape.accepted.nullable(),
+  integrity: z.object({ status: z.enum(["verified", "modified", "not_verified", "replay_failed"]), detail: z.string() }),
+});
 export type ProjectSummary = z.infer<typeof projectSummarySchema>;
 
 export const casePageSchema = z.object({
-  items: z.array(z.unknown()),
+  itemsJson: z.array(z.string()),
   total: z.number(),
   offset: z.number(),
   limit: z.number(),
@@ -224,6 +240,23 @@ const sourceArtifactSchema = z.object({
   message: z.string().optional(),
   preview: z.array(z.unknown()).optional(),
 });
+
+export const fieldInventorySchema = z.object({
+  fields: z.array(z.object({
+    pointer: z.string(), observedType: z.string(), expectedCoverage: z.number(),
+    baselineCoverage: z.number(), candidateCoverage: z.number(), schemaOnly: z.boolean(),
+    candidateOmission: z.boolean(), suggestedRule: z.enum(["exact", "normalized_string", "canonical_date", "exact_integer", "decimal_exact", "keyed_array"]),
+    typeDistribution: z.record(z.string(), z.number()),
+  })),
+  datasetRows: z.number(), baselineRows: z.number(), candidateRows: z.number(),
+  analyzedAllRows: z.literal(true),
+  mapping: z.object({
+    matched: z.number(), duplicateDatasetIds: z.array(z.string()), missingBaseline: z.number(),
+    missingCandidate: z.number(), invalidDatasetIds: z.number(), invalidBaselineIds: z.number(),
+    invalidCandidateIds: z.number(),
+  }),
+});
+export type FieldInventory = z.infer<typeof fieldInventorySchema>;
 
 const fieldRuleSchema = z.object({
   pointer: z.string(),

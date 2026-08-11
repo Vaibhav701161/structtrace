@@ -1,0 +1,17 @@
+Structured outputs can pass a schema and still fail the task. StructTrace turns that hidden risk into paired, replayable evidence.
+
+We begin with the caller's golden data, current baseline, candidate outputs, and unchanged JSON Schema. Everything stays on the local machine.
+
+Rust parses every bounded row. The browser preview is display-only, while field discovery, coverage, missing values, and evaluator suggestions come from the complete sources and contract.
+
+We define correctness explicitly, then choose a release gate. The gate preserves every failure in the denominator and refuses authority when evidence is weak.
+
+This real run compares one hundred matched cases. Both variants remain structurally valid, but the candidate changes one answer. The paired matrix exposes that regression directly, with its denominator and uncertainty visible.
+
+Inside the case explorer, exact numeric lexemes survive the browser boundary. Added, removed, changed, and type-changed values have distinct markers, and the failing JSON path stays in focus.
+
+Promotion is not a file copy. StructTrace replays the run, verifies every manifest-bound artifact and score, then commits the exact candidate bytes as an immutable accepted project revision.
+
+The CI export resolves that same verified revision and accepted baseline. It pins StructTrace to a real source commit. It replays evidence, applies the authority-safe release command, and retains the resulting artifacts.
+
+StructTrace is a local evidence system for deciding whether a structured-output change is actually safe to ship.

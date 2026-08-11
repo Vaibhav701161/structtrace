@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "capture": {
+    "source": "real StructTrace release binary and embedded local UI",
+    "script": "demo/video/record-launch-walkthrough.mjs",
+    "resolution": "2560x1440",
+    "capture_frames_per_second": 25,
+    "browser": "Playwright Chromium",
+    "fixture": "100 deterministic local recorded-output pairs; one retained semantic regression"
+  },
+  "narration": {
+    "provider": "Microsoft Edge neural speech",
+    "voice": "en-US-ChristopherNeural",
+    "rate": "-8%",
+    "pitch": "-12Hz",
+    "source": "demo/video/launch-narration.txt"
+  },
+  "delivery": {
+    "master_video": "H.264 yuv420p, CRF 16",
+    "web_audio": "AAC, 48kHz, 192kbps",
+    "spoken_loudness": "-16 LUFS integrated, -1.5 dB true peak",
+    "captions": "WebVTT sidecar and burned-in launch cut"
+  },
+  "claim_policy": "Every interaction is captured from the real product. Editorial cuts may remove waiting time but must not change data, state, or outcomes."
+}

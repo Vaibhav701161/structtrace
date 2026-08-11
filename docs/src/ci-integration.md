@@ -22,3 +22,10 @@ failed rules and a compact Markdown-compatible table. Preserve `.structtrace/run
 artifact when reviewers need the offline report and replay bundle.
 
 Do not convert exit code `10` to success unless the workflow intentionally treats release regressions as advisory. Keep provider credentials in the CI secret store and reference only their environment-variable names in `structtrace.yaml`.
+
+The Local UI exports CI only from a verified committed project revision. The snapshot includes the
+revision receipt and, when present, the accepted-baseline receipt; exported baseline bytes must
+match the accepted candidate digest before any workflow is written. Source checkout is pinned only
+when the running binary embeds a usable 40-character Git commit. Archive or development builds
+without that provenance refuse export with an actionable error instead of emitting a placeholder
+checkout ref.

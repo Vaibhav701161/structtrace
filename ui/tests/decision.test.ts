@@ -7,6 +7,7 @@ function result(gate: RunResult["summary"]["gate"]): RunResult {
     runId: "run",
     projectName: "project",
     createdAt: 0,
+    integrity: { status: "verified", detail: "Replay verified." },
     cases: [],
     summary: {
       baseline: { total: 1, parse_valid: 1, schema_valid: 1, semantic_success: 1, deployment_success: 1, valid_but_wrong: 0, errors: 0 },

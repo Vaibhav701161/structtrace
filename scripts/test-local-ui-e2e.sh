@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 server_log="$(mktemp)"
+test_project_root="$(mktemp -d)"
 server_pid=""
 
 cleanup() {
@@ -11,12 +12,13 @@ cleanup() {
     wait "$server_pid" 2>/dev/null || true
   fi
   rm -f "$server_log"
+  rm -rf "$test_project_root"
 }
 trap cleanup EXIT
 
 cd "$repository_root"
 cargo build --locked -p structtrace-cli
-target/debug/structtrace open --no-browser >"$server_log" 2>&1 &
+target/debug/structtrace --project-root "$test_project_root" open --no-browser >"$server_log" 2>&1 &
 server_pid="$!"
 
 local_url=""

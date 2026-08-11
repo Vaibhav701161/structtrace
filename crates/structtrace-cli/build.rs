@@ -17,7 +17,9 @@ fn main() {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_owned())
-        .filter(|value| value.len() == 40)
-        .unwrap_or_else(|| "source-revision-unavailable".to_owned());
+        .filter(|value| {
+            value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .unwrap_or_default();
     println!("cargo:rustc-env=STRUCTTRACE_GIT_SHA={revision}");
 }

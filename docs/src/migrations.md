@@ -43,3 +43,20 @@ Replay refuses unsupported artifact versions rather than guessing.
 
 SQLite metadata upgrades to version 5 when a compatible run store is opened. This metadata update
 does not convert an older portable artifact into artifact version 10.
+
+## Local project revision format 1
+
+StructTrace Local projects created before revision format 1 remain visible as legacy projects, but
+they are not treated as authoritative committed revisions. Opening and completing a new comparison
+creates the first immutable `revisions/<revision-id>` directory and atomically writes
+`current-revision.json`. Legacy mutable files are never silently relabelled as verified evidence.
+
+An accepted-baseline record from the earlier standalone-file design is not migrated by inference.
+The source release run must still exist, use the current artifact format, authorize deployment,
+and pass complete replay before the candidate can be promoted into an accepted revision. This
+explicit refusal prevents older partial receipts from acquiring provenance they never stored.
+
+Revision format 1 receipts bind the normalized project configuration, golden data, caller schema,
+baseline and candidate bytes, source run, parent revision, and accepted-baseline provenance when
+present. Unknown future receipt fields or formats fail closed until a compatible StructTrace
+version performs an explicit migration.

@@ -1,7 +1,7 @@
 //! Capability-protected local browser product backed by the StructTrace engine.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use structtrace_core::{
@@ -118,17 +119,59 @@ struct StagedSource {
     #[serde(default)]
     rows: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    preview: Vec<Value>,
+    preview_json: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AcceptedBaseline {
     run_id: String,
     project_id: String,
     accepted_at: u64,
+    run_manifest_hash: String,
+    summary_hash: String,
     candidate_artifact_hash: String,
+    staged_source_hash: String,
     source_id: String,
+    project_revision_id: String,
+    gate_mode: GateMode,
+    deployment_authorized: bool,
+    artifact_format_version: u32,
+    structtrace_version: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectRevisionState {
+    Completed,
+    Accepted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectRevisionReceipt {
+    format_version: u32,
+    revision_id: String,
+    project_id: String,
+    state: ProjectRevisionState,
+    created_at: u64,
+    source_run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_revision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_provenance: Option<AcceptedBaseline>,
+    artifacts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentProjectRevision {
+    format_version: u32,
+    project_id: String,
+    revision_id: String,
+    state: ProjectRevisionState,
+    revision_receipt_hash: String,
+    accepted_baseline: Option<AcceptedBaseline>,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +199,10 @@ struct ProjectSummary {
     name: String,
     run_count: usize,
     updated_at: u64,
+    revision_id: Option<String>,
+    revision_state: Option<ProjectRevisionState>,
+    accepted_baseline: Option<AcceptedBaseline>,
+    integrity: RunIntegrity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +273,7 @@ struct ComparisonRequest {
 #[serde(rename_all = "snake_case")]
 enum JobStatus {
     Queued,
+    WaitingForExecutor,
     Running,
     Complete,
     Failed,
@@ -279,6 +327,23 @@ struct RunResponse {
     created_at: u64,
     summary: RunSummary,
     schema_provenance: &'static str,
+    integrity: RunIntegrity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RunIntegrityStatus {
+    Verified,
+    Modified,
+    NotVerified,
+    ReplayFailed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunIntegrity {
+    status: RunIntegrityStatus,
+    detail: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,11 +367,70 @@ impl Default for CasePageQuery {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CasePageResponse {
-    items: Vec<PairedCaseRecord>,
+    items_json: Vec<String>,
     total: usize,
     offset: usize,
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FieldInventoryRequest {
+    dataset: SourceReference,
+    baseline: SourceReference,
+    candidate: SourceReference,
+    schema: Option<SourceReference>,
+    dataset_output: String,
+    baseline_output: String,
+    candidate_output: String,
+    dataset_id: String,
+    baseline_id: String,
+    candidate_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldInventoryResponse {
+    fields: Vec<FieldInventoryField>,
+    dataset_rows: usize,
+    baseline_rows: usize,
+    candidate_rows: usize,
+    analyzed_all_rows: bool,
+    mapping: MappingInventory,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MappingInventory {
+    matched: usize,
+    duplicate_dataset_ids: Vec<String>,
+    missing_baseline: usize,
+    missing_candidate: usize,
+    invalid_dataset_ids: usize,
+    invalid_baseline_ids: usize,
+    invalid_candidate_ids: usize,
+}
+
+#[derive(Debug, Default)]
+struct FieldObservations {
+    present: usize,
+    types: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldInventoryField {
+    pointer: String,
+    observed_type: String,
+    expected_coverage: f64,
+    baseline_coverage: f64,
+    candidate_coverage: f64,
+    schema_only: bool,
+    candidate_omission: bool,
+    suggested_rule: &'static str,
+    type_distribution: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,8 +594,10 @@ pub async fn serve(project_root: &Path, open_browser: bool) -> anyhow::Result<()
         .route("/{token}/api/v1/jobs", post(create_job))
         .route("/{token}/api/v1/jobs/{job_id}", get(get_job))
         .route("/{token}/api/v1/jobs/{job_id}/cancel", post(cancel_job))
-        .route("/{token}/api/v1/jobs/{job_id}/resume", post(resume_job))
+        .route("/{token}/api/v1/jobs/{job_id}/retry", post(retry_job))
+        .route("/{token}/api/v1/jobs/{job_id}/resume", post(retry_job))
         .route("/{token}/api/v1/sources", post(stage_source))
+        .route("/{token}/api/v1/sources/inventory", post(field_inventory))
         .route(
             "/{token}/api/v1/comparisons/draft",
             get(get_draft).put(save_draft).delete(delete_draft),
@@ -701,8 +827,57 @@ async fn stage_source(
     let rows = authoritative_rows(&request.kind, &request.file)?;
     let mut staged = stage_browser_file(&state.project_root, request.kind, request.file)?;
     staged.rows = rows.len();
-    staged.preview = rows.into_iter().take(25).collect();
+    staged.preview_json = rows
+        .into_iter()
+        .take(25)
+        .map(|row| serde_json::to_string(&row))
+        .collect::<Result<Vec<_>, _>>()?;
+    atomic_write(
+        &staged_sources_dir(&state.project_root).join(format!("{}.json", staged.source_id)),
+        &serde_json::to_vec_pretty(&staged)?,
+    )?;
     Ok(Json(staged))
+}
+
+async fn field_inventory(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<FieldInventoryRequest>,
+) -> Result<Json<FieldInventoryResponse>, AppError> {
+    let dataset = authoritative_rows(
+        "dataset",
+        &load_staged_source(&state.project_root, &request.dataset)?,
+    )?;
+    let baseline = authoritative_rows(
+        "baseline",
+        &load_staged_source(&state.project_root, &request.baseline)?,
+    )?;
+    let candidate = authoritative_rows(
+        "candidate",
+        &load_staged_source(&state.project_root, &request.candidate)?,
+    )?;
+    let schema = request
+        .schema
+        .as_ref()
+        .map(|reference| load_staged_source(&state.project_root, reference))
+        .transpose()?
+        .map(|file| structtrace_core::strict_json::value_from_str(&file.content))
+        .transpose()?;
+    Ok(Json(build_field_inventory(FieldInventoryInput {
+        dataset: &dataset,
+        baseline: &baseline,
+        candidate: &candidate,
+        output_pointers: [
+            &request.dataset_output,
+            &request.baseline_output,
+            &request.candidate_output,
+        ],
+        id_pointers: [
+            &request.dataset_id,
+            &request.baseline_id,
+            &request.candidate_id,
+        ],
+        schema: schema.as_ref(),
+    })))
 }
 
 async fn run_comparison(
@@ -769,7 +944,10 @@ async fn cancel_job(
     let job = jobs
         .get_mut(job_id)
         .ok_or_else(|| AppError::not_found("job_not_found", "Comparison job was not found."))?;
-    if matches!(job.state.status, JobStatus::Queued | JobStatus::Running) {
+    if matches!(
+        job.state.status,
+        JobStatus::Queued | JobStatus::WaitingForExecutor | JobStatus::Running
+    ) {
         job.cancel.store(true, Ordering::Relaxed);
         job.state.stage = "cancelling".to_owned();
         job.state.message = Some(
@@ -782,7 +960,7 @@ async fn cancel_job(
     Ok(Json(job.state.clone()))
 }
 
-async fn resume_job(
+async fn retry_job(
     State(state): State<Arc<AppState>>,
     AxumPath(params): AxumPath<HashMap<String, String>>,
 ) -> Result<(StatusCode, Json<JobResponse>), AppError> {
@@ -801,7 +979,7 @@ async fn resume_job(
         ) {
             return Err(AppError::bad_request(
                 "job_not_resumable",
-                "Only failed, cancelled, or interrupted jobs can be resumed.",
+                "Only failed, cancelled, or interrupted jobs can be retried.",
             ));
         }
         job.request.clone()
@@ -850,8 +1028,16 @@ async fn execute_job(state: Arc<AppState>, job_id: String) {
     let (request, cancel) = match state.jobs.lock() {
         Ok(mut jobs) => match jobs.get_mut(&job_id) {
             Some(job) => {
-                job.state.status = JobStatus::Running;
-                job.state.stage = "preparing_project".to_owned();
+                job.state.status = JobStatus::WaitingForExecutor;
+                job.state.stage = "waiting_for_executor".to_owned();
+                job.state.message = Some(
+                    "Waiting for the single local comparison executor. Cancellation remains immediate."
+                        .to_owned(),
+                );
+                job.state.events.push(JobEvent {
+                    stage: "waiting_for_executor".to_owned(),
+                    at: now_seconds(),
+                });
                 job.state.updated_at = now_seconds();
                 let _ = persist_job(&state.project_root, job);
                 (job.request.clone(), Arc::clone(&job.cancel))
@@ -866,10 +1052,39 @@ async fn execute_job(state: Arc<AppState>, job_id: String) {
     let progress_state = Arc::clone(&state);
     let progress_job_id = job_id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let _lock = run_state
-            .comparison_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("comparison coordinator is unavailable"))?;
+        let _lock = loop {
+            anyhow::ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "comparison cancelled by user"
+            );
+            match run_state.comparison_lock.try_lock() {
+                Ok(lock) => break lock,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("comparison coordinator is unavailable");
+                }
+            }
+        };
+        {
+            let mut jobs = progress_state
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job registry is unavailable"))?;
+            let job = jobs
+                .get_mut(&progress_job_id)
+                .context("comparison job disappeared")?;
+            job.state.status = JobStatus::Running;
+            job.state.stage = "preparing_project".to_owned();
+            job.state.message = None;
+            job.state.updated_at = now_seconds();
+            job.state.events.push(JobEvent {
+                stage: "preparing_project".to_owned(),
+                at: job.state.updated_at,
+            });
+            persist_job(&progress_state.project_root, job)?;
+        }
         let observer = |progress: structtrace_engine::RunProgress| -> anyhow::Result<()> {
             anyhow::ensure!(
                 !cancel.load(Ordering::Relaxed),
@@ -974,8 +1189,15 @@ async fn accept_run(
 ) -> Result<Json<AcceptedBaselineResponse>, AppError> {
     let run_id = params.get("run_id").context("run ID is missing")?;
     let run_dir = run_dir_for(&state, run_id)?;
+    let replay = structtrace_engine::replay_run(&run_dir)?;
+    if !replay.verified {
+        return Err(AppError::bad_request(
+            "run_integrity_failed",
+            "This run cannot be promoted because its manifest-bound artifacts or replayed decision did not verify.",
+        ));
+    }
     let summary: RunSummary = read_json(&run_dir.join("summary.json"))?;
-    if !summary.gate.deployment_authorized {
+    if summary.gate.gate_mode != GateMode::Release || !summary.gate.deployment_authorized {
         return Err(AppError::bad_request(
             "acceptance_not_authorized",
             "Only a release comparison with deployment authorization can become the next baseline.",
@@ -987,11 +1209,41 @@ async fn accept_run(
         .project_root
         .join(".structtrace/ui/projects")
         .join(&project_id);
+    let (current, source_revision, source_revision_receipt) =
+        current_project_revision(&project_dir)?
+            .context("this run predates transactional project revisions and cannot be promoted")?;
+    let run_revision = run_dir
+        .ancestors()
+        .nth(3)
+        .context("run is not inside a project revision")?;
+    if run_revision != source_revision {
+        return Err(AppError::bad_request(
+            "stale_project_revision",
+            "Only the current committed project revision can be promoted.",
+        ));
+    }
+    if current.state != ProjectRevisionState::Completed
+        || source_revision_receipt.source_run_id != *run_id
+    {
+        return Err(AppError::bad_request(
+            "invalid_project_revision",
+            "The current project revision is not the completed source of this run.",
+        ));
+    }
     let canonical_candidate = structtrace_core::hashing::read_bounded(
         &run_dir.join("inputs/candidate.jsonl"),
         MAX_FILE_BYTES,
         "accepted candidate input",
     )?;
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let candidate_hash = structtrace_core::hashing::hash_bytes(&canonical_candidate);
+    if manifest.input_artifacts.get("inputs/candidate.jsonl") != Some(&candidate_hash) {
+        return Err(AppError::bad_request(
+            "candidate_integrity_failed",
+            "Verified candidate bytes do not match the run manifest.",
+        ));
+    }
     let candidate = BrowserFile {
         name: format!("accepted-{run_id}.jsonl"),
         format: InputFormat::Jsonl,
@@ -999,22 +1251,74 @@ async fn accept_run(
             .context("accepted candidate is not UTF-8")?,
     };
     let staged = stage_browser_file(&state.project_root, "baseline".to_owned(), candidate)?;
-    let manifest: structtrace_core::artifact::RunManifest =
-        read_json(&run_dir.join("manifest.json"))?;
+    if staged.hash != candidate_hash {
+        return Err(AppError::bad_request(
+            "baseline_staging_failed",
+            "The staged accepted baseline differs from the verified candidate bytes.",
+        ));
+    }
+    let accepted_revision_id = Ulid::new().to_string();
+    let revisions = project_dir.join("revisions");
+    std::fs::create_dir_all(&revisions)?;
+    let scratch = tempfile::Builder::new()
+        .prefix(".structtrace-accepted-")
+        .tempdir_in(&revisions)?;
+    let build = scratch.path().join("build");
+    copy_project_definition(&source_revision, &build)?;
+    atomic_write(
+        &build.join("outputs/baseline.jsonl"),
+        staged_source_bytes(&state.project_root, &staged.source_id)?.as_slice(),
+    )?;
     let accepted = AcceptedBaseline {
         run_id: run_id.clone(),
-        project_id,
+        project_id: project_id.clone(),
         accepted_at: now_seconds(),
-        candidate_artifact_hash: manifest
-            .input_artifacts
-            .get("inputs/candidate.jsonl")
-            .cloned()
-            .context("candidate hash is missing from the run manifest")?,
+        run_manifest_hash: structtrace_core::hashing::hash_file(&run_dir.join("manifest.json"))?,
+        summary_hash: structtrace_core::hashing::hash_file(&run_dir.join("summary.json"))?,
+        candidate_artifact_hash: candidate_hash,
+        staged_source_hash: staged.hash.clone(),
         source_id: staged.source_id.clone(),
+        project_revision_id: accepted_revision_id.clone(),
+        gate_mode: summary.gate.gate_mode,
+        deployment_authorized: true,
+        artifact_format_version: manifest.artifact_format_version,
+        structtrace_version: manifest.structtrace_version,
+    };
+    let revision_receipt = ProjectRevisionReceipt {
+        format_version: 1,
+        revision_id: accepted_revision_id.clone(),
+        project_id: project_id.clone(),
+        state: ProjectRevisionState::Accepted,
+        created_at: now_seconds(),
+        source_run_id: run_id.clone(),
+        parent_revision_id: Some(current.revision_id.clone()),
+        baseline_provenance: Some(accepted.clone()),
+        artifacts: project_definition_hashes(&build)?,
+    };
+    let revision_receipt_bytes = serde_json::to_vec_pretty(&revision_receipt)?;
+    atomic_write(
+        &build.join("structtrace-project-revision.json"),
+        &revision_receipt_bytes,
+    )?;
+    let accepted_revision = revisions.join(&accepted_revision_id);
+    if accepted_revision.exists() {
+        return Err(AppError::bad_request(
+            "revision_conflict",
+            "The accepted project revision already exists.",
+        ));
+    }
+    std::fs::rename(&build, &accepted_revision)?;
+    let pointer = CurrentProjectRevision {
+        format_version: 1,
+        project_id,
+        revision_id: accepted_revision_id,
+        state: ProjectRevisionState::Accepted,
+        revision_receipt_hash: structtrace_core::hashing::hash_bytes(&revision_receipt_bytes),
+        accepted_baseline: Some(accepted.clone()),
     };
     atomic_write(
-        &project_dir.join("accepted-baseline.json"),
-        &serde_json::to_vec_pretty(&accepted)?,
+        &project_dir.join("current-revision.json"),
+        &serde_json::to_vec_pretty(&pointer)?,
     )?;
     Ok(Json(accepted_response(&state.project_root, accepted)?))
 }
@@ -1026,18 +1330,22 @@ async fn get_accepted_baseline(
     let project_id = params.get("project_id").context("project ID is missing")?;
     validate_project_id(project_id)
         .map_err(|error| AppError::bad_request("invalid_project_id", error.to_string()))?;
-    let path = state
+    let project = state
         .project_root
         .join(".structtrace/ui/projects")
-        .join(project_id)
-        .join("accepted-baseline.json");
-    if !path.exists() {
+        .join(project_id);
+    let Some((current, _, _)) = current_project_revision(&project)? else {
         return Err(AppError::not_found(
             "accepted_baseline_not_found",
             "This project has no accepted baseline.",
         ));
-    }
-    let accepted: AcceptedBaseline = read_json(&path)?;
+    };
+    let Some(accepted) = current.accepted_baseline else {
+        return Err(AppError::not_found(
+            "accepted_baseline_not_found",
+            "This project has no accepted baseline.",
+        ));
+    };
     Ok(Json(accepted_response(&state.project_root, accepted)?))
 }
 
@@ -1082,12 +1390,12 @@ async fn get_run_cases(
     }
     let run_id = params.get("run_id").context("run ID is missing")?;
     let run_dir = run_dir_for(&state, run_id)?;
-    let bytes = structtrace_core::hashing::read_bounded(
-        &run_dir.join("cases.jsonl"),
-        64 * 1024 * 1024,
-        "case evidence",
-    )?;
-    let text = std::str::from_utf8(&bytes)?;
+    let index_path = ensure_case_index(&run_dir).map_err(|error| {
+        AppError::bad_request(
+            "run_integrity_failed",
+            format!("Case evidence is unavailable because integrity verification failed: {error}"),
+        )
+    })?;
     let search = query.search.to_lowercase();
     let pinned_case_ids = if query.filter == "pinned" {
         let _guard = state
@@ -1102,27 +1410,193 @@ async fn get_run_cases(
     } else {
         HashSet::new()
     };
-    let mut total = 0usize;
-    let mut items = Vec::with_capacity(query.limit);
-    for (index, line) in text.lines().enumerate() {
-        let record: PairedCaseRecord = structtrace_core::strict_json::from_str(line)
-            .with_context(|| format!("invalid case artifact line {}", index + 1))?;
-        if !case_matches_filter(&record, &query.filter, &pinned_case_ids)
-            || (!search.is_empty() && !line.to_lowercase().contains(&search))
-        {
-            continue;
-        }
-        if total >= query.offset && items.len() < query.limit {
-            items.push(record);
-        }
-        total += 1;
-    }
+    let connection = Connection::open_with_flags(
+        index_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let filter_token = case_filter_token(&query.filter);
+    let search_pattern = format!("%{}%", escape_like(&search));
+    let pinned = pinned_case_ids.into_iter().collect::<Vec<_>>();
+    let pinned_json = serde_json::to_string(&pinned)?;
+    let where_clause = if query.filter == "pinned" {
+        "case_id IN (SELECT value FROM json_each(?1)) AND search_text LIKE ?2 ESCAPE '\\'"
+    } else {
+        "filter_keys LIKE ?1 ESCAPE '\\' AND search_text LIKE ?2 ESCAPE '\\'"
+    };
+    let filter_pattern = if query.filter == "pinned" {
+        pinned_json
+    } else {
+        format!("%|{}|%", escape_like(filter_token))
+    };
+    let total: i64 = connection.query_row(
+        &format!("SELECT COUNT(*) FROM cases WHERE {where_clause}"),
+        params![&filter_pattern, &search_pattern],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(total)?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT record_json FROM cases WHERE {where_clause} ORDER BY ordinal LIMIT ?3 OFFSET ?4"
+    ))?;
+    let items_json = statement
+        .query_map(
+            params![
+                &filter_pattern,
+                &search_pattern,
+                i64::try_from(query.limit)?,
+                i64::try_from(query.offset)?
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(CasePageResponse {
-        items,
+        items_json,
         total,
         offset: query.offset,
         limit: query.limit,
     }))
+}
+
+fn case_filter_token(filter: &str) -> &str {
+    match filter {
+        "regressions" | "improvements" | "both_wrong" | "valid_but_wrong" | "parse_failures"
+        | "schema_failures" | "evaluator_errors" => filter,
+        _ => "all",
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn ensure_case_index(run_dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::io::BufRead;
+
+    let manifest: structtrace_core::artifact::RunManifest =
+        read_json(&run_dir.join("manifest.json"))?;
+    let expected_hash = manifest
+        .artifacts
+        .get("cases.jsonl")
+        .context("run manifest does not bind cases.jsonl")?;
+    let cases_path = run_dir.join("cases.jsonl");
+    let source_metadata = std::fs::metadata(&cases_path)?;
+    let source_fingerprint = file_fingerprint(&source_metadata)?;
+    let index_dir = run_dir.join(".structtrace-ui");
+    let index_path = index_dir.join("case-index.sqlite3");
+    if index_path.is_file() {
+        let connection = Connection::open_with_flags(
+            &index_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let indexed_hash: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'cases_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let indexed_fingerprint: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'source_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            indexed_hash.as_deref() == Some(expected_hash)
+                && indexed_fingerprint.as_deref() == Some(source_fingerprint.as_str()),
+            "cases.jsonl changed after its verified search index was created"
+        );
+        return Ok(index_path);
+    }
+    let integrity = inspect_run_integrity(run_dir);
+    anyhow::ensure!(
+        integrity.status == RunIntegrityStatus::Verified,
+        integrity.detail
+    );
+    std::fs::create_dir_all(&index_dir)?;
+    make_owner_only_directory(&index_dir)?;
+    let temporary = index_dir.join(format!(".case-index-{}.sqlite3", Ulid::new()));
+    let mut connection = Connection::open(&temporary)?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=FULL; \
+         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+         CREATE TABLE cases (ordinal INTEGER PRIMARY KEY, case_id TEXT NOT NULL UNIQUE, filter_keys TEXT NOT NULL, search_text TEXT NOT NULL, record_json TEXT NOT NULL); \
+         CREATE INDEX case_filter_index ON cases(filter_keys, ordinal); \
+         CREATE INDEX case_id_index ON cases(case_id);",
+    )?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO metadata(key, value) VALUES ('cases_hash', ?1), ('source_fingerprint', ?2)",
+        params![expected_hash, source_fingerprint],
+    )?;
+    let file = std::fs::File::open(&cases_path)?;
+    let reader = std::io::BufReader::new(file);
+    let empty_pins = HashSet::new();
+    for (ordinal, line) in reader.lines().enumerate() {
+        let line = line?;
+        anyhow::ensure!(
+            line.len() <= 16 * 1024 * 1024,
+            "case evidence line {} exceeds the UI index limit",
+            ordinal + 1
+        );
+        let record: PairedCaseRecord = structtrace_core::strict_json::from_str(&line)
+            .with_context(|| format!("invalid case artifact line {}", ordinal + 1))?;
+        let filters = [
+            "all",
+            "regressions",
+            "improvements",
+            "both_wrong",
+            "valid_but_wrong",
+            "parse_failures",
+            "schema_failures",
+            "evaluator_errors",
+        ]
+        .into_iter()
+        .filter(|filter| case_matches_filter(&record, filter, &empty_pins))
+        .collect::<Vec<_>>()
+        .join("|");
+        transaction.execute(
+            "INSERT INTO cases(ordinal, case_id, filter_keys, search_text, record_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                i64::try_from(ordinal)?,
+                record.case.id,
+                format!("|{filters}|"),
+                line.to_lowercase(),
+                line
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    drop(connection);
+    std::fs::rename(&temporary, &index_path)?;
+    Ok(index_path)
+}
+
+fn file_fingerprint(metadata: &std::fs::Metadata) -> anyhow::Result<String> {
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{modified}:{}:{}:{}",
+            metadata.len(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{}:{modified}", metadata.len()))
+    }
 }
 
 fn case_matches_filter(
@@ -1258,8 +1732,10 @@ async fn delete_draft(State(state): State<Arc<AppState>>) -> Result<StatusCode, 
             .project_root
             .join(".structtrace/ui/projects")
             .join(project_id);
-        let has_runs = project.join(".structtrace/runs").is_dir();
-        let initialized = project.join("structtrace.yaml").exists();
+        let has_runs =
+            project.join(".structtrace/runs").is_dir() || project.join("revisions").is_dir();
+        let initialized = project.join("structtrace.yaml").exists()
+            || project.join("current-revision.json").exists();
         if project.is_dir() && !has_runs && !initialized {
             std::fs::remove_dir_all(project)?;
         }
@@ -1295,25 +1771,65 @@ async fn list_projects(
             .and_then(Value::as_str)
             .unwrap_or("Unnamed comparison")
             .to_owned();
-        let runs = entry.path().join(".structtrace/runs");
-        let run_count = if runs.is_dir() {
-            std::fs::read_dir(runs)?
-                .filter_map(Result::ok)
-                .filter(|item| item.file_type().is_ok_and(|kind| kind.is_dir()))
-                .count()
-        } else {
-            0
-        };
+        let run_count = project_run_roots(&entry.path())?
+            .into_iter()
+            .map(|runs| {
+                std::fs::read_dir(runs).map(|items| {
+                    items
+                        .filter_map(Result::ok)
+                        .filter(|item| item.file_type().is_ok_and(|kind| kind.is_dir()))
+                        .count()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
         let updated_at = std::fs::metadata(&draft_path)?
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_secs());
+        let (revision_id, revision_state, accepted_baseline, integrity) =
+            match current_project_revision(&entry.path()) {
+                Ok(Some((current, _, _))) => (
+                    Some(current.revision_id.clone()),
+                    Some(current.state),
+                    current.accepted_baseline,
+                    RunIntegrity {
+                        status: RunIntegrityStatus::Verified,
+                        detail: "The current immutable project revision matches its receipt."
+                            .to_owned(),
+                    },
+                ),
+                Ok(None) => (
+                    None,
+                    None,
+                    None,
+                    RunIntegrity {
+                        status: RunIntegrityStatus::NotVerified,
+                        detail: "This legacy project has no immutable committed revision yet."
+                            .to_owned(),
+                    },
+                ),
+                Err(error) => (
+                    None,
+                    None,
+                    None,
+                    RunIntegrity {
+                        status: RunIntegrityStatus::Modified,
+                        detail: format!("Project revision integrity failed: {error}"),
+                    },
+                ),
+            };
         projects.push(ProjectSummary {
             project_id,
             name,
             run_count,
             updated_at,
+            revision_id,
+            revision_state,
+            accepted_baseline,
+            integrity,
         });
     }
     projects.sort_by_key(|project| std::cmp::Reverse(project.updated_at));
@@ -1339,8 +1855,61 @@ async fn get_project(
         ));
     }
     let mut draft: Value = read_json(&path)?;
+    let project_root = path.parent().context("project draft path has no parent")?;
+    apply_current_revision_to_draft(&state.project_root, project_root, &mut draft)?;
     hydrate_draft_source_contents(&state.project_root, &mut draft)?;
     Ok(Json(serde_json::json!({"draft": draft})))
+}
+
+fn apply_current_revision_to_draft(
+    storage_root: &Path,
+    project_root: &Path,
+    draft: &mut Value,
+) -> anyhow::Result<()> {
+    let Some((current, _, _)) = current_project_revision(project_root)? else {
+        return Ok(());
+    };
+    let Some(accepted) = current.accepted_baseline else {
+        return Ok(());
+    };
+    let response = accepted_response(storage_root, accepted)?;
+    draft["sources"]["baseline"] = serde_json::json!({
+        "sourceId": response.source.source_id,
+        "hash": response.source.hash,
+        "kind": "baseline",
+        "name": response.source.name,
+        "format": response.source.format,
+        "bytes": response.source.bytes,
+        "rows": response.source.content.lines().filter(|line| !line.trim().is_empty()).count(),
+        "status": "ready"
+    });
+    draft["sources"]
+        .as_object_mut()
+        .context("project sources must be an object")?
+        .remove("candidate");
+    let accepted_name = draft
+        .get("candidateName")
+        .cloned()
+        .unwrap_or_else(|| Value::String("Accepted candidate".to_owned()));
+    draft["baselineName"] = accepted_name;
+    draft["candidateName"] = Value::String("Candidate change".to_owned());
+    draft
+        .as_object_mut()
+        .context("project draft must be an object")?
+        .remove("activeJobId");
+    for (key, value) in [
+        ("baselineId", "/id"),
+        ("baselineOutput", "/output"),
+        ("baselineStatus", "/status"),
+        ("baselineError", "/error"),
+        ("baselineLatency", "/latency_ms"),
+        ("baselineUsage", "/usage"),
+        ("baselineCost", "/cost"),
+        ("baselineMetadata", "/metadata"),
+    ] {
+        draft["mapping"][key] = Value::String(value.to_owned());
+    }
+    Ok(())
 }
 
 async fn duplicate_project(
@@ -1362,6 +1931,10 @@ async fn duplicate_project(
         ));
     }
     let mut draft: Value = read_json(&source)?;
+    let source_project_root = source
+        .parent()
+        .context("project draft path has no parent")?;
+    apply_current_revision_to_draft(&state.project_root, source_project_root, &mut draft)?;
     let new_id = Ulid::new().to_string();
     draft["projectId"] = Value::String(new_id.clone());
     if let Some(name) = draft.get("name").and_then(Value::as_str).map(str::to_owned) {
@@ -1455,19 +2028,19 @@ async fn pin_regression(
     let run_dir = run_dir_for(&state, &request.run_id)?;
     let manifest: structtrace_core::artifact::RunManifest =
         read_json(&run_dir.join("manifest.json"))?;
-    let bytes = structtrace_core::hashing::read_bounded(
-        &run_dir.join("cases.jsonl"),
-        64 * 1024 * 1024,
-        "case evidence",
+    let index = ensure_case_index(&run_dir)?;
+    let connection = Connection::open_with_flags(
+        index,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let mut found = false;
-    for line in std::str::from_utf8(&bytes)?.lines() {
-        let record = structtrace_core::strict_json::from_str::<PairedCaseRecord>(line)?;
-        if record.case.id == request.case_id {
-            found = true;
-            break;
-        }
-    }
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM cases WHERE case_id = ?1",
+            [&request.case_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
     if !found {
         return Err(AppError::not_found(
             "case_not_found",
@@ -1559,16 +2132,18 @@ async fn generate_ci(
         CiMode::Regression => ("regression", "structtrace gate latest"),
         CiMode::Release => ("release", "structtrace release-check latest"),
     };
-    let project = state
+    let project_root = state
         .project_root
         .join(".structtrace/ui/projects")
         .join(&request.project_id);
-    if !project.is_dir() {
+    if !project_root.is_dir() {
         return Err(AppError::not_found(
             "project_not_found",
             "Run this project once before exporting CI.",
         ));
     }
+    let (committed, project, _) = current_project_revision(&project_root)?
+        .context("This project has no verified committed revision to export.")?;
     let mut parsed = Config::load(&project.join("structtrace.yaml"))?;
     parsed.gate.mode = match request.mode {
         CiMode::Regression => GateMode::Regression,
@@ -1581,10 +2156,19 @@ async fn generate_ci(
         )
     })?;
     let config = serde_yaml_ng::to_string(&parsed)?;
-    let revision =
-        option_env!("STRUCTTRACE_GIT_SHA").unwrap_or("7e5546ff35b5f0ce3209741a19f1e332950a309b");
+    let revision = option_env!("STRUCTTRACE_GIT_SHA").unwrap_or("");
+    if revision.len() != 40
+        || !revision
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(AppError::bad_request(
+            "ci_source_revision_unavailable",
+            "This StructTrace binary has no valid embedded 40-character source revision. Build from a clean Git checkout or install a verified release binary before exporting CI.",
+        ));
+    }
     let workflow = format!(
-        "# Generated from a complete saved StructTrace project.\nname: StructTrace\n\non:\n  pull_request:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  structured-output-regression:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n      - name: Check out project\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n      - name: Check out pinned StructTrace source\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n        with:\n          repository: Vaibhav701161/structtrace\n          ref: {revision}\n          path: .structtrace-tool\n      - name: Install pinned StructTrace binary\n        run: cargo install --locked --path .structtrace-tool/crates/structtrace-cli\n      - name: Verify required comparison inputs\n        run: test -s data/golden.jsonl && test -s outputs/baseline.jsonl && test -s outputs/candidate.jsonl && test -s schemas/output.schema.json\n      - name: Validate project\n        run: structtrace doctor --strict\n      - name: Run comparison\n        run: structtrace run\n      - name: Verify decision authority\n        run: {command}\n      - name: Upload immutable evidence\n        if: always()\n        uses: actions/upload-artifact@v4\n        with:\n          name: structtrace-evidence\n          path: .structtrace/runs/\n          if-no-files-found: error\n          retention-days: 14\n"
+        "# Generated from a complete verified StructTrace project revision.\nname: StructTrace\n\non:\n  pull_request:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  structured-output-regression:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n      - name: Check out project\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n      - name: Check out pinned StructTrace source\n        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0\n        with:\n          repository: Vaibhav701161/structtrace\n          ref: {revision}\n          path: .structtrace-tool\n      - name: Install pinned StructTrace binary\n        run: cargo install --locked --path .structtrace-tool/crates/structtrace-cli\n      - name: Verify required comparison inputs\n        run: test -s data/golden.jsonl && test -s outputs/baseline.jsonl && test -s outputs/candidate.jsonl && test -s schemas/output.schema.json && test -s project-revision.json\n      - name: Validate project\n        run: structtrace doctor --strict\n      - name: Run comparison\n        run: structtrace run\n      - name: Replay immutable evidence\n        run: structtrace replay latest\n      - name: Verify decision authority\n        run: {command}\n      - name: Upload immutable evidence\n        if: always()\n        uses: actions/upload-artifact@v4\n        with:\n          name: structtrace-evidence\n          path: .structtrace/runs/\n          if-no-files-found: error\n          retention-days: 14\n"
     );
     let export = state
         .project_root
@@ -1632,16 +2216,32 @@ async fn generate_ci(
     .into_iter()
     .map(str::to_owned)
     .collect::<Vec<_>>();
-    let accepted = project.join("accepted-baseline.json");
-    if accepted.is_file() {
-        let bytes = structtrace_core::hashing::read_bounded(
-            &accepted,
-            1024 * 1024,
-            "accepted baseline reference",
+    if let Some(accepted) = &committed.accepted_baseline {
+        if accepted.staged_source_hash != accepted.candidate_artifact_hash {
+            return Err(AppError::bad_request(
+                "accepted_baseline_integrity_failed",
+                "The accepted baseline receipt does not match the committed project revision.",
+            ));
+        }
+        let exported_baseline_hash =
+            structtrace_core::hashing::hash_file(&export.join("outputs/baseline.jsonl"))?;
+        if exported_baseline_hash != accepted.candidate_artifact_hash {
+            return Err(AppError::bad_request(
+                "accepted_baseline_integrity_failed",
+                "CI baseline bytes do not match the accepted candidate.",
+            ));
+        }
+        atomic_write(
+            &export.join("accepted-baseline.json"),
+            &serde_json::to_vec_pretty(accepted)?,
         )?;
-        atomic_write(&export.join("accepted-baseline.json"), &bytes)?;
         files.push("accepted-baseline.json".to_owned());
     }
+    atomic_write(
+        &export.join("project-revision.json"),
+        &serde_json::to_vec_pretty(&committed)?,
+    )?;
+    files.push("project-revision.json".to_owned());
     Ok(Json(CiResponse {
         config,
         workflow,
@@ -1713,6 +2313,14 @@ fn materialize_and_run_comparison_inner(
             "project destination must be a directory"
         );
     }
+    let previous_revision = current_project_revision(&destination)?;
+    let parent_revision_id = previous_revision
+        .as_ref()
+        .map(|(current, _, _)| current.revision_id.clone());
+    let inherited_baseline = previous_revision
+        .as_ref()
+        .and_then(|(current, _, _)| current.accepted_baseline.clone())
+        .filter(|accepted| accepted.source_id == request.files.baseline.source_id);
     let scratch = tempfile::Builder::new()
         .prefix(".structtrace-ui-")
         .tempdir_in(&projects_root)?;
@@ -1862,40 +2470,52 @@ fn materialize_and_run_comparison_inner(
     ));
     let config = Config::validate(config)?;
     std::fs::write(&config_path, serde_yaml_ng::to_string(&config)?)?;
-    if destination.exists() {
-        for relative in [
-            "structtrace.yaml",
-            "data/golden.jsonl",
-            "schemas/output.schema.json",
-            "outputs/baseline.jsonl",
-            "outputs/candidate.jsonl",
-            "README.md",
-            "ONBOARDING.md",
-            ".gitignore",
-        ] {
-            let source = build.join(relative);
-            let target = destination.join(relative);
-            let bytes = structtrace_core::hashing::read_bounded(
-                &source,
-                MAX_FILE_BYTES,
-                "prepared project artifact",
-            )?;
-            atomic_write(&target, &bytes)?;
-        }
-        std::fs::remove_dir_all(&build)?;
-    } else {
-        std::fs::rename(&build, &destination)?;
-    }
-    let run = match observer {
+    let mut run = match observer {
         Some(observer) => structtrace_engine::run_recorded_observed(
-            &destination,
-            &destination.join("structtrace.yaml"),
+            &build,
+            &build.join("structtrace.yaml"),
             observer,
         )?,
-        None => {
-            structtrace_engine::run_recorded(&destination, &destination.join("structtrace.yaml"))?
-        }
+        None => structtrace_engine::run_recorded(&build, &build.join("structtrace.yaml"))?,
     };
+    std::fs::create_dir_all(&destination)?;
+    make_owner_only_directory(&destination)?;
+    let revision_id = Ulid::new().to_string();
+    let revision_receipt = ProjectRevisionReceipt {
+        format_version: 1,
+        revision_id: revision_id.clone(),
+        project_id: project_id.clone(),
+        state: ProjectRevisionState::Completed,
+        created_at: now_seconds(),
+        source_run_id: run.run_id.clone(),
+        parent_revision_id,
+        baseline_provenance: inherited_baseline.clone(),
+        artifacts: revision_artifact_hashes(&build, &run.run_id)?,
+    };
+    let revision_receipt_bytes = serde_json::to_vec_pretty(&revision_receipt)?;
+    atomic_write(
+        &build.join("structtrace-project-revision.json"),
+        &revision_receipt_bytes,
+    )?;
+    let revisions = destination.join("revisions");
+    std::fs::create_dir_all(&revisions)?;
+    make_owner_only_directory(&revisions)?;
+    let committed = revisions.join(&revision_id);
+    anyhow::ensure!(!committed.exists(), "project revision already exists");
+    std::fs::rename(&build, &committed)?;
+    run.run_dir = committed.join(".structtrace/runs").join(&run.run_id);
+    let current = CurrentProjectRevision {
+        format_version: 1,
+        project_id,
+        revision_id,
+        state: ProjectRevisionState::Completed,
+        revision_receipt_hash: structtrace_core::hashing::hash_bytes(&revision_receipt_bytes),
+        accepted_baseline: inherited_baseline,
+    };
+    atomic_write(
+        &destination.join("current-revision.json"),
+        &serde_json::to_vec_pretty(&current)?,
+    )?;
     Ok((
         run,
         match schema_provenance {
@@ -1939,11 +2559,11 @@ fn discover_jobs(root: &Path) -> anyhow::Result<HashMap<String, JobEntry>> {
         let mut persisted: PersistedJob = structtrace_core::strict_json::from_slice(&bytes)?;
         if matches!(
             persisted.state.status,
-            JobStatus::Queued | JobStatus::Running
+            JobStatus::Queued | JobStatus::WaitingForExecutor | JobStatus::Running
         ) {
             persisted.state.status = JobStatus::Interrupted;
             persisted.state.stage = "interrupted".to_owned();
-            persisted.state.message = Some("The local server stopped before this comparison completed. Resume it to run again from retained source references.".to_owned());
+            persisted.state.message = Some("The local server stopped before this comparison completed. Retry restarts the complete comparison from retained source references.".to_owned());
             persisted.state.updated_at = now_seconds();
         }
         let job = JobEntry {
@@ -2042,6 +2662,242 @@ fn authoritative_rows(kind: &str, file: &BrowserFile) -> anyhow::Result<Vec<Valu
         .map(structtrace_core::strict_json::value_from_slice)
         .collect::<Result<Vec<_>, _>>()
         .context("server-normalized source could not be previewed")
+}
+
+struct FieldInventoryInput<'a> {
+    dataset: &'a [Value],
+    baseline: &'a [Value],
+    candidate: &'a [Value],
+    output_pointers: [&'a str; 3],
+    id_pointers: [&'a str; 3],
+    schema: Option<&'a Value>,
+}
+
+fn build_field_inventory(input: FieldInventoryInput<'_>) -> FieldInventoryResponse {
+    let [dataset_output, baseline_output, candidate_output] = input.output_pointers;
+    let [dataset_id, baseline_id, candidate_id] = input.id_pointers;
+    let expected = mapped_values(input.dataset, dataset_output);
+    let baseline_values = mapped_values(input.baseline, baseline_output);
+    let candidate_values = mapped_values(input.candidate, candidate_output);
+    let mut expected_fields = BTreeMap::new();
+    let mut baseline_fields = BTreeMap::new();
+    let mut candidate_fields = BTreeMap::new();
+    for value in &expected {
+        observe_fields(value, "", &mut expected_fields);
+    }
+    for value in &baseline_values {
+        observe_fields(value, "", &mut baseline_fields);
+    }
+    for value in &candidate_values {
+        observe_fields(value, "", &mut candidate_fields);
+    }
+    let mut schema_fields = BTreeMap::new();
+    if let Some(schema) = input.schema {
+        observe_schema_fields(schema, "", &mut schema_fields);
+    }
+    let pointers = expected_fields
+        .keys()
+        .chain(baseline_fields.keys())
+        .chain(candidate_fields.keys())
+        .chain(schema_fields.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let fields = pointers
+        .into_iter()
+        .map(|pointer| {
+            let expected_observation = expected_fields.get(&pointer);
+            let baseline_observation = baseline_fields.get(&pointer);
+            let candidate_observation = candidate_fields.get(&pointer);
+            let mut type_distribution = BTreeMap::new();
+            for observations in [
+                expected_observation,
+                baseline_observation,
+                candidate_observation,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for (kind, count) in &observations.types {
+                    *type_distribution.entry(kind.clone()).or_insert(0) += count;
+                }
+            }
+            let observed_type = if type_distribution.len() == 1 {
+                type_distribution.keys().next().cloned().unwrap_or_default()
+            } else if type_distribution.is_empty() {
+                schema_fields
+                    .get(&pointer)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_owned())
+            } else {
+                "mixed".to_owned()
+            };
+            let expected_coverage = coverage(expected_observation, input.dataset.len());
+            let candidate_coverage = coverage(candidate_observation, input.candidate.len());
+            let lower = pointer.to_ascii_lowercase();
+            let suggested_rule = match observed_type.as_str() {
+                "array" => "keyed_array",
+                "integer" => "exact_integer",
+                "number" => "decimal_exact",
+                "string" if lower.contains("date") || lower.ends_with("_at") => "canonical_date",
+                "string"
+                    if ["name", "title", "description", "label", "text"]
+                        .iter()
+                        .any(|name| lower.contains(name)) =>
+                {
+                    "normalized_string"
+                }
+                _ => "exact",
+            };
+            FieldInventoryField {
+                pointer,
+                observed_type,
+                expected_coverage,
+                baseline_coverage: coverage(baseline_observation, input.baseline.len()),
+                candidate_coverage,
+                schema_only: expected_observation.is_none()
+                    && baseline_observation.is_none()
+                    && candidate_observation.is_none(),
+                candidate_omission: candidate_coverage < expected_coverage,
+                suggested_rule,
+                type_distribution,
+            }
+        })
+        .collect();
+    let (dataset_ids, invalid_dataset_ids) = string_ids(input.dataset, dataset_id);
+    let (baseline_ids, invalid_baseline_ids) = string_ids(input.baseline, baseline_id);
+    let (candidate_ids, invalid_candidate_ids) = string_ids(input.candidate, candidate_id);
+    let mut seen = HashSet::new();
+    let duplicate_dataset_ids = dataset_ids
+        .iter()
+        .filter(|id| !seen.insert((*id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let baseline_set = baseline_ids.into_iter().collect::<HashSet<_>>();
+    let candidate_set = candidate_ids.into_iter().collect::<HashSet<_>>();
+    let matched = dataset_ids
+        .iter()
+        .filter(|id| baseline_set.contains(*id) && candidate_set.contains(*id))
+        .count();
+    let missing_baseline = dataset_ids
+        .iter()
+        .filter(|id| !baseline_set.contains(*id))
+        .count();
+    let missing_candidate = dataset_ids
+        .iter()
+        .filter(|id| !candidate_set.contains(*id))
+        .count();
+    FieldInventoryResponse {
+        fields,
+        dataset_rows: input.dataset.len(),
+        baseline_rows: input.baseline.len(),
+        candidate_rows: input.candidate.len(),
+        analyzed_all_rows: true,
+        mapping: MappingInventory {
+            matched,
+            duplicate_dataset_ids,
+            missing_baseline,
+            missing_candidate,
+            invalid_dataset_ids,
+            invalid_baseline_ids,
+            invalid_candidate_ids,
+        },
+    }
+}
+
+fn string_ids(rows: &[Value], pointer: &str) -> (Vec<String>, usize) {
+    let mut ids = Vec::new();
+    let mut invalid = 0;
+    for row in rows {
+        match row.pointer(pointer).and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => ids.push(id.to_owned()),
+            _ => invalid += 1,
+        }
+    }
+    (ids, invalid)
+}
+
+fn mapped_values<'a>(rows: &'a [Value], pointer: &str) -> Vec<&'a Value> {
+    rows.iter()
+        .filter_map(|row| {
+            if pointer.is_empty() || pointer == "/" {
+                Some(row)
+            } else {
+                row.pointer(pointer)
+            }
+        })
+        .collect()
+}
+
+fn observe_fields(value: &Value, path: &str, fields: &mut BTreeMap<String, FieldObservations>) {
+    if !path.is_empty() {
+        let observations = fields.entry(path.to_owned()).or_default();
+        observations.present += 1;
+        *observations
+            .types
+            .entry(json_type_name(value).to_owned())
+            .or_insert(0) += 1;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                observe_fields(child, &format!("{path}/{key}"), fields);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                observe_fields(item, &format!("{path}/*"), fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn observe_schema_fields(schema: &Value, path: &str, fields: &mut BTreeMap<String, String>) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (key, definition) in properties {
+            let key = key.replace('~', "~0").replace('/', "~1");
+            let pointer = format!("{path}/{key}");
+            let kind = definition
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            fields.insert(pointer.clone(), kind);
+            observe_schema_fields(definition, &pointer, fields);
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        let pointer = format!("{path}/*");
+        fields.entry(pointer.clone()).or_insert_with(|| {
+            items
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        });
+        observe_schema_fields(items, &pointer, fields);
+    }
+}
+
+fn coverage(observation: Option<&FieldObservations>, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        observation.map_or(0.0, |value| value.present as f64 / total as f64)
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn csv_rows(file: &BrowserFile) -> anyhow::Result<Vec<Value>> {
@@ -2275,7 +3131,86 @@ fn response_from_run(run_dir: &Path) -> anyhow::Result<RunResponse> {
                 "inferred_from_expected_values"
             }
         },
+        integrity: inspect_run_integrity(run_dir),
     })
+}
+
+fn inspect_run_integrity(run_dir: &Path) -> RunIntegrity {
+    let manifest: structtrace_core::artifact::RunManifest =
+        match read_json(&run_dir.join("manifest.json")) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return RunIntegrity {
+                    status: RunIntegrityStatus::NotVerified,
+                    detail: format!("Run manifest could not be verified: {error}"),
+                };
+            }
+        };
+    if manifest.artifact_format_version != structtrace_core::ARTIFACT_FORMAT_VERSION {
+        return RunIntegrity {
+            status: RunIntegrityStatus::NotVerified,
+            detail: format!(
+                "Artifact format {} requires a compatible StructTrace version.",
+                manifest.artifact_format_version
+            ),
+        };
+    }
+    for (relative, expected) in manifest.artifacts.iter().chain(&manifest.input_artifacts) {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return RunIntegrity {
+                status: RunIntegrityStatus::ReplayFailed,
+                detail: "Manifest contains an unsafe artifact path.".to_owned(),
+            };
+        }
+        match structtrace_core::hashing::hash_file(&run_dir.join(relative_path)) {
+            Ok(actual) if actual == *expected => {}
+            Ok(_) => {
+                return RunIntegrity {
+                    status: RunIntegrityStatus::Modified,
+                    detail: format!("Manifest-bound artifact {relative} has been modified."),
+                };
+            }
+            Err(_) => {
+                return RunIntegrity {
+                    status: RunIntegrityStatus::Modified,
+                    detail: format!("Manifest-bound artifact {relative} is missing or unreadable."),
+                };
+            }
+        }
+    }
+    match structtrace_engine::replay_run(run_dir) {
+        Ok(report) if report.verified => RunIntegrity {
+            status: RunIntegrityStatus::Verified,
+            detail: format!(
+                "Every manifest-bound artifact matched and {} case scores replayed exactly.",
+                report.cases_replayed
+            ),
+        },
+        Ok(report) => RunIntegrity {
+            status: RunIntegrityStatus::ReplayFailed,
+            detail: format!(
+                "Replay rejected this run: {} artifact, {} cross-artifact, {} row-score, and {} summary mismatches.",
+                report.artifact_hash_mismatches.len(),
+                report.cross_artifact_mismatches.len(),
+                report.row_score_mismatches.len(),
+                report.summary_mismatches.len()
+            ),
+        },
+        Err(error) => RunIntegrity {
+            status: RunIntegrityStatus::ReplayFailed,
+            detail: format!("Replay could not verify this run: {error}"),
+        },
+    }
 }
 
 fn discover_ui_runs(project_root: &Path) -> anyhow::Result<HashMap<String, PathBuf>> {
@@ -2286,7 +3221,7 @@ fn discover_ui_runs(project_root: &Path) -> anyhow::Result<HashMap<String, PathB
         for project in std::fs::read_dir(projects)? {
             let project = project?;
             if project.file_type()?.is_dir() && !project.file_type()?.is_symlink() {
-                run_roots.push(project.path().join(".structtrace/runs"));
+                run_roots.extend(project_run_roots(&project.path())?);
             }
         }
     }
@@ -2310,6 +3245,27 @@ fn discover_ui_runs(project_root: &Path) -> anyhow::Result<HashMap<String, PathB
         }
     }
     Ok(runs)
+}
+
+fn project_run_roots(project: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let legacy = project.join(".structtrace/runs");
+    if legacy.is_dir() {
+        roots.push(legacy);
+    }
+    let revisions = project.join("revisions");
+    if revisions.is_dir() {
+        for revision in std::fs::read_dir(revisions)? {
+            let revision = revision?;
+            if revision.file_type()?.is_dir() && !revision.file_type()?.is_symlink() {
+                let runs = revision.path().join(".structtrace/runs");
+                if runs.is_dir() {
+                    roots.push(runs);
+                }
+            }
+        }
+    }
+    Ok(roots)
 }
 
 fn read_pins(project_root: &Path) -> anyhow::Result<Vec<PinnedCase>> {
@@ -2350,7 +3306,7 @@ fn stage_browser_file(
         hash: structtrace_core::hashing::hash_bytes(bytes),
         bytes: bytes.len(),
         rows: 0,
-        preview: Vec::new(),
+        preview_json: Vec::new(),
     };
     let directory = staged_sources_dir(root);
     std::fs::create_dir_all(&directory)?;
@@ -2386,12 +3342,166 @@ fn accepted_response(
     })
 }
 
+fn revision_artifact_hashes(
+    revision_root: &Path,
+    run_id: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let run_manifest = format!(".structtrace/runs/{run_id}/manifest.json");
+    let run_summary = format!(".structtrace/runs/{run_id}/summary.json");
+    [
+        "structtrace.yaml".to_owned(),
+        "data/golden.jsonl".to_owned(),
+        "schemas/output.schema.json".to_owned(),
+        "outputs/baseline.jsonl".to_owned(),
+        "outputs/candidate.jsonl".to_owned(),
+        run_manifest,
+        run_summary,
+    ]
+    .into_iter()
+    .map(|relative| {
+        let hash = structtrace_core::hashing::hash_file(&revision_root.join(&relative))?;
+        Ok((relative, hash))
+    })
+    .collect()
+}
+
+fn project_definition_hashes(revision_root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    [
+        "structtrace.yaml",
+        "data/golden.jsonl",
+        "schemas/output.schema.json",
+        "outputs/baseline.jsonl",
+        "outputs/candidate.jsonl",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let hash = structtrace_core::hashing::hash_file(&revision_root.join(relative))?;
+        Ok((relative.to_owned(), hash))
+    })
+    .collect()
+}
+
+fn copy_project_definition(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    for relative in [
+        "structtrace.yaml",
+        "data/golden.jsonl",
+        "schemas/output.schema.json",
+        "outputs/baseline.jsonl",
+        "outputs/candidate.jsonl",
+    ] {
+        let bytes = structtrace_core::hashing::read_bounded(
+            &source.join(relative),
+            MAX_FILE_BYTES,
+            "committed project definition",
+        )?;
+        atomic_write(&destination.join(relative), &bytes)?;
+    }
+    for relative in ["README.md", "ONBOARDING.md", ".gitignore"] {
+        let source_file = source.join(relative);
+        if source_file.is_file() {
+            let bytes = structtrace_core::hashing::read_bounded(
+                &source_file,
+                MAX_FILE_BYTES,
+                "committed project documentation",
+            )?;
+            atomic_write(&destination.join(relative), &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn staged_source_bytes(root: &Path, source_id: &str) -> anyhow::Result<Vec<u8>> {
+    validate_source_id(source_id)?;
+    let bytes = structtrace_core::hashing::read_bounded(
+        &staged_sources_dir(root).join(format!("{source_id}.data")),
+        MAX_FILE_BYTES,
+        "staged comparison source",
+    )?;
+    let metadata: StagedSource =
+        read_json(&staged_sources_dir(root).join(format!("{source_id}.json")))?;
+    anyhow::ensure!(
+        metadata.hash == structtrace_core::hashing::hash_bytes(&bytes),
+        "staged source bytes do not match their recorded hash"
+    );
+    Ok(bytes)
+}
+
+fn current_project_revision(
+    project_root: &Path,
+) -> anyhow::Result<Option<(CurrentProjectRevision, PathBuf, ProjectRevisionReceipt)>> {
+    let pointer_path = project_root.join("current-revision.json");
+    if !pointer_path.is_file() {
+        return Ok(None);
+    }
+    let pointer: CurrentProjectRevision = read_json(&pointer_path)?;
+    anyhow::ensure!(
+        project_root.file_name().and_then(|value| value.to_str())
+            == Some(pointer.project_id.as_str()),
+        "project revision pointer belongs to another project"
+    );
+    validate_project_id(&pointer.project_id)?;
+    validate_project_id(&pointer.revision_id)?;
+    let revision_root = project_root.join("revisions").join(&pointer.revision_id);
+    anyhow::ensure!(
+        revision_root.is_dir(),
+        "current project revision is missing"
+    );
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(&revision_root)?
+            .file_type()
+            .is_symlink(),
+        "current project revision must not be a symbolic link"
+    );
+    let receipt_path = revision_root.join("structtrace-project-revision.json");
+    let receipt_bytes = structtrace_core::hashing::read_bounded(
+        &receipt_path,
+        1024 * 1024,
+        "project revision receipt",
+    )?;
+    anyhow::ensure!(
+        structtrace_core::hashing::hash_bytes(&receipt_bytes) == pointer.revision_receipt_hash,
+        "project revision receipt hash does not match the committed pointer"
+    );
+    let receipt: ProjectRevisionReceipt =
+        structtrace_core::strict_json::from_slice(&receipt_bytes)?;
+    anyhow::ensure!(
+        receipt.project_id == pointer.project_id
+            && receipt.revision_id == pointer.revision_id
+            && receipt.state == pointer.state,
+        "project revision receipt identity does not match the committed pointer"
+    );
+    for (relative, expected) in &receipt.artifacts {
+        let actual = structtrace_core::hashing::hash_file(&revision_root.join(relative))?;
+        anyhow::ensure!(
+            actual == *expected,
+            "committed project artifact {relative} failed integrity verification"
+        );
+    }
+    anyhow::ensure!(
+        serde_json::to_value(&pointer.accepted_baseline)?
+            == serde_json::to_value(&receipt.baseline_provenance)?,
+        "accepted baseline provenance does not match the hash-bound revision receipt"
+    );
+    if let Some(accepted) = &pointer.accepted_baseline {
+        anyhow::ensure!(
+            accepted.deployment_authorized
+                && accepted.gate_mode == GateMode::Release
+                && accepted.staged_source_hash == accepted.candidate_artifact_hash
+                && receipt.artifacts.get("outputs/baseline.jsonl")
+                    == Some(&accepted.candidate_artifact_hash),
+            "accepted baseline provenance does not match committed baseline bytes"
+        );
+    }
+    Ok(Some((pointer, revision_root, receipt)))
+}
+
 fn ui_project_id(run_dir: &Path) -> Option<String> {
-    let project = run_dir.ancestors().nth(3)?;
-    let parent = project.parent()?;
-    (parent.file_name()?.to_str()? == "projects")
-        .then(|| project.file_name()?.to_str().map(str::to_owned))
-        .flatten()
+    let components = run_dir.components().collect::<Vec<_>>();
+    components.windows(2).find_map(|window| {
+        (window[0].as_os_str() == "projects")
+            .then(|| window[1].as_os_str().to_str().map(str::to_owned))
+            .flatten()
+    })
 }
 
 fn validate_project_id(project_id: &str) -> anyhow::Result<()> {
@@ -2502,14 +3612,21 @@ fn hydrate_draft_source_contents(root: &Path, value: &mut Value) -> anyhow::Resu
         let source_id = source
             .get("sourceId")
             .and_then(Value::as_str)
-            .context("saved source reference is missing sourceId")?;
+            .context("saved source reference is missing sourceId")?
+            .to_owned();
         let file = load_staged_source(
             root,
             &SourceReference {
-                source_id: source_id.to_owned(),
+                source_id: source_id.clone(),
             },
         )?;
         source.insert("content".to_owned(), Value::String(file.content));
+        let staged: StagedSource =
+            read_json(&staged_sources_dir(root).join(format!("{source_id}.json")))?;
+        source.insert(
+            "previewJson".to_owned(),
+            serde_json::to_value(staged.preview_json)?,
+        );
     }
     Ok(())
 }
@@ -2526,7 +3643,7 @@ fn garbage_collect_staged_sources(root: &Path) -> anyhow::Result<()> {
             if !project.file_type()?.is_dir() || project.file_type()?.is_symlink() {
                 continue;
             }
-            for name in ["ui-draft.json", "accepted-baseline.json"] {
+            for name in ["ui-draft.json", "current-revision.json"] {
                 let path = project.path().join(name);
                 if !path.exists() {
                     continue;
@@ -2644,7 +3761,7 @@ mod tests {
             hash: structtrace_core::hashing::hash_bytes(b"original"),
             bytes: 8,
             rows: 1,
-            preview: Vec::new(),
+            preview_json: Vec::new(),
         };
         std::fs::write(
             directory.join(format!("{source_id}.json")),
@@ -2727,6 +3844,74 @@ mod tests {
     }
 
     #[test]
+    fn csv_normalization_preserves_multiline_quotes_and_leading_zero_ids() {
+        let file = BrowserFile {
+            name: "cases.csv".to_owned(),
+            format: InputFormat::Csv,
+            content: "id,output\n001,\"{\"\"text\"\":\"\"first\nsecond, value\"\"}\"\n".to_owned(),
+        };
+        let normalized = normalized_jsonl(&file).unwrap();
+        let row: Value =
+            structtrace_core::strict_json::from_slice(normalized.trim_ascii()).unwrap();
+        assert_eq!(row.pointer("/id"), Some(&Value::String("001".to_owned())));
+        assert_eq!(
+            row.pointer("/output"),
+            Some(&Value::String(
+                "{\"text\":\"first\nsecond, value\"}".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn full_source_inventory_finds_late_schema_only_and_candidate_omitted_fields() {
+        let mut dataset = Vec::new();
+        let mut baseline = Vec::new();
+        let mut candidate = Vec::new();
+        for index in 0..30 {
+            let late = (index == 29).then_some(serde_json::json!("present"));
+            let mut expected = serde_json::json!({"answer": index});
+            let mut baseline_output = expected.clone();
+            if let Some(value) = late {
+                expected["late"] = value.clone();
+                baseline_output["late"] = value;
+            }
+            dataset.push(serde_json::json!({"expected": expected}));
+            baseline.push(serde_json::json!({"output": baseline_output}));
+            candidate.push(serde_json::json!({"output": {"answer": index}}));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": {"type": "integer"},
+                "late": {"type": "string"},
+                "schema_only": {"type": "boolean"}
+            }
+        });
+        let inventory = build_field_inventory(FieldInventoryInput {
+            dataset: &dataset,
+            baseline: &baseline,
+            candidate: &candidate,
+            output_pointers: ["/expected", "/output", "/output"],
+            id_pointers: ["/id", "/id", "/id"],
+            schema: Some(&schema),
+        });
+        let late = inventory
+            .fields
+            .iter()
+            .find(|field| field.pointer == "/late")
+            .unwrap();
+        assert!(late.candidate_omission);
+        assert_eq!(late.expected_coverage, 1.0 / 30.0);
+        let schema_only = inventory
+            .fields
+            .iter()
+            .find(|field| field.pointer == "/schema_only")
+            .unwrap();
+        assert!(schema_only.schema_only);
+        assert!(inventory.analyzed_all_rows);
+    }
+
+    #[test]
     fn inferred_schema_is_closed_and_required() {
         let source = b"{\"id\":\"a\",\"expected\":{\"answer\":4}}\n";
         let schema: Value =
@@ -2757,5 +3942,42 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn modified_run_is_never_reported_as_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let run = crate::bundled_demo::run_invoice(root.path()).unwrap();
+        assert_eq!(
+            inspect_run_integrity(&run.run_dir).status,
+            RunIntegrityStatus::Verified
+        );
+        let summary = run.run_dir.join("summary.json");
+        let mut bytes = std::fs::read(&summary).unwrap();
+        bytes.push(b' ');
+        std::fs::write(summary, bytes).unwrap();
+        assert_eq!(
+            inspect_run_integrity(&run.run_dir).status,
+            RunIntegrityStatus::Modified
+        );
+    }
+
+    #[test]
+    fn case_index_is_hash_bound_and_reused_for_bounded_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let run = crate::bundled_demo::run_invoice(root.path()).unwrap();
+        let index = ensure_case_index(&run.run_dir).unwrap();
+        let connection = Connection::open(&index).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM cases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 12);
+        drop(connection);
+        assert_eq!(ensure_case_index(&run.run_dir).unwrap(), index);
+        let cases = run.run_dir.join("cases.jsonl");
+        let mut bytes = std::fs::read(&cases).unwrap();
+        bytes.push(b' ');
+        std::fs::write(cases, bytes).unwrap();
+        assert!(ensure_case_index(&run.run_dir).is_err());
     }
 }

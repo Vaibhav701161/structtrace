@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
   <title id="title">StructTrace app icon</title>
-  <desc id="desc">A white S-shaped trace on a dark rounded square with a blue comparison node.</desc>
-  <rect width="128" height="128" rx="28" fill="#101827"/>
+  <desc id="desc">A white S-shaped trace on a graphite rounded square with a copper comparison node.</desc>
+  <rect width="128" height="128" rx="22" fill="#242521"/>
   <path d="M95 28H55C40 28 31 36.4 31 48s9 20 24 20h20c15 0 24 8.4 24 20s-9 20-24 20H35" fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="95" cy="28" r="9" fill="#FFFFFF"/>
-  <circle cx="64" cy="68" r="9" fill="#3568F5"/>
+  <circle cx="64" cy="68" r="9" fill="#D09268"/>
   <circle cx="35" cy="108" r="9" fill="#FFFFFF"/>
 </svg>

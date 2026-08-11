@@ -58,22 +58,28 @@ The result screen presents complete-denominator structural, semantic, deployment
 valid-but-wrong metrics; paired transitions; the paired interval; primary field hotspots; and the
 independent-evidence audit. Every aggregate leads to immutable case evidence.
 
-Case evidence is queried from the Rust server in 200-row pages and rendered through a virtualized
-table. A request can return no more than 500 cases, filters and search execute on the server, and
-the complete case artifact remains subject to the existing 64 MiB evidence bound. This avoids
-placing an entire large run in either an API response or the browser DOM.
+Case evidence is queried from a run-bound SQLite index in 200-row pages and rendered through a
+virtualized table. A request can return no more than 500 cases. Filters, escaped literal search,
+and exact case lookup execute in the bounded index without rereading or lowercasing the complete
+`cases.jsonl` artifact on every request. Index creation first verifies the complete run and binds
+the index to the manifest's case-artifact hash and source-file fingerprint.
 
-The case drawer uses JSON Pointer-addressed structural rows, distinguishes added, removed, changed,
-and type-changed values, aligns common ID/SKU/product-code arrays before comparison, offers unified
-and side-by-side modes, collapses unchanged paths, and copies exact pointers. Error,
+The case API transports each record as strict raw JSON text. The browser's lossless parser retains
+arbitrary-length integer and decimal lexemes, creates null-prototype object maps, and requires own
+properties during JSON Pointer traversal. The case drawer uses JSON Pointer-addressed structural
+rows, distinguishes added, removed, changed, and type-changed values, aligns common
+ID/SKU/product-code arrays before comparison, offers unified and side-by-side modes, collapses
+unchanged paths, and copies exact pointers or the exact evidence record. Error,
 not-applicable, and unscored evaluator states remain distinct from a semantic “wrong” result.
 
 Recorded evaluation executes through a durable local job. The browser polls real engine
-checkpoints, shows the current phase and completed work units, preserves an event history, recovers
+checkpoints, distinguishes queued, waiting-for-executor, and running states, shows the current
+phase and completed work units, preserves an event history, recovers
 the active job after reload, and requests cancellation through a shared atomic control checked at
-safe source and case boundaries. Cancelled, failed, or server-interrupted jobs can be resumed from
-their retained source references as a new auditable job; no decision is produced for an incomplete
-job.
+safe source and case boundaries. Queued or waiting work cancels before it acquires the executor.
+Cancelled, failed, or server-interrupted jobs can be retried from retained source references as a
+new auditable job. Retry restarts the complete comparison and is not represented as case-level
+resume. No decision is produced for an incomplete job.
 
 ## Security boundary
 
@@ -83,8 +89,10 @@ Content Security Policy, frame denial, referrer denial, and MIME-sniffing protec
 are compiled into the Rust binary and have no runtime network dependency.
 
 Draft references, staged sources, and browser-created projects are retained beneath
-`.structtrace/ui/`. Re-running a retained draft updates that stable project definition atomically
-while preserving every prior immutable run. CLI projects opened with
+`.structtrace/ui/`. A browser run materializes an isolated attempted revision. Only a fully
+finalized run is renamed into `projects/<id>/revisions/<revision-id>` and atomically selected by
+`current-revision.json`; failure, cancellation, interruption, or process exit cannot change the
+previous committed revision. CLI projects opened with
 `structtrace --project-root <folder> open` are discovered alongside UI-created projects. Completed
 evidence continues to use the same hash-bound portable artifacts and replay model as the CLI.
 The Projects screen reopens the saved wizard policy, persists name changes, duplicates a project
@@ -97,10 +105,13 @@ definitions, golden/baseline/candidate sources, caller schema, commit-pinned Str
 authority-safe command, required-input checks, evidence upload, and integration instructions. The
 application-specific candidate generation step remains caller-owned and is named explicitly rather
 than guessed. Candidate-baseline promotion appears
-only for an authorizing Release decision. It copies the immutable candidate input into a separately
-hash-bound staged source, records the accepted run ID and candidate artifact hash, and prepares the
-same persistent project for its next candidate. Advisory, regression, insufficient-evidence, and
-failed decisions cannot promote a baseline; there is no unrecorded override path.
+only for an authorizing Release decision whose complete replay verifies. Promotion commits a new
+accepted project revision whose baseline bytes are the manifest-bound candidate bytes. Its receipt
+binds the source run, project, manifest, summary, candidate, staged-source and revision hashes,
+gate authority, artifact format, StructTrace version, and acceptance time. Project reopen, the next
+comparison, and CI export resolve that same accepted baseline without a separate synchronization
+step. Advisory, regression, insufficient-evidence, modified, replay-failed, and failed decisions
+cannot promote a baseline; there is no unrecorded override path.
 
 ## Frontend development
 

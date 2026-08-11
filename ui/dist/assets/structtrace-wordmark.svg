@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 80" role="img" aria-labelledby="title desc">
   <title id="title">StructTrace wordmark</title>
   <desc id="desc">The StructTrace trace mark beside the StructTrace name.</desc>
-  <g transform="translate(6 6) scale(1.05)" fill="none" stroke="#3568F5" stroke-linecap="round" stroke-linejoin="round">
+  <g transform="translate(6 6) scale(1.05)" fill="none" stroke="#95502F" stroke-linecap="round" stroke-linejoin="round">
     <path d="M47 14H27C19.5 14 15 18.2 15 24c0 5.8 4.5 10 12 10h10c7.5 0 12 4.2 12 10s-4.5 10-12 10H17" stroke-width="5"/>
-    <circle cx="47" cy="14" r="4.5" fill="#3568F5" stroke="none"/>
-    <circle cx="32" cy="34" r="4.5" fill="#3568F5" stroke="none"/>
-    <circle cx="17" cy="54" r="4.5" fill="#3568F5" stroke="none"/>
+    <circle cx="47" cy="14" r="4.5" fill="#95502F" stroke="none"/>
+    <circle cx="32" cy="34" r="4.5" fill="#95502F" stroke="none"/>
+    <circle cx="17" cy="54" r="4.5" fill="#95502F" stroke="none"/>
   </g>
-  <text x="86" y="50" fill="#101827" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="700" letter-spacing="-0.8">StructTrace</text>
+  <text x="86" y="50" fill="#242521" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="700" letter-spacing="-0.8">StructTrace</text>
 </svg>

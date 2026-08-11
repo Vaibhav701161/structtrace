@@ -1,16 +1,18 @@
 # StructTrace Demo Video
 
-This directory contains the reproducible local demo-video renderer.
+This directory contains the reproducible real-product launch walkthrough recorder.
 
 Generated video files are written under `demo/video/generated/` and are intentionally ignored by
 git because MP4 artifacts are large binary outputs.
 
-Default workflow from the repository root:
+The public-launch walkthrough uses the real release binary and browser product:
 
 ```bash
-cargo run -p structtrace-cli -- demo invoice
-python3 demo/video/render_cinematic_demo.py --run-dir .structtrace/runs/<run-id>
+STRUCTTRACE_UI_URL='http://127.0.0.1:<port>/<capability>/' \
+  python3 demo/video/render-launch-walkthrough.py --url "$STRUCTTRACE_UI_URL"
 ```
 
-The renderer reads the completed StructTrace run artifacts, captures the offline report when
-`wkhtmltoimage` is available, and produces a technical MP4 demo without external assets.
+`record-launch-walkthrough.mjs` drives real product interactions at 2560x1440 and records the
+actual browser surface. `render-launch-walkthrough.py` generates disclosed neural narration using
+the settings in `launch-production-manifest.json`, normalizes spoken loudness, and creates an H.264
+master. Generated media and render receipts remain ignored because they are build artifacts.

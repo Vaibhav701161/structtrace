@@ -1,4 +1,5 @@
-import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, jobResponseSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
+import { acceptedBaselineSchema, casePageSchema, comparisonDraftSchema, fieldInventorySchema, jobResponseSchema, pinnedCaseSchema, projectSummarySchema, runResultSchema, systemResponseSchema, type ComparisonRequest, type SourceArtifact, type SourceKind } from "./types";
+import { strictJsonParse } from "../lib/lossless-json";
 
 function capabilityBase(): string {
   const first = window.location.pathname.split("/").filter(Boolean)[0];
@@ -62,15 +63,24 @@ export async function cancelComparisonJob(jobId: string) {
   return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: "{}" }));
 }
 
-export async function resumeComparisonJob(jobId: string) {
-  return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }));
+export async function retryComparisonJob(jobId: string) {
+  return jobResponseSchema.parse(await request(`/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST", body: "{}" }));
 }
 
 export async function stageSource(kind: SourceKind, source: SourceArtifact): Promise<Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">> {
-  return await request("/sources", {
+  const staged = await request("/sources", {
     method: "POST",
     body: JSON.stringify({ kind, file: { name: source.name, format: source.format, content: source.content } }),
-  }) as Pick<SourceArtifact, "sourceId" | "hash" | "bytes" | "rows" | "preview">;
+  }) as { sourceId: string; hash: string; bytes: number; rows: number; previewJson?: string[] };
+  return { ...staged, preview: staged.previewJson?.map(strictJsonParse) };
+}
+
+export async function getFieldInventory(requestBody: {
+  dataset: { sourceId: string }; baseline: { sourceId: string }; candidate: { sourceId: string };
+  schema?: { sourceId: string }; datasetOutput: string; baselineOutput: string; candidateOutput: string;
+  datasetId: string; baselineId: string; candidateId: string;
+}) {
+  return fieldInventorySchema.parse(await request("/sources/inventory", { method: "POST", body: JSON.stringify(requestBody) }));
 }
 
 export async function getRun(runId: string) {
@@ -87,7 +97,8 @@ export async function getAcceptedBaseline(projectId: string) {
 
 export async function getRunCases(runId: string, offset: number, filter: string, search: string) {
   const parameters = new URLSearchParams({ offset: String(offset), limit: "200", filter, search });
-  return casePageSchema.parse(await request(`/runs/${encodeURIComponent(runId)}/cases?${parameters}`));
+  const page = casePageSchema.parse(await request(`/runs/${encodeURIComponent(runId)}/cases?${parameters}`));
+  return { ...page, items: page.itemsJson.map(strictJsonParse) };
 }
 
 export async function getRuns() {
@@ -100,12 +111,12 @@ export async function getProjects() {
 
 export async function getProject(projectId: string) {
   const payload = await request(`/projects/${encodeURIComponent(projectId)}`) as { draft?: unknown };
-  return comparisonDraftSchema.parse(payload.draft);
+  return comparisonDraftSchema.parse(hydrateDraftPreviews(payload.draft));
 }
 
 export async function duplicateProject(projectId: string) {
   const payload = await request(`/projects/${encodeURIComponent(projectId)}/duplicate`, { method: "POST", body: "{}" }) as { draft?: unknown };
-  return comparisonDraftSchema.parse(payload.draft);
+  return comparisonDraftSchema.parse(hydrateDraftPreviews(payload.draft));
 }
 
 export async function archiveProject(projectId: string) {
@@ -141,7 +152,11 @@ export function draftForStorage(draft: unknown): Record<string, unknown> {
   const sources = value.sources;
   if (sources && typeof sources === "object") {
     for (const source of Object.values(sources)) {
-      if (source && typeof source === "object") delete (source as Record<string, unknown>).content;
+      if (source && typeof source === "object") {
+        delete (source as Record<string, unknown>).content;
+        delete (source as Record<string, unknown>).preview;
+        delete (source as Record<string, unknown>).previewJson;
+      }
     }
     for (const [kind, source] of Object.entries(sources)) {
       if (!source || typeof source !== "object" || !(source as Record<string, unknown>).sourceId) delete (sources as Record<string, unknown>)[kind];
@@ -152,7 +167,20 @@ export function draftForStorage(draft: unknown): Record<string, unknown> {
 
 export async function getDraft() {
   const payload = await request("/comparisons/draft") as { draft?: unknown };
-  return payload.draft == null ? null : comparisonDraftSchema.parse(payload.draft);
+  return payload.draft == null ? null : comparisonDraftSchema.parse(hydrateDraftPreviews(payload.draft));
+}
+
+function hydrateDraftPreviews(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  const sources = (value as Record<string, unknown>).sources;
+  if (!sources || typeof sources !== "object") return value;
+  for (const source of Object.values(sources)) {
+    if (!source || typeof source !== "object") continue;
+    const record = source as Record<string, unknown>;
+    if (Array.isArray(record.previewJson)) record.preview = record.previewJson.map((item) => strictJsonParse(String(item)));
+    delete record.previewJson;
+  }
+  return value;
 }
 
 export async function deleteDraft() {

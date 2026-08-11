@@ -102,6 +102,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setSource: (kind, source) => setDraft((current) => ({
       ...current,
       sources: { ...current.sources, [kind]: source },
+      rules: [],
+      activeJobId: undefined,
     })),
     setRules: (rules) => setDraft((current) => ({ ...current, rules })),
     result,
@@ -110,7 +112,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       const next = freshDraft();
       setDraft(next);
       setResult(null);
-      void saveDraft(next).catch((error: Error) => { setDraftStatus("error"); setDraftError(error.message); });
+      void persistDraft(next).catch((error: Error) => { setDraftStatus("error"); setDraftError(error.message); });
     },
     draftStatus,
     draftError,

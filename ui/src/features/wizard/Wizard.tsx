@@ -19,11 +19,12 @@ import {
   XCircle,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { cancelComparisonJob, createComparisonJob, getComparisonJob, getRun, resumeComparisonJob, stageSource } from "../../api/client";
+import { cancelComparisonJob, createComparisonJob, getComparisonJob, getFieldInventory, getRun, retryComparisonJob, stageSource } from "../../api/client";
 import type { ComparisonRequest, FieldRule, GateMode, Mapping, SourceArtifact, SourceKind } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Skeleton, Status, Stepper, WizardActions } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
-import { detectFormat, discoverRules, inferPointer, parseRows, pointerCandidates, valueAt } from "../import/inspect";
+import { detectFormat, inferPointer, parseRows, pointerCandidates } from "../import/inspect";
+import { exactJsonStringify } from "../../lib/lossless-json";
 
 const paths = ["/new/source", "/new/map", "/new/correctness", "/new/evidence", "/new/review", "/new/run"] as const;
 
@@ -82,17 +83,14 @@ function SourceDrop({ kind, title, description, required, source, onSource }: {
 }) {
   const input = useRef<HTMLInputElement>(null);
   const read = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const content = String(reader.result ?? "");
+    void file.arrayBuffer().then((bytes) => {
+      const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       const pending: SourceArtifact = { kind, name: file.name, format: kind === "schema" ? "json" : detectFormat(file.name, content), content, bytes: new Blob([content]).size, rows: 0, status: "staging", message: "Strict validation and hashing on the local server…", sourceId: "", hash: "" };
       onSource(pending);
       void stageSource(kind, pending)
         .then((staged) => onSource({ ...pending, ...staged, status: "ready", message: undefined }))
         .catch((error: Error) => onSource({ ...pending, sourceId: "", hash: "", status: "error", message: error.message }));
-    };
-    reader.onerror = () => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The browser could not read this file.", sourceId: "", hash: "" });
-    reader.readAsText(file);
+    }).catch(() => onSource({ kind, name: file.name, format: "jsonl", content: "", bytes: file.size, rows: 0, status: "error", message: "The file is not valid UTF-8 and was refused before parsing.", sourceId: "", hash: "" }));
   };
   return (
     <article className={`source-card ${source?.status === "ready" ? "source-ready" : ""} ${source?.status === "error" ? "source-error" : ""}`}>
@@ -145,21 +143,28 @@ function MappingStep() {
     }});
     setInitialized(true);
   }, [baselinePointers, candidatePointers, dataPointers, draft.mapping, initialized, updateDraft]);
-
-  const ids = (rows: unknown[], pointer: string) => rows.map((row) => valueAt(row, pointer)).filter((value): value is string => typeof value === "string");
-  const dataIds = ids(dataRows, draft.mapping.datasetId);
-  const baselineIds = new Set(ids(baselineRows, draft.mapping.baselineId));
-  const candidateIds = new Set(ids(candidateRows, draft.mapping.candidateId));
-  const duplicates = dataIds.filter((id, index) => dataIds.indexOf(id) !== index);
-  const matched = dataIds.filter((id) => baselineIds.has(id) && candidateIds.has(id)).length;
-  const missingCandidate = dataIds.filter((id) => !candidateIds.has(id)).length;
+  const inventory = useQuery({
+    queryKey: ["mapping-inventory", dataset.sourceId, baseline.sourceId, candidate.sourceId, draft.sources.schema?.sourceId, draft.mapping],
+    enabled: initialized,
+    queryFn: () => getFieldInventory({
+      dataset: { sourceId: dataset.sourceId }, baseline: { sourceId: baseline.sourceId }, candidate: { sourceId: candidate.sourceId },
+      schema: draft.sources.schema ? { sourceId: draft.sources.schema.sourceId } : undefined,
+      datasetOutput: draft.mapping.datasetExpected, baselineOutput: draft.mapping.baselineOutput, candidateOutput: draft.mapping.candidateOutput,
+      datasetId: draft.mapping.datasetId, baselineId: draft.mapping.baselineId, candidateId: draft.mapping.candidateId,
+    }),
+  });
+  const mappingAudit = inventory.data?.mapping;
+  const duplicates = mappingAudit?.duplicateDatasetIds ?? [];
+  const matched = mappingAudit?.matched ?? 0;
+  const missingCandidate = mappingAudit?.missingCandidate ?? 0;
   const leakage = draft.mapping.datasetInput === draft.mapping.datasetExpected;
-  const valid = dataIds.length > 0 && baselineIds.size > 0 && candidateIds.size > 0 && duplicates.length === 0 && !leakage;
+  const invalidIds = (mappingAudit?.invalidDatasetIds ?? 1) + (mappingAudit?.invalidBaselineIds ?? 0) + (mappingAudit?.invalidCandidateIds ?? 0);
+  const valid = Boolean(mappingAudit) && matched > 0 && duplicates.length === 0 && invalidIds === 0 && !leakage;
 
   const set = (key: keyof typeof draft.mapping, value: string) => updateDraft({ mapping: { ...draft.mapping, [key]: value } });
   return (
     <>
-      <PageHeader eyebrow="Step 2 of 6" title="Confirm how your files are structured" description="StructTrace suggests fields deterministically. Inspect a sample before continuing." />
+      <PageHeader eyebrow="Step 2 of 6" title="Confirm how your files are structured" description="StructTrace suggests mappings from a server-parsed sample. Complete field coverage is analyzed in the next step." />
       <div className="mapping-grid">
         <MappingCard title="Golden data" source={dataset} rows={dataRows} options={dataPointers} fields={[
           ["Case ID", "datasetId", draft.mapping.datasetId], ["Input", "datasetInput", draft.mapping.datasetInput], ["Expected output", "datasetExpected", draft.mapping.datasetExpected],
@@ -171,12 +176,14 @@ function MappingStep() {
       <Card className="coverage-card">
         <div><strong>{matched.toLocaleString()}</strong><span>matched cases</span></div>
         <div className={duplicates.length ? "metric-bad" : ""}><strong>{duplicates.length}</strong><span>duplicate IDs</span></div>
-        <div><strong>{dataIds.filter((id) => !baselineIds.has(id)).length}</strong><span>missing baseline</span></div>
+        <div><strong>{mappingAudit?.missingBaseline ?? 0}</strong><span>missing baseline</span></div>
         <div className={missingCandidate ? "metric-warn" : ""}><strong>{missingCandidate}</strong><span>missing candidate</span></div>
       </Card>
       {missingCandidate > 0 && <InlineNotice tone="warning" title="Missing candidate outputs stay in the denominator">{missingCandidate} cases will count as candidate failures. They will not disappear from the result.</InlineNotice>}
       {leakage && <InlineNotice tone="danger" title="Reference leakage risk">Input and expected output resolve to the same path. Choose distinct fields before continuing.</InlineNotice>}
       {duplicates.length > 0 && <InlineNotice tone="danger" title="Duplicate case IDs">Resolve duplicate IDs before running. First affected ID: <code>{duplicates[0]}</code>.</InlineNotice>}
+      {invalidIds > 0 && <InlineNotice tone="danger" title="Case IDs must be non-empty strings">The full-source audit found {invalidIds} missing, empty, or non-string ID values across the three sources.</InlineNotice>}
+      {inventory.error && <InlineNotice tone="danger" title="Complete mapping audit failed">{inventory.error.message}</InlineNotice>}
       <WizardActions back={navigation.back} next={navigation.next} nextLabel="Looks right" disabled={!valid} />
     </>
   );
@@ -188,9 +195,9 @@ function MappingCard({ title, source, rows, options, fields, set }: {
 }) {
   return (
     <Card className="mapping-card">
-      <div className="mapping-title"><div><h2>{title}</h2><p>{source.name}</p></div><Status tone="pass" label={`${rows.length} rows`} /></div>
+      <div className="mapping-title"><div><h2>{title}</h2><p>{source.name}</p></div><Status tone="pass" label={`${source.rows} total rows`} /></div>
       {fields.map(([label, key, value]) => <label className="field-select" key={key}><span>{label}<small>Suggested · verify</small></span><div><select value={value} onChange={(event) => set(key, event.target.value)}>{options.map((pointer) => <option key={pointer}>{pointer}</option>)}</select><ChevronDown size={15} /></div></label>)}
-      <div className="sample-json"><small>Sample record</small><pre>{JSON.stringify(rows[0], null, 2).slice(0, 620)}</pre></div>
+      <div className="sample-json"><small>Server-parsed sample record</small><pre>{exactJsonStringify(rows[0], 2).slice(0, 620)}</pre></div>
     </Card>
   );
 }
@@ -204,15 +211,42 @@ function EnvelopeFields({ prefix, title, mapping, options, set }: { prefix: "bas
 function CorrectnessStep() {
   const { draft, setRules } = useWorkspace();
   const navigation = useStepNavigation(2);
-  const discovered = useMemo(() => discoverRules(draft.sources.dataset!, draft.sources.baseline!, draft.sources.candidate!, draft.mapping.datasetExpected, draft.mapping.baselineOutput, draft.mapping.candidateOutput), [draft.mapping, draft.sources]);
+  const inventory = useQuery({
+    queryKey: ["field-inventory", draft.sources.dataset?.sourceId, draft.sources.baseline?.sourceId, draft.sources.candidate?.sourceId, draft.sources.schema?.sourceId, draft.mapping.datasetExpected, draft.mapping.baselineOutput, draft.mapping.candidateOutput],
+    queryFn: () => getFieldInventory({
+      dataset: { sourceId: draft.sources.dataset!.sourceId }, baseline: { sourceId: draft.sources.baseline!.sourceId }, candidate: { sourceId: draft.sources.candidate!.sourceId },
+      schema: draft.sources.schema ? { sourceId: draft.sources.schema.sourceId } : undefined,
+      datasetOutput: draft.mapping.datasetExpected, baselineOutput: draft.mapping.baselineOutput, candidateOutput: draft.mapping.candidateOutput,
+      datasetId: draft.mapping.datasetId, baselineId: draft.mapping.baselineId, candidateId: draft.mapping.candidateId,
+    }),
+  });
+  const discovered = useMemo(() => (inventory.data?.fields ?? []).filter((field) => !field.pointer.includes("/*/")).map((field) => {
+    const children = (inventory.data?.fields ?? []).filter((candidate) => candidate.pointer.startsWith(`${field.pointer}/*/`));
+    const identity = children.find((candidate) => /\/(id|sku|product_code|code)$/i.test(candidate.pointer));
+    return {
+      pointer: field.pointer, kind: field.suggestedRule, enabled: false,
+      expectedCoverage: field.expectedCoverage, baselineCoverage: field.baselineCoverage,
+      candidateCoverage: field.candidateCoverage, observedType: field.observedType,
+      keys: field.suggestedRule === "keyed_array" ? identity?.pointer.slice(field.pointer.length + 2) : undefined,
+      keyFields: field.suggestedRule === "keyed_array" ? (identity ? [identity.pointer.slice(field.pointer.length + 2)] : []) : undefined,
+      arrayFields: field.suggestedRule === "keyed_array" ? children.filter((item) => item !== identity).map((item) => ({ pointer: item.pointer.slice(field.pointer.length + 2), kind: item.suggestedRule === "keyed_array" || item.suggestedRule === "decimal_exact" ? "exact" as const : item.suggestedRule })) : undefined,
+    } satisfies FieldRule;
+  }), [inventory.data]);
   const [initialized, setInitialized] = useState(false);
-  useEffect(() => { if (!initialized) { setRules(draft.rules.length ? draft.rules : discovered); setInitialized(true); } }, [discovered, draft.rules, initialized, setRules]);
+  useEffect(() => {
+    if (initialized || !inventory.data) return;
+    setRules(draft.rules.length ? draft.rules : discovered);
+    setInitialized(true);
+  }, [discovered, draft.rules, initialized, inventory.data, setRules]);
   const update = (pointer: string, next: Partial<FieldRule>) => setRules(draft.rules.map((rule) => rule.pointer === pointer ? { ...rule, ...next } : rule));
   const enabled = draft.rules.filter((rule) => rule.enabled);
   const keyedRules = enabled.filter((rule) => rule.kind === "keyed_array");
   return (
     <>
-      <PageHeader eyebrow="Step 3 of 6" title="What does correct mean for your application?" description="Schema validity is never treated as task correctness. Select the fields and deterministic rules that define success." />
+      <PageHeader eyebrow="Step 3 of 6" title="What does correct mean for your application?" description="Schema validity is never treated as task correctness. Every bounded source row and the caller schema are analyzed before suggestions appear." />
+      {inventory.isLoading && <Card><Skeleton /><Skeleton width="82%" /><Skeleton width="64%" /></Card>}
+      {inventory.error && <InlineNotice tone="danger" title="Full-source field analysis failed">{inventory.error.message}</InlineNotice>}
+      {inventory.data && <InlineNotice tone="success" title="Complete source inventory verified">Rust analyzed all {inventory.data.datasetRows.toLocaleString()} expected, {inventory.data.baselineRows.toLocaleString()} baseline, and {inventory.data.candidateRows.toLocaleString()} candidate rows. Preview rows are display-only.</InlineNotice>}
       <div className="correctness-summary"><div><CircleDot size={18} /><span><strong>{enabled.length} fields define correctness</strong><small>A case passes only when every selected rule passes.</small></span></div><Status tone={enabled.length ? "info" : "warning"} label={enabled.length ? "All selected rules must pass" : "Select at least one field"} /></div>
       <Card className="rules-card">
         <table className="rules-table">
@@ -346,9 +380,9 @@ function RunStep() {
     mutationFn: () => request ? createComparisonJob(request) : Promise.reject(new Error("The saved comparison sources are not available.")),
     onSuccess: async (createdJob) => { await updateDraftAndPersist({ activeJobId: createdJob.jobId }); },
   });
-  const job = useQuery({ queryKey: ["comparison-job", draft.activeJobId], queryFn: () => getComparisonJob(draft.activeJobId!), enabled: Boolean(draft.activeJobId), refetchInterval: (query) => ["queued", "running"].includes(query.state.data?.status ?? "") ? 300 : false });
+  const job = useQuery({ queryKey: ["comparison-job", draft.activeJobId], queryFn: () => getComparisonJob(draft.activeJobId!), enabled: Boolean(draft.activeJobId), refetchInterval: (query) => ["queued", "waiting_for_executor", "running"].includes(query.state.data?.status ?? "") ? 300 : false });
   const cancel = useMutation({ mutationFn: () => cancelComparisonJob(draft.activeJobId!), onSuccess: () => void job.refetch() });
-  const resume = useMutation({ mutationFn: () => resumeComparisonJob(draft.activeJobId!), onSuccess: async (next) => { await updateDraftAndPersist({ activeJobId: next.jobId }); } });
+  const retry = useMutation({ mutationFn: () => retryComparisonJob(draft.activeJobId!), onSuccess: async (next) => { await updateDraftAndPersist({ activeJobId: next.jobId }); } });
   useEffect(() => { if (request && !draft.activeJobId && create.isIdle) create.mutate(); }, [create, draft.activeJobId, request]);
   useEffect(() => {
     const runId = job.data?.status === "complete" ? job.data.runId : null;
@@ -357,21 +391,21 @@ function RunStep() {
   }, [job.data?.runId, job.data?.status, navigate, setResult, updateDraft]);
   const progress = job.data ? Math.round(job.data.completed / Math.max(1, job.data.total) * 100) : 0;
   const terminalError = create.error ?? job.error;
-  const active = !job.data || ["queued", "running"].includes(job.data.status);
+  const active = !job.data || ["queued", "waiting_for_executor", "running"].includes(job.data.status);
   if (!request && draftStatus === "loading") return <div className="run-screen"><Card className="run-progress"><Skeleton /><Skeleton width="70%" /></Card></div>;
   if (!request) return <div className="run-screen"><InlineNotice tone="danger" title="Comparison sources are unavailable">Return to the first step and attach the dataset, baseline, and candidate sources before running.</InlineNotice></div>;
   return (
     <div className="run-screen">
       <PageHeader eyebrow="Step 6 of 6" title={`Comparing ${draft.sources.dataset?.rows ?? 0} cases`} description="Baseline and candidate outputs are loaded. The Rust engine is building verified paired evidence." />
       <Card className="run-progress">
-        <div className="progress-head"><div><LoaderCircle className={active ? "spin" : ""} /><span><strong>{job.data?.status === "failed" ? "Comparison stopped" : job.data?.status === "cancelled" ? "Comparison cancelled" : job.data?.status === "interrupted" ? "Comparison interrupted" : job.data?.status === "complete" ? "Artifacts verified" : "Comparison running"}</strong><small>{job.data ? stageLabel(job.data.stage) : "Starting an isolated local job…"}</small></span></div><Status tone={job.data?.status === "complete" ? "pass" : ["failed", "cancelled", "interrupted"].includes(job.data?.status ?? "") ? "fail" : "working"} label={job.data?.status ?? "Starting"} /></div>
+        <div className="progress-head"><div><LoaderCircle className={active ? "spin" : ""} /><span><strong>{job.data?.status === "failed" ? "Comparison stopped" : job.data?.status === "cancelled" ? "Comparison cancelled" : job.data?.status === "interrupted" ? "Comparison interrupted" : job.data?.status === "complete" ? "Artifacts verified" : job.data?.status === "waiting_for_executor" ? "Waiting for local executor" : "Comparison running"}</strong><small>{job.data ? stageLabel(job.data.stage) : "Starting an isolated local job…"}</small></span></div><Status tone={job.data?.status === "complete" ? "pass" : ["failed", "cancelled", "interrupted"].includes(job.data?.status ?? "") ? "fail" : "working"} label={job.data?.status === "waiting_for_executor" ? "Queued" : job.data?.status ?? "Starting"} /></div>
         <div className="progress-line" aria-label={`${progress}% complete`}><span style={{ width: `${progress}%` }} /></div>
         {job.data && <div className="job-progress-meta"><span><strong>{job.data.completed.toLocaleString()}</strong> / {job.data.total.toLocaleString()} work units</span><code>{job.data.jobId}</code></div>}
         {job.data?.events.length ? <ol className="stage-list">{job.data.events.map((event, index) => <li className={index === job.data!.events.length - 1 && active ? "active" : "complete"} key={`${event.stage}:${event.at}:${index}`}><span>{index + 1}</span><strong>{stageLabel(event.stage)}</strong><small>{new Date(event.at * 1000).toLocaleTimeString()}</small></li>)}</ol> : null}
         {active && draft.activeJobId && <div className="job-actions"><Button variant="secondary" icon={XCircle} onClick={() => cancel.mutate()} disabled={cancel.isPending}>{cancel.isPending ? "Requesting cancellation…" : "Cancel safely"}</Button><small>Reload-safe. Cancellation occurs at the next engine checkpoint.</small></div>}
       </Card>
       {terminalError && <InlineNotice tone="danger" title="StructTrace could not start this comparison"><p>{terminalError.message}</p><Button variant="secondary" onClick={() => create.mutate()}>Try again</Button></InlineNotice>}
-      {job.data && ["failed", "cancelled", "interrupted"].includes(job.data.status) && <InlineNotice tone="danger" title="No decision was produced"><p>{job.data.message}</p><Button variant="secondary" onClick={() => resume.mutate()} disabled={resume.isPending}>{resume.isPending ? "Resuming…" : "Resume from retained sources"}</Button></InlineNotice>}
+      {job.data && ["failed", "cancelled", "interrupted"].includes(job.data.status) && <InlineNotice tone="danger" title="No decision was produced"><p>{job.data.message}</p><p>Retry reuses the retained source references and restarts the complete comparison. It is not a partial resume.</p><Button variant="secondary" onClick={() => retry.mutate()} disabled={retry.isPending}>{retry.isPending ? "Retrying…" : "Retry from retained sources"}</Button></InlineNotice>}
     </div>
   );
 }

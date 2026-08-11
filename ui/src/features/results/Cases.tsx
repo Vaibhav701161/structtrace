@@ -7,6 +7,7 @@ import { getRun, getRunCases, pinCase } from "../../api/client";
 import type { RunResult } from "../../api/types";
 import { Button, Card, InlineNotice, PageHeader, Status } from "../../design-system/components";
 import { useWorkspace } from "../../state/workspace";
+import { exactJsonStringify, isExactJsonNumber, ownValueAt } from "../../lib/lossless-json";
 
 type CaseRecord = Record<string, any>;
 const filters = ["All cases", "Regressions", "Improvements", "Both wrong", "Valid but wrong", "Parse failures", "Schema failures", "Evaluator errors", "Saved"];
@@ -105,7 +106,7 @@ function firstFailure(record: CaseRecord) {
 
 function CaseDrawer({ result, record, close, previous, next }: { result: RunResult; record: CaseRecord; close: () => void; previous?: () => void; next?: () => void }) {
   const [tab, setTab] = useState("Comparison");
-  const [changedOnly, setChangedOnly] = useState(false);
+  const [changedOnly, setChangedOnly] = useState(record.deployment_transition === "baseline_only_pass");
   const [viewMode, setViewMode] = useState<"side" | "unified">("side");
   const drawer = useRef<HTMLElement>(null);
   const queryClient = useQueryClient();
@@ -143,7 +144,7 @@ function CaseDrawer({ result, record, close, previous, next }: { result: RunResu
         <header><div><small>CASE</small><h2>{String(record.case?.id)}</h2><Status tone={transition.tone} label={transition.label} /></div><div><Button variant="secondary" icon={Pin} onClick={() => pin.mutate()} disabled={pin.isPending}>{pin.isSuccess ? "Saved" : pin.isPending ? "Saving…" : "Save case"}</Button><button className="icon-button" onClick={close} aria-label="Close case"><X /></button></div></header>
         <nav className="drawer-tabs" aria-label="Case detail tabs">{["Comparison", "Rules", "Raw evidence", "Metadata"].map((item) => <button className={tab === item ? "active" : ""} onClick={() => setTab(item)} key={item}>{item}</button>)}</nav>
         <div className="drawer-content">
-          {tab === "Comparison" && <><div className="diff-toolbar"><span>{failingPointers.size} failing {failingPointers.size === 1 ? "field" : "fields"}</span><div className="diff-mode" role="group" aria-label="Diff layout"><button className={viewMode === "side" ? "active" : ""} onClick={() => setViewMode("side")}><GitCompareArrows size={13} /> Side by side</button><button className={viewMode === "unified" ? "active" : ""} onClick={() => setViewMode("unified")}><PanelLeftClose size={13} /> Unified</button></div><label><input type="checkbox" checked={changedOnly} onChange={(event) => setChangedOnly(event.target.checked)} /> Collapse unchanged</label></div>{viewMode === "side" ? <div className="comparison-columns"><JsonPanel title="Expected" value={record.case?.expected} highlights={failingPointers} changedOnly={changedOnly} /><JsonPanel title="Baseline" value={output("baseline")} expected={record.case?.expected} state={record.baseline_evaluation?.primary_pass} highlights={failingPointers} changedOnly={changedOnly} /><JsonPanel title="Candidate" value={output("candidate")} expected={record.case?.expected} state={record.candidate_evaluation?.primary_pass} highlights={failingPointers} changedOnly={changedOnly} /></div> : <UnifiedDiff expected={record.case?.expected} baseline={output("baseline")} candidate={output("candidate")} highlights={failingPointers} changedOnly={changedOnly} />}</>}
+          {tab === "Comparison" && <><div className="case-compact-summary"><div><small>TRANSITION</small><strong>{transition.label}</strong></div><div><small>FAILED FIELDS</small><strong>{failingPointers.size}</strong></div><div><small>BASELINE</small><strong>{record.baseline_evaluation?.primary_pass === true ? "Correct" : "Incorrect"}</strong></div><div><small>CANDIDATE</small><strong>{record.candidate_evaluation?.primary_pass === true ? "Correct" : "Incorrect"}</strong></div></div><div className="diff-toolbar"><span>{failingPointers.size} failing {failingPointers.size === 1 ? "field" : "fields"}</span><button disabled={!failingPointers.size} onClick={() => drawer.current?.querySelector<HTMLElement>(".json-row-failed, .unified-row.json-row-failed")?.scrollIntoView({ block: "center" })}>Focus failed fields</button><button onClick={() => void navigator.clipboard.writeText(exactJsonStringify(record))}><Copy size={13} /> Copy exact evidence</button><div className="diff-mode" role="group" aria-label="Diff layout"><button className={viewMode === "side" ? "active" : ""} onClick={() => setViewMode("side")}><GitCompareArrows size={13} /> Side by side</button><button className={viewMode === "unified" ? "active" : ""} onClick={() => setViewMode("unified")}><PanelLeftClose size={13} /> Unified</button></div><label><input type="checkbox" checked={changedOnly} onChange={(event) => setChangedOnly(event.target.checked)} /> Collapse unchanged</label></div>{viewMode === "side" ? <div className="comparison-columns"><JsonPanel title="Expected" value={record.case?.expected} highlights={failingPointers} changedOnly={changedOnly} /><JsonPanel title="Baseline" value={output("baseline")} expected={record.case?.expected} state={record.baseline_evaluation?.primary_pass} highlights={failingPointers} changedOnly={changedOnly} /><JsonPanel title="Candidate" value={output("candidate")} expected={record.case?.expected} state={record.candidate_evaluation?.primary_pass} highlights={failingPointers} changedOnly={changedOnly} /></div> : <UnifiedDiff expected={record.case?.expected} baseline={output("baseline")} candidate={output("candidate")} highlights={failingPointers} changedOnly={changedOnly} />}</>}
           {tab === "Rules" && <RuleTable record={record} />}
           {tab === "Raw evidence" && <div className="raw-stack"><JsonPanel title="Baseline output envelope" value={record.baseline_output} /><JsonPanel title="Candidate output envelope" value={record.candidate_output} /></div>}
           {tab === "Metadata" && <JsonPanel title="Evaluation-only metadata" value={record.case?.metadata ?? { message: "No metadata retained" }} />}
@@ -175,7 +176,7 @@ type DiffState = "reference" | "unchanged" | "added" | "removed" | "changed" | "
 export interface DiffRow { path: string; depth: number; value: string; state: DiffState }
 function diffMark(state: DiffState) { return state === "added" ? "+" : state === "removed" ? "−" : state === "changed" ? "~" : state === "type_changed" ? "T" : "·"; }
 function diffLabel(state: DiffState) { return state.replace("_", " "); }
-function valueType(value: unknown) { return value === null ? "null" : Array.isArray(value) ? "array" : typeof value; }
+function valueType(value: unknown) { return value === null ? "null" : Array.isArray(value) ? "array" : isExactJsonNumber(value) ? (/^-?(0|[1-9]\d*)$/.test(value.lexeme) ? "integer" : "number") : typeof value; }
 function stableArrayKey(values: unknown[]) {
   for (const key of ["id", "sku", "product_code", "code"]) {
     if (values.length && values.every((item) => item !== null && typeof item === "object" && !Array.isArray(item) && ["string", "number"].includes(typeof (item as CaseRecord)[key]))) return key;
@@ -192,7 +193,7 @@ function alignArrays(expected: unknown, actual: unknown): unknown {
     }
     return actual;
   }
-  if (expected !== null && actual !== null && typeof expected === "object" && typeof actual === "object" && !Array.isArray(expected) && !Array.isArray(actual)) {
+  if (expected !== null && actual !== null && typeof expected === "object" && typeof actual === "object" && !isExactJsonNumber(expected) && !isExactJsonNumber(actual) && !Array.isArray(expected) && !Array.isArray(actual)) {
     return Object.fromEntries(Object.entries(actual as CaseRecord).map(([key, value]) => [key, alignArrays((expected as CaseRecord)[key], value)]));
   }
   return actual;
@@ -210,14 +211,14 @@ export function structuralDiff(expected: unknown, actual: unknown): DiffRow[] {
     return { ...actualRow, state };
   });
 }
-function valueAtPointer(value: unknown, pointer: string): unknown { return pointer.split("/").slice(1).reduce<unknown>((current, encoded) => current !== null && typeof current === "object" ? (current as CaseRecord)[encoded.replace(/~1/g, "/").replace(/~0/g, "~")] : undefined, value); }
+function valueAtPointer(value: unknown, pointer: string): unknown { return ownValueAt(value, pointer); }
 function jsonRows(value: unknown, path = "", depth = 0): Array<{ path: string; depth: number; value: string }> {
-  if (value !== null && typeof value === "object") {
+  if (value !== null && typeof value === "object" && !isExactJsonNumber(value)) {
     const entries = Array.isArray(value) ? value.map((item, index) => [String(index), item] as const) : Object.entries(value as Record<string, unknown>);
     if (!entries.length) return [{ path, depth, value: Array.isArray(value) ? "[]" : "{}" }];
     return entries.flatMap(([key, child]) => jsonRows(child, `${path}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`, depth + 1));
   }
-  return [{ path, depth, value: typeof value === "string" ? JSON.stringify(value) : String(value) }];
+  return [{ path, depth, value: isExactJsonNumber(value) ? value.lexeme : typeof value === "string" ? JSON.stringify(value) : String(value) }];
 }
 function RuleTable({ record }: { record: CaseRecord }) {
   const baseline = Object.values(record.baseline_evaluation?.evaluators ?? {}) as CaseRecord[];

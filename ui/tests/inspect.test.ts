@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { detectFormat, discoverRules, parseArtifact, parseRows, valueAt } from "../src/features/import/inspect";
+import { exactJsonStringify, isExactJsonNumber, strictJsonParse } from "../src/lib/lossless-json";
 
 describe("local import inspection", () => {
   it("reports the exact invalid JSONL line", () => {
@@ -27,7 +28,22 @@ describe("local import inspection", () => {
 
   it("parses quoted CSV with nested JSON deterministically", () => {
     const rows = parseRows('id,output\na,"{""answer"":4}"\n', "csv");
-    expect(valueAt(rows[0], "/output/answer")).toBe(4);
+    const answer = valueAt(rows[0], "/output/answer");
+    expect(isExactJsonNumber(answer)).toBe(true);
+    expect(exactJsonStringify(answer)).toBe("4");
+  });
+
+  it("preserves arbitrary precision integers and decimals exactly", () => {
+    const value = strictJsonParse('{"integer":9007199254740993,"decimal":0.12345678901234567890123456789}');
+    expect(exactJsonStringify(value)).toBe('{"integer":9007199254740993,"decimal":0.12345678901234567890123456789}');
+  });
+
+  it("treats dangerous JSON names as plain own properties", () => {
+    const value = strictJsonParse('{"__proto__":{"polluted":true},"constructor":1,"prototype":2}') as Record<string, unknown>;
+    expect(Object.getPrototypeOf(value)).toBeNull();
+    expect(Object.hasOwn(value, "__proto__")).toBe(true);
+    expect(valueAt(value, "/__proto__/polluted")).toBe(true);
+    expect(valueAt({}, "/toString")).toBeUndefined();
   });
 
   it("detects arrays as JSON and newline records as JSONL", () => {

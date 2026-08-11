@@ -37,6 +37,12 @@ function ResultsLoading({ error }: { error: Error | null }) {
 }
 
 export function decision(result: RunResult) {
+  if (result.integrity.status !== "verified") return {
+    title: result.integrity.status === "modified" ? "EVIDENCE MODIFIED" : result.integrity.status === "replay_failed" ? "REPLAY FAILED" : "EVIDENCE NOT VERIFIED",
+    text: result.integrity.detail,
+    tone: "fail" as const,
+    icon: ShieldAlert,
+  };
   const gate = result.summary.gate;
   if (gate.gate_mode === "release" && gate.deployment_authorized) return { title: "RELEASE AUTHORIZED", text: "Candidate passed every configured release and evidence rule.", tone: "pass" as const, icon: ShieldCheck };
   if (gate.status === "error") return { title: "RUN ERROR", text: gate.runtime_errors[0] ?? "A required rule could not be evaluated safely.", tone: "fail" as const, icon: CircleAlert };
@@ -71,12 +77,13 @@ function ResultContent({ result }: { result: RunResult }) {
     : `Candidate created ${improvements} improvements and ${regressions} regressions. Review every discordant case before changing production behavior.`;
   return (
     <div className="page page-wide result-page">
-      <PageHeader eyebrow={`${result.projectName} · immutable run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} onClick={() => void navigate({ to: "/ci" })}>Export CI project</Button></>} />
+      <PageHeader eyebrow={`${result.projectName} · run ${result.runId}`} title="Should I ship?" actions={<><Button variant="secondary" icon={Download} onClick={() => exportSummary(result)}>Export summary</Button><Button icon={GitPullRequest} disabled={result.integrity.status !== "verified"} onClick={() => void navigate({ to: "/ci" })}>Export CI project</Button></>} />
       <section className={`decision-banner decision-${state.tone}`}>
         <state.icon size={28} aria-hidden="true" />
         <div><span>RELEASE DECISION</span><h2>{state.title}</h2><p>{state.text}</p></div>
         <Status tone={state.tone === "pass" ? "pass" : state.tone === "fail" ? "fail" : state.tone === "warning" ? "warning" : "info"} label={summary.gate.gate_mode === "release" ? "Release gate" : summary.gate.gate_mode === "regression" ? "Regression gate" : "Advisory"} />
       </section>
+      <InlineNotice tone={result.integrity.status === "verified" ? "success" : "danger"} title={result.integrity.status === "verified" ? "Evidence integrity verified" : "Authority disabled"}>{result.integrity.detail}{result.integrity.status !== "verified" && " Case claims, release export, and baseline promotion are disabled until the original artifacts verify."}</InlineNotice>
       {(summary.gate.quality_failures.length > 0 || summary.gate.evidence_failures.length > 0 || summary.gate.runtime_errors.length > 0) && <Card className="gate-audit"><div><h2>Why this decision was reached</h2><p>Quality, evidence, and runtime findings remain separate. None are hidden by another category.</p></div>{summary.gate.quality_failures.length > 0 && <GateFailures title="Quality failures" items={summary.gate.quality_failures} tone="fail" />}{summary.gate.evidence_failures.length > 0 && <GateFailures title="Evidence failures" items={summary.gate.evidence_failures} tone="warning" />}{summary.gate.runtime_errors.length > 0 && <GateFailures title="Runtime errors" items={summary.gate.runtime_errors} tone="fail" />}</Card>}
       <Card className="explanation"><CircleAlert size={20} /><p>{description}</p></Card>
       <Card className="outcome-visualization">
@@ -109,12 +116,12 @@ function ResultContent({ result }: { result: RunResult }) {
         </Card>
       </div>
       <Card className="evidence-card">
-        <div className="panel-heading"><div><h2>Evidence independence audit</h2><p>Captured execution remains visible even when rows cannot multiply inferential evidence.</p></div><Status tone="pass" label="Hash-bound artifacts" /></div>
+        <div className="panel-heading"><div><h2>Evidence independence audit</h2><p>Captured execution remains visible even when rows cannot multiply inferential evidence.</p></div><Status tone={result.integrity.status === "verified" ? "pass" : "fail"} label={result.integrity.status === "verified" ? "Artifacts verified" : "Authority disabled"} /></div>
         <div className="evidence-funnel" role="img" aria-label={`${capturedTotal} rows captured, ${independentTotal} independent evidence units, ${semanticTotal} jointly scored semantic pairs`}><FunnelStep label="Captured rows" value={capturedTotal} max={capturedTotal} /><FunnelStep label="Independent units" value={independentTotal} max={capturedTotal} /><FunnelStep label="Semantic pairs" value={semanticTotal} max={capturedTotal} /></div>
         <div className="evidence-metrics"><div><strong>{summary.evidence.total_rows}</strong><span>Rows captured</span></div><div><strong>{summary.evidence.effective_inference_units}</strong><span>Effective independent units</span></div><div><strong>{summary.evidence.exact_duplicate_groups}</strong><span>Exact-duplicate groups</span></div><div className={summary.evidence.repeated_trial_groups ? "bad" : ""}><strong>{summary.evidence.repeated_trial_groups}</strong><span>Repeated-trial conflicts</span></div><div className={summary.evidence.label_conflict_groups ? "bad" : ""}><strong>{summary.evidence.label_conflict_groups}</strong><span>Label conflicts</span></div></div>
       </Card>
-      <div className="result-actions"><Button icon={XCircle} variant="secondary" onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Saved cases</Button>{result.projectId && summary.gate.deployment_authorized && !accepted.isSuccess && <Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={accepted.isPending}>{accepted.isPending ? "Promoting…" : "Accept as next baseline"}</Button>}{accepted.data && <Button icon={ArrowRight} onClick={() => { const parsed = parseArtifact("baseline", accepted.data.source.name, accepted.data.source.content); void startNextIteration({ ...parsed, sourceId: accepted.data.source.sourceId, hash: accepted.data.source.hash }).then(() => navigate({ to: "/new/source" })); }}>Start next comparison</Button>}</div>
-      {accepted.data && <InlineNotice tone="success" title="Authorized baseline recorded">Candidate bytes from run <code>{accepted.data.accepted.runId}</code> are hash-bound and will be the default baseline for the next comparison in this project.</InlineNotice>}
+      <div className="result-actions"><Button icon={XCircle} variant="secondary" disabled={result.integrity.status !== "verified"} onClick={() => void navigate({ to: "/runs/$runId/cases", params: { runId: result.runId }, search: { search: "" } })}>Inspect regressions</Button><Button icon={Pin} variant="secondary" onClick={() => void navigate({ to: "/regressions" })}>Saved cases</Button>{result.integrity.status === "verified" && result.projectId && summary.gate.deployment_authorized && !accepted.isSuccess && <Button icon={ArrowRight} onClick={() => accepted.mutate()} disabled={accepted.isPending}>{accepted.isPending ? "Promoting…" : "Accept as next baseline"}</Button>}{accepted.data && <Button icon={ArrowRight} onClick={() => { const parsed = parseArtifact("baseline", accepted.data.source.name, accepted.data.source.content); void startNextIteration({ ...parsed, sourceId: accepted.data.source.sourceId, hash: accepted.data.source.hash }).then(() => navigate({ to: "/new/source" })); }}>Open next comparison</Button>}</div>
+      {accepted.data && <InlineNotice tone="success" title="Verified baseline revision committed">Replay-verified candidate bytes from run <code>{accepted.data.accepted.runId}</code> now define project revision <code>{accepted.data.accepted.projectRevisionId}</code>. Reopening the project and CI export resolve this same candidate hash.</InlineNotice>}
       {accepted.error && <InlineNotice tone="danger" title="Baseline promotion failed">{accepted.error.message}</InlineNotice>}
     </div>
   );

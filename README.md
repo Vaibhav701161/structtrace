@@ -338,6 +338,13 @@ hashes establish integrity and consistency, not cryptographic authorship. Resume
 when all bound experimental inputs still match, including local entry-source files, dependency
 lockfiles, the Git commit, and the dirty-tree fingerprint.
 
+StructTrace Local adds transactional project revisions around this evidence. Failed and cancelled
+attempts remain isolated; only a finalized run can atomically replace the current project pointer.
+The UI labels run evidence as verified, modified, not verified, or replay failed and disables case
+claims, release export, and baseline promotion unless complete replay succeeds. An accepted release
+candidate becomes the project's baseline immediately through a hash-bound accepted revision, and
+the same bytes are resolved by project reopen, the next comparison, and CI export.
+
 ## Privacy boundary
 
 StructTrace sends no telemetry and performs no automatic uploads. Provider credentials are read

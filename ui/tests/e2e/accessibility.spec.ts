@@ -57,10 +57,12 @@ test("recorded files complete the visual workflow through the Rust engine", asyn
   await expect(page.locator(".coverage-card strong").first()).toHaveText("12");
   await page.getByRole("button", { name: "Looks right" }).click();
   await expect(page.getByRole("heading", { name: "What does correct mean for your application?" })).toBeVisible();
-  await page.getByRole("checkbox", { name: "Use /line_items" }).check();
+  await page.getByRole("checkbox", { name: "Use /line_items", exact: true }).check();
   await expect(page.getByRole("heading", { name: "Match items in /line_items" })).toBeVisible();
+  await expect(page.getByText("Match key required", { exact: true })).toBeVisible();
+  await page.getByRole("combobox", { name: "Role for /description" }).selectOption("key");
   await expect(page.getByRole("combobox", { name: "Role for /description" })).toHaveValue("key");
-  await expect(page.getByRole("combobox", { name: "Role for /unit_price" })).toHaveValue("key");
+  await expect(page.getByRole("combobox", { name: "Role for /unit_price" })).not.toHaveValue("key");
   await expect(page.getByText("Pairs the same item across variants").first()).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Continue" }).click();
@@ -135,29 +137,26 @@ test("authorized candidate becomes the next baseline in the same project", async
   await page.getByRole("button", { name: "Run comparison" }).click();
   await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible({ timeout: 20_000 });
   const resultUrl = page.url();
+  await page.getByRole("button", { name: "Accept as next baseline" }).click();
+  await expect(page.getByText("Verified baseline revision committed")).toBeVisible();
   await page.getByRole("button", { name: "Export CI project" }).click();
   await expect(page.getByRole("heading", { name: "Export a reproducible CI project" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Release authorization/ })).toHaveClass(/selected/);
   await page.getByRole("button", { name: "Export complete CI project" }).click();
   await expect(page.getByText("Complete CI project exported")).toBeVisible();
+  await expect(page.getByText(/files were materialized/)).toBeVisible();
   const generatedWorkflow = page.locator(".generated-file").filter({ hasText: ".github/workflows/structtrace.yml" });
   await expect(generatedWorkflow).toContainText("structtrace release-check latest");
   await expect(generatedWorkflow).toContainText(/ref: [0-9a-f]{40}/);
   await page.goto(resultUrl);
   await expect(page.getByRole("heading", { name: "RELEASE AUTHORIZED" })).toBeVisible();
-  await page.getByRole("button", { name: "Accept as next baseline" }).click();
-  await expect(page.getByText("Authorized baseline recorded")).toBeVisible();
-  const persistedIteration = page.waitForRequest((request) => request.method() === "PUT" && request.url().includes("/comparisons/draft") && request.postData()?.includes("accepted-") === true);
-  await page.getByRole("button", { name: "Start next comparison" }).click();
-  await persistedIteration;
-  await expect(page.getByRole("heading", { name: "What are you comparing?" })).toBeVisible();
-  await expect(page.getByText(/accepted-.*\.jsonl/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Continue to field mapping" })).toBeDisabled();
   await page.getByRole("link", { name: "Projects" }).click();
   const project = page.locator(".pinned-list > div").filter({ hasText: projectName }).first();
   await expect(project).toContainText("1 immutable run");
+  await expect(project).toContainText("Accepted revision");
   await project.getByRole("button", { name: "Open" }).click();
   await expect(page.getByText(/accepted-.*\.jsonl/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Continue to field mapping" })).toBeDisabled();
   await page.getByRole("link", { name: "Projects" }).click();
   await project.getByRole("button", { name: `Duplicate ${projectName}` }).click();
   await expect(page.getByRole("heading", { name: "What are you comparing?" })).toBeVisible();
@@ -170,7 +169,7 @@ test("authorized candidate becomes the next baseline in the same project", async
   await expect(copy).toBeHidden();
 });
 
-test("long comparison exposes real reload-safe cancellation and resume", async ({ page }) => {
+test("long comparison exposes real reload-safe cancellation and honest retry", async ({ page }) => {
   test.setTimeout(60_000);
   const count = 10_000;
   const dataset = Array.from({ length: count }, (_, index) => JSON.stringify({ id: `job-${index}`, input: { value: index }, expected: { answer: index } })).join("\n") + "\n";
@@ -194,9 +193,43 @@ test("long comparison exposes real reload-safe cancellation and resume", async (
   await page.reload();
   await expect(page.getByRole("button", { name: "Cancel safely" })).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Cancel safely" }).click();
-  await expect(page.getByRole("button", { name: "Resume from retained sources" })).toBeVisible({ timeout: 15_000 });
-  await page.getByRole("button", { name: "Resume from retained sources" }).click();
+  await expect(page.getByRole("button", { name: "Retry from retained sources" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/restarts the complete comparison/)).toBeVisible();
+  await page.getByRole("button", { name: "Retry from retained sources" }).click();
   await expect(page.getByRole("button", { name: "Cancel safely" })).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Cancel safely" }).click();
   await expect(page.getByText("No decision was produced", { exact: true })).toBeVisible({ timeout: 15_000 });
+});
+
+test("full-source inventory and browser evidence preserve late fields and exact numbers", async ({ page }) => {
+  const exactRow = (value: unknown) => JSON.stringify(value)
+    .replace('"__BIG_INTEGER__"', "9007199254740993")
+    .replace('"__EXACT_DECIMAL__"', "0.12345678901234567890123456789");
+  const dataset = Array.from({ length: 30 }, (_, index) => exactRow({
+    id: `precision-${index}`,
+    input: { value: index },
+    expected: index === 29
+      ? { amount: "__BIG_INTEGER__", exact_decimal: "__EXACT_DECIMAL__", late_field: "required" }
+      : { amount: "__BIG_INTEGER__", exact_decimal: "__EXACT_DECIMAL__" },
+  })).join("\n") + "\n";
+  const outputRows = (includeLate: boolean) => Array.from({ length: 30 }, (_, index) => exactRow({
+    id: `precision-${index}`, status: "ok",
+    output: { amount: "__BIG_INTEGER__", exact_decimal: "__EXACT_DECIMAL__", ...(includeLate && index === 29 ? { late_field: "required" } : {}) },
+  })).join("\n") + "\n";
+  const schema = JSON.stringify({ type: "object", properties: { amount: { type: "integer" }, exact_decimal: { type: "number" }, late_field: { type: "string" }, schema_only: { type: "boolean" } }, required: ["amount", "exact_decimal"], additionalProperties: false });
+  await page.goto(process.env.STRUCTTRACE_UI_URL ?? "/");
+  await page.getByRole("button", { name: "Compare a change" }).click();
+  const files = page.locator('input[type="file"]');
+  await files.nth(0).setInputFiles({ name: "precision-dataset.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(dataset) });
+  await files.nth(1).setInputFiles({ name: "precision-baseline.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(outputRows(true)) });
+  await files.nth(2).setInputFiles({ name: "precision-candidate.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(outputRows(false)) });
+  await files.nth(3).setInputFiles({ name: "precision.schema.json", mimeType: "application/json", buffer: Buffer.from(schema) });
+  await page.getByRole("button", { name: "Continue to field mapping" }).click();
+  await expect(page.locator(".sample-json").first()).toContainText("9007199254740993");
+  await expect(page.locator(".sample-json").first()).toContainText("0.12345678901234567890123456789");
+  await page.getByRole("button", { name: "Looks right" }).click();
+  await expect(page.getByText(/Rust analyzed all 30 expected, 30 baseline, and 30 candidate rows/)).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Use /late_field" })).toBeVisible();
+  await expect(page.getByText("Candidate omission", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Use /schema_only" })).toBeVisible();
 });

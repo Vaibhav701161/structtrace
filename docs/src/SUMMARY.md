@@ -4,6 +4,7 @@
 - [Why StructTrace exists](why-structtrace-exists.md)
 - [Quickstart](quickstart.md)
 - [StructTrace Local browser workflow](local-ui.md)
+- [Visual system](visual-system.md)
 - [Running the offline demo](offline-demo.md)
 - [Core concepts](core-concepts.md)
   - [Validity versus correctness](validity-versus-correctness.md)

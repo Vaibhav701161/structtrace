@@ -2312,6 +2312,7 @@ dependencies = [
  "minijinja",
  "open",
  "rand 0.9.5",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml_ng",
