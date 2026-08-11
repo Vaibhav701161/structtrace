@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-11T09:49:34Z",
-  "source_commit": "68e2f04c5fea62f5c48cfe5b327cb60c6c170e37",
+  "generated_at": "2026-08-11T09:58:08Z",
+  "source_commit": "01f7fc5477ebdf4515b0a639154c437c5a39084e",
   "dirty_state_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "source_tree_digest": "76b6643af918f00d8dbedfd7b67937891df6f9a2630ca03913331f99e5fef893",
+  "source_tree_digest": "fe1f0da50b01402fcc83230f7f22034d0c9221061748beaa0f2f1d2a9eec0db0",
   "cargo_lock_sha256": "9ae3824a91188f1537478bc48e758c4755c614cb3b47c32ea81a4a3be8091ffb",
-  "binary_sha256": "5acd92720ba9160ab9170b5d251a82034e836d863f464b1d901531d6d18f3604",
+  "binary_sha256": "e67e08c327a35cbd41e90aa4c9bc1ff0b0d18eccbac7e975a5a50d3c1a8fcf43",
   "worktree_clean_before": true,
   "environment": {
     "rustc": "rustc 1.87.0 (17067e9ac 2025-05-09)",
@@ -24,14 +24,14 @@
       "name": "clippy",
       "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
       "exit_code": 0,
-      "log_sha256": "621250c47a83b1fa4e4424cd2ca2909dccfb2ef68764f6716b7e105456573d14",
+      "log_sha256": "18509afceef56ee4deddb41b05e6639b4d95909d170b6dfa31417b7aba5666e0",
       "artifact_paths": []
     },
     {
       "name": "tests",
       "command": "cargo test --workspace --all-features --locked",
       "exit_code": 0,
-      "log_sha256": "7befb3b4658484ffc384b8db61f372f92692a979325a0df2d7da0b2f95ed55c6",
+      "log_sha256": "30523170e58c8a079630dd6d0e648699b16138cb258187fd81a4bf72c2e222ae",
       "artifact_paths": []
     },
     {
@@ -45,14 +45,14 @@
       "name": "frontend_tests",
       "command": "cd ui && npm run check",
       "exit_code": 0,
-      "log_sha256": "9e40c76824ea6ea0bd3c2b2c97c8451eb8acefc1f9ce5056bc24eb06045b9fdf",
+      "log_sha256": "889ac47834b04fd9051eed53ec61b23def15449e99378929f59975273fc20c14",
       "artifact_paths": []
     },
     {
       "name": "frontend_build",
       "command": "cd ui && npm run build && git diff --exit-code -- dist",
       "exit_code": 0,
-      "log_sha256": "1d90a850937e189415c3eccf7c56564d192505a4f16acd7a1ffc5d2166dd63f3",
+      "log_sha256": "49051331bb54d31080564c2d5d4e0d3baab58faab4d2fe7c10ea44608b70ae0f",
       "artifact_paths": [
         "ui/dist/assets/app.js",
         "ui/dist/assets/app.css"
@@ -62,7 +62,7 @@
       "name": "release_build",
       "command": "cargo build --release --workspace --locked",
       "exit_code": 0,
-      "log_sha256": "5fed994335fe448418cbe1d9556ecaac58f80310e39878c26ff5d0c0d00b5def",
+      "log_sha256": "0a14b7b00b122a5301bdcb5532fb436e08f7be4966f75bf212c8c7d0463ebf25",
       "artifact_paths": [
         "target/release/structtrace"
       ]
@@ -82,7 +82,7 @@
       "name": "browser_e2e",
       "command": "./scripts/test-local-ui-e2e.sh --project=chromium --project=firefox",
       "exit_code": 0,
-      "log_sha256": "acc6b5b8363a8429adcb2c067a4f79c455d7d1655ccba106ceecf83a89f9e7b4",
+      "log_sha256": "6be76d3470a9efd5c9123271e55a4b7007eb7a76cb4f90356ce71caa96857c7e",
       "artifact_paths": [
         "ui/tests/e2e/accessibility.spec.ts"
       ]
