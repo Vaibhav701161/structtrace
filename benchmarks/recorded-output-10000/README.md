@@ -18,13 +18,13 @@ remains an explicit opt-in boundary pending measurement.
 
 ## Recorded result
 
-Commit `297215aabc83786f86ed4104a79ee0c8e123e4f8` was measured from a clean worktree on
+Commit `3cb2121fb7b78fad4cca6ca8de011952d3eafe7b` was measured from a clean worktree on
 Linux x86-64 under WSL2 with Rust 1.87.0:
 
 | Operation | Wall time | Peak RSS |
 |---|---:|---:|
-| Complete 10,000-case run | 156.64 s | 326,232 KiB |
-| Complete replay | 2.30 s | 287,512 KiB |
+| Complete 10,000-case run | 148.96 s | 326,208 KiB |
+| Complete replay | 2.27 s | 287,744 KiB |
 
 The three source artifacts total 2,478,890 bytes and the completed run directory contains
 72,632,417 bytes. These are descriptive measurements on one machine, not cross-platform latency

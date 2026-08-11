@@ -398,8 +398,8 @@ tool does not claim streaming or million-row ingestion.
 
 | Clean-tree Linux measurement | Wall time | Peak RSS |
 |---|---:|---:|
-| 10,000-case run | 156.64 s | 326,232 KiB |
-| Complete replay | 2.30 s | 287,512 KiB |
+| 10,000-case run | 148.96 s | 326,208 KiB |
+| Complete replay | 2.27 s | 287,744 KiB |
 
 The exact commit, binary/lockfile digests, source sizes, command results, and artifact size are in
 [`benchmarks/recorded-output-10000/result.json`](benchmarks/recorded-output-10000/result.json).
