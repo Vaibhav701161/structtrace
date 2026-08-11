@@ -91,17 +91,20 @@ mod windows_tests {
         make_private_directory(&directory).unwrap();
         make_private_file(&file).unwrap();
         for path in [&directory, &file] {
-            let output = std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    "(Get-Acl -LiteralPath $env:STRUCTTRACE_ACL_TEST_PATH).AreAccessRulesProtected",
-                ])
-                .env("STRUCTTRACE_ACL_TEST_PATH", path)
+            let output = std::process::Command::new("icacls")
+                .arg(path)
                 .output()
                 .unwrap();
-            assert!(output.status.success());
-            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "True");
+            assert!(
+                output.status.success(),
+                "icacls inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let acl = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                !acl.contains("(I)"),
+                "private path retained an inherited access-control entry: {acl}"
+            );
         }
     }
 }

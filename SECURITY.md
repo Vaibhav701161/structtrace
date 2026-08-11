@@ -64,8 +64,8 @@ user and host. Encrypt or delete them according to the organization’s data
 retention policy.
 
 On Unix, StructTrace creates run directories as `0700` and files as `0600`.
-Equivalent restrictive Windows ACL enforcement is not yet verified, so command
-and Python execution remain Beta on Windows.
+Restrictive Windows ACL enforcement is verified in the cross-platform test matrix. Command
+and Python execution nevertheless remain Beta on Windows pending broader deployment evidence.
 
 ## Integrity
 
