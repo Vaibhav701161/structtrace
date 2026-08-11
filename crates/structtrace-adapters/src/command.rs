@@ -1,13 +1,23 @@
 //! Language-agnostic command adapter using a strict JSONL protocol.
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::Path,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::Command,
     task::JoinHandle,
     time::{Instant, timeout},
 };
+
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 
 pub(crate) const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -83,16 +93,16 @@ async fn run_persistent(
         }
     };
     let process_id = child.id();
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(mut stdin) = child.stdin().take() else {
         terminate_process_tree(&mut child, process_id).await;
         return all_failed(cases, "process_spawn", "could not open child stdin");
     };
-    let Some(stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout().take() else {
         terminate_process_tree(&mut child, process_id).await;
         return all_failed(cases, "process_spawn", "could not open child stdout");
     };
     let stderr_task = child
-        .stderr
+        .stderr()
         .take()
         .map(|stderr| tokio::spawn(drain_stderr(stderr, limits.max_stderr_bytes)));
     let mut stdout = BufReader::new(stdout);
@@ -234,8 +244,8 @@ async fn run_persistent(
     }
     drop(stdin);
     let mut lifecycle_trusted = terminal_failure.is_none();
-    match timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await {
-        Ok(Ok(status)) if !status.success() && terminal_failure.is_none() => {
+    match wait_for_parent_exit(&mut child, PROCESS_SHUTDOWN_GRACE).await {
+        Ok(Some(status)) if !status.success() && terminal_failure.is_none() => {
             let message = format!("persistent process exited unsuccessfully with {status}");
             protocol_errors.push(message.clone());
             lifecycle_trusted = false;
@@ -243,7 +253,7 @@ async fn run_persistent(
                 *row = error_output(&case.id, "process_exit", &message, row.latency_ms);
             }
         }
-        Ok(Err(error)) if terminal_failure.is_none() => {
+        Err(error) if terminal_failure.is_none() => {
             let message = format!("could not wait for persistent process: {error}");
             protocol_errors.push(message.clone());
             lifecycle_trusted = false;
@@ -251,7 +261,7 @@ async fn run_persistent(
                 *row = error_output(&case.id, "process_wait", &message, row.latency_ms);
             }
         }
-        Err(_) if terminal_failure.is_none() => {
+        Ok(None) if terminal_failure.is_none() => {
             let message = format!(
                 "persistent process ignored EOF and exceeded the {} ms shutdown grace period",
                 PROCESS_SHUTDOWN_GRACE.as_millis()
@@ -268,7 +278,7 @@ async fn run_persistent(
                 );
             }
         }
-        Err(_) => terminate_process_tree(&mut child, process_id).await,
+        Ok(None) => terminate_process_tree(&mut child, process_id).await,
         _ => {}
     }
     if lifecycle_trusted {
@@ -398,7 +408,7 @@ async fn run_per_case(
                 continue;
             }
         };
-        let Some(mut child_stdin) = child.stdin.take() else {
+        let Some(mut child_stdin) = child.stdin().take() else {
             terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
@@ -419,7 +429,7 @@ async fn run_per_case(
             continue;
         }
         drop(child_stdin);
-        let Some(child_stdout) = child.stdout.take() else {
+        let Some(child_stdout) = child.stdout().take() else {
             terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
@@ -429,7 +439,7 @@ async fn run_per_case(
             ));
             continue;
         };
-        let Some(child_stderr) = child.stderr.take() else {
+        let Some(child_stderr) = child.stderr().take() else {
             terminate_process_tree(&mut child, process_id).await;
             rows.push(error_output(
                 &case.id,
@@ -443,8 +453,8 @@ async fn run_per_case(
         let stderr_limit = limits.max_stderr_bytes;
         let stdout_task = tokio::spawn(drain_bounded(child_stdout, output_limit));
         let stderr_task = tokio::spawn(drain_bounded(child_stderr, stderr_limit));
-        let wait = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
-        let timed_out = wait.is_err();
+        let wait = wait_for_parent_exit(&mut child, Duration::from_millis(timeout_ms)).await;
+        let timed_out = matches!(wait, Ok(None));
         if timed_out {
             terminate_process_tree(&mut child, process_id).await;
         }
@@ -463,7 +473,7 @@ async fn run_per_case(
             ));
             continue;
         }
-        if let Ok(Err(error)) = &wait {
+        if let Err(error) = &wait {
             rows.push(error_output(
                 &case.id,
                 "process_terminated",
@@ -472,7 +482,7 @@ async fn run_per_case(
             ));
             continue;
         }
-        if let Ok(Ok(status)) = &wait {
+        if let Ok(Some(status)) = &wait {
             if !status.success() {
                 rows.push(error_output(
                     &case.id,
@@ -556,24 +566,30 @@ async fn run_per_case(
     }
 }
 
-pub(crate) fn spawn(spec: &CommandSpec, working_directory: &Path) -> std::io::Result<Child> {
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.args)
-        .current_dir(working_directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+pub(crate) fn spawn(
+    spec: &CommandSpec,
+    working_directory: &Path,
+) -> std::io::Result<Box<dyn ChildWrapper>> {
+    let mut command = CommandWrap::with_new(&spec.program, |command| {
+        command
+            .args(&spec.args)
+            .current_dir(working_directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    });
+    command.wrap(KillOnDrop);
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-    }
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
     command.spawn()
 }
 
-pub(crate) async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
+pub(crate) async fn terminate_process_tree(
+    child: &mut Box<dyn ChildWrapper>,
+    process_id: Option<u32>,
+) {
     terminate_tree_signal(process_id, false).await;
     if timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await.is_ok() {
         return;
@@ -581,6 +597,26 @@ pub(crate) async fn terminate_process_tree(child: &mut Child, process_id: Option
     terminate_tree_signal(process_id, true).await;
     let _ = child.start_kill();
     let _ = timeout(PROCESS_SHUTDOWN_GRACE, child.wait()).await;
+}
+
+pub(crate) async fn wait_for_parent_exit(
+    child: &mut Box<dyn ChildWrapper>,
+    grace: Duration,
+) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // A successful adapter process may still have descendants holding inherited pipe
+            // handles. Kill the managed process group or Windows Job Object after the parent is
+            // reaped so those handles cannot stall evidence finalization.
+            let _ = child.start_kill();
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(unix)]

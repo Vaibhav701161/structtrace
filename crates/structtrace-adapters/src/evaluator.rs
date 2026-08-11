@@ -202,7 +202,7 @@ async fn run_persistent_batch(
         }
     };
     let process_id = child.id();
-    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(mut stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
         crate::command::terminate_process_tree(&mut child, process_id).await;
         return invocations
             .iter()
@@ -220,7 +220,7 @@ async fn run_persistent_batch(
             })
             .collect();
     };
-    let stderr_task = child.stderr.take().map(|stderr| {
+    let stderr_task = child.stderr().take().map(|stderr| {
         tokio::spawn(crate::command::drain_stderr(
             stderr,
             runtime.limits.max_stderr_bytes,
@@ -317,22 +317,24 @@ async fn run_persistent_batch(
             _ => {}
         }
     }
-    match timeout(crate::command::PROCESS_SHUTDOWN_GRACE, child.wait()).await {
-        Ok(Ok(status)) if !status.success() && terminal_failure.is_none() => {
+    match crate::command::wait_for_parent_exit(&mut child, crate::command::PROCESS_SHUTDOWN_GRACE)
+        .await
+    {
+        Ok(Some(status)) if !status.success() && terminal_failure.is_none() => {
             invalidate_all = Some(format!(
                 "persistent evaluator exited unsuccessfully with {status}"
             ));
         }
-        Ok(Err(failure)) if terminal_failure.is_none() => {
+        Err(failure) if terminal_failure.is_none() => {
             invalidate_all = Some(format!(
                 "could not wait for persistent evaluator: {failure}"
             ));
         }
-        Err(_) if terminal_failure.is_none() => {
+        Ok(None) if terminal_failure.is_none() => {
             invalidate_all = Some("persistent evaluator ignored EOF".to_owned());
             crate::command::terminate_process_tree(&mut child, process_id).await;
         }
-        Err(_) => crate::command::terminate_process_tree(&mut child, process_id).await,
+        Ok(None) => crate::command::terminate_process_tree(&mut child, process_id).await,
         _ => {}
     }
     if terminal_failure.is_none() && invalidate_all.is_none() {
