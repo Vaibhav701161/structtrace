@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-11T10:09:40.656462+00:00",
+  "generated_at": "2026-08-11T10:24:55.799690+00:00",
   "cases": 10000,
   "platform": "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64",
   "rustc": "rustc 1.87.0 (17067e9ac 2025-05-09)",
-  "source_commit": "3cb2121fb7b78fad4cca6ca8de011952d3eafe7b",
+  "source_commit": "0669ae9aea789804e0e18a7ffdc1905fb3cb5546",
   "source_worktree_clean": true,
-  "cargo_lock_sha256": "9ae3824a91188f1537478bc48e758c4755c614cb3b47c32ea81a4a3be8091ffb",
-  "binary_sha256": "5a23c3bcd682db6e3dca8d89f961784290462fd056330d65351ac779f0f7ad7b",
+  "cargo_lock_sha256": "34e7ee4b60feabc0452ab6736e04387c947c92bc36006ee8d470f13694a01b90",
+  "binary_sha256": "dcf11dc90037a22f847773fe46c7f382f542f33a1d693adb64a8802734dd82d0",
   "source_bytes": {
     "dataset": 938890,
     "baseline": 770000,
@@ -19,30 +19,30 @@
       "command": [
         "/home/vaibhav/structtrace/target/release/structtrace",
         "--project-root",
-        "/tmp/structtrace-scale-xm_k4h7b",
+        "/tmp/structtrace-scale-akfu0rgc",
         "run"
       ],
       "exit_code": 0,
-      "wall_seconds": 148.965,
-      "stdout_tail": "STRUCTTRACE RUN COMPLETE\n\nRun:          01KZR4MKND9EHYAP5C446B58PS\nBaseline:     10000/10000 (100.0%)\nCandidate:    10000/10000 (100.0%)\nDifference:   +0.00 percentage points\nTransitions:  0 candidate-only, 0 baseline-only\nGate:         advisory NOT CONFIGURED\nAuthorization: NO DEPLOYMENT AUTHORIZATION\nReport:       /tmp/structtrace-scale-xm_k4h7b/.structtrace/runs/01KZR4MKND9EHYAP5C446B58PS/report/index.html\nOpen with:    structtrace report 01KZR4MKND9EHYAP5C446B58PS --open\n              (chunked reports may not work through file://)\n",
+      "wall_seconds": 135.543,
+      "stdout_tail": "STRUCTTRACE RUN COMPLETE\n\nRun:          01KZR5GYKXV3CABQVRJVVWMPTS\nBaseline:     10000/10000 (100.0%)\nCandidate:    10000/10000 (100.0%)\nDifference:   +0.00 percentage points\nTransitions:  0 candidate-only, 0 baseline-only\nGate:         advisory NOT CONFIGURED\nAuthorization: NO DEPLOYMENT AUTHORIZATION\nReport:       /tmp/structtrace-scale-akfu0rgc/.structtrace/runs/01KZR5GYKXV3CABQVRJVVWMPTS/report/index.html\nOpen with:    structtrace report 01KZR5GYKXV3CABQVRJVVWMPTS --open\n              (chunked reports may not work through file://)\n",
       "stderr_tail": "",
-      "measured_wall_seconds": 148.96,
-      "peak_rss_kib": 326208
+      "measured_wall_seconds": 135.54,
+      "peak_rss_kib": 326584
     },
     {
       "command": [
         "/home/vaibhav/structtrace/target/release/structtrace",
         "--project-root",
-        "/tmp/structtrace-scale-xm_k4h7b",
+        "/tmp/structtrace-scale-akfu0rgc",
         "replay",
         "latest"
       ],
       "exit_code": 0,
-      "wall_seconds": 2.28,
-      "stdout_tail": "STRUCTTRACE REPLAY\n\nRun:                          01KZR4MKND9EHYAP5C446B58PS\nCases replayed:               10000\nVariant outputs replayed:     20000\nBuilt-in evaluator results recomputed: 20000\nExternal evaluator receipts verified: 0\nExternal evaluator programs re-executed: 0\n\nArtifact hash mismatches:     0\nCross-artifact mismatches:  0\nRow-score mismatches:         0\nSummary mismatches:           0\n\nREPLAY VERIFIED\n",
+      "wall_seconds": 2.123,
+      "stdout_tail": "STRUCTTRACE REPLAY\n\nRun:                          01KZR5GYKXV3CABQVRJVVWMPTS\nCases replayed:               10000\nVariant outputs replayed:     20000\nBuilt-in evaluator results recomputed: 20000\nExternal evaluator receipts verified: 0\nExternal evaluator programs re-executed: 0\n\nArtifact hash mismatches:     0\nCross-artifact mismatches:  0\nRow-score mismatches:         0\nSummary mismatches:           0\n\nREPLAY VERIFIED\n",
       "stderr_tail": "",
-      "measured_wall_seconds": 2.27,
-      "peak_rss_kib": 287744
+      "measured_wall_seconds": 2.12,
+      "peak_rss_kib": 288544
     }
   ],
   "passed": true
